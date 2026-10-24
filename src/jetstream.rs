@@ -1,13 +1,26 @@
-//! JetStream engine (Phase 9): in-memory streams, consumers (push and
-//! pull), acknowledgements with redelivery, and the `$JS.API` surface.
+//! JetStream engine (Phase 9, upgraded in Phase 15): streams, consumers
+//! (push and pull), acknowledgements with redelivery, and the
+//! `$JS.API` surface.
 //!
 //! Scope notes (also in the README):
-//! - Storage is in-memory only. A stream created with file storage is
-//!   accepted but its data lives in memory and is lost on restart.
+//! - Persistence: when a store dir is configured (`--js-store-dir` /
+//!   `jetstream.store_dir`), the whole engine is snapshotted to JSON
+//!   (payloads base64-encoded) after every mutation and reloaded on
+//!   startup. Without a store dir the engine is purely in-memory and
+//!   data is lost on restart. A stream created with file storage but
+//!   no store dir is accepted but stays in-memory.
+//! - Pending ack state is NOT persisted: messages delivered but unacked
+//!   before a restart are not redelivered (consumers resume from their
+//!   next_stream_seq). Dedup ids are persisted (window restarts).
 //! - JetStream is per-node: streams capture messages published on the
 //!   hosting node, but `$JS.API` requests and `$JS.ACK` messages route
 //!   cluster-wide via the `$JS.API.>` interest the server advertises.
-//! - No replication, no mirroring/sourcing, no workqueue retention.
+//!   Streams are account-scoped (Phase 14); stream names are
+//!   node-global.
+//! - Retention: limits and workqueue (deleted after first ack; ack
+//!   policy All deletes only the acked message, not the whole floor).
+//! - Consumer deliver_policy: all, last (filter-aware), new, and
+//!   by_start_sequence. No replication, no mirroring/sourcing.
 //! - KV is not a separate implementation: a KV bucket is a plain stream
 //!   named `KV_<bucket>` with subjects `$KV.<bucket>.>`; the primitives
 //!   KV needs (headers on stored messages, `MSG.GET` with `last_by_subj`)
@@ -31,9 +44,68 @@ const DEFAULT_ACK_WAIT: Duration = Duration::from_secs(30);
 /// Redelivery / pull-expiry tick interval.
 const TICK: Duration = Duration::from_millis(100);
 
-/// In-memory JetStream engine handle.
+/// JetStream engine handle. When `store_dir` is set, the whole
+/// engine is snapshotted to JSON in that directory (atomically, via
+/// temp file + rename) after every mutating operation, and reloaded
+/// on startup. Without a store dir the engine is purely in-memory.
 pub struct JetStream {
     engine: Mutex<Engine>,
+    store_dir: Option<std::path::PathBuf>,
+}
+
+impl JetStream {
+    /// Snapshot file name inside the store dir.
+    fn snapshot_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("rust-natsd-js.json")
+    }
+
+    /// Write the current engine state to the store dir, if configured.
+    /// Best-effort: errors are logged, never fatal (the in-memory
+    /// state remains authoritative until the next successful write).
+    pub(crate) fn persist(&self) {
+        let Some(dir) = &self.store_dir else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("rust-natsd: jetstream store dir {dir:?}: {e}");
+            return;
+        }
+        let snapshot = {
+            let engine = self.engine.lock().unwrap();
+            engine.snapshot_json()
+        };
+        let tmp = dir.join("rust-natsd-js.json.tmp");
+        let path = Self::snapshot_path(dir);
+        match std::fs::write(&tmp, serde_json::to_string_pretty(&snapshot).unwrap()) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, &path) {
+                    eprintln!("rust-natsd: jetstream snapshot rename: {e}");
+                }
+            }
+            Err(e) => eprintln!("rust-natsd: jetstream snapshot write: {e}"),
+        }
+    }
+
+    /// Load a snapshot from the store dir, if one exists. Returns
+    /// None when there is no snapshot (fresh start) or it is
+    /// unreadable (in which case the error is logged and the engine
+    /// starts empty rather than failing startup).
+    fn load_snapshot(dir: &std::path::Path) -> Option<Engine> {
+        let path = Self::snapshot_path(dir);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        match Engine::from_snapshot_json(&text) {
+            Ok(engine) => Some(engine),
+            Err(e) => {
+                eprintln!(
+                    "rust-natsd: jetstream snapshot {path:?} unreadable ({e}); starting empty"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl JetStream {
@@ -44,7 +116,7 @@ impl JetStream {
         let mut bytes = 0u64;
         let mut consumers = 0usize;
         for s in engine.streams.values() {
-            messages += s.messages.len() as u64;
+            messages += s.live_count() as u64;
             bytes += s.bytes();
             consumers += s.consumers.len();
         }
@@ -71,12 +143,12 @@ impl JetStream {
         let mut total_bytes = 0u64;
         let mut total_consumers = 0usize;
         for s in engine.streams.values() {
-            total_messages += s.messages.len() as u64;
+            total_messages += s.live_count() as u64;
             total_bytes += s.bytes();
             total_consumers += s.consumers.len();
             streams.push(json!({
                 "name": s.name,
-                "messages": s.messages.len(),
+                "messages": s.live_count(),
                 "bytes": s.bytes(),
                 "first_seq": s.first_seq(),
                 "last_seq": s.last_seq(),
@@ -85,7 +157,7 @@ impl JetStream {
             }));
         }
         json!({
-            "config": {"max_memory": 0, "max_file": 0, "store_dir": ""},
+            "config": {"max_memory": 0, "max_file": 0, "store_dir": self.store_dir.as_ref().map(|d| d.to_string_lossy().to_string()).unwrap_or_default()},
             "streams": streams,
             "total_streams": engine.streams.len(),
             "total_messages": total_messages,
@@ -95,10 +167,23 @@ impl JetStream {
     }
 
     pub fn new() -> Self {
-        JetStream {
-            engine: Mutex::new(Engine {
+        Self::with_store_dir(None)
+    }
+
+    /// Create an engine, restoring a snapshot from `store_dir` when
+    /// one exists there.
+    pub fn with_store_dir(store_dir: Option<std::path::PathBuf>) -> Self {
+        let engine = match &store_dir {
+            Some(dir) => Self::load_snapshot(dir).unwrap_or_else(|| Engine {
                 streams: HashMap::new(),
             }),
+            None => Engine {
+                streams: HashMap::new(),
+            },
+        };
+        JetStream {
+            engine: Mutex::new(engine),
+            store_dir,
         }
     }
 }
@@ -142,6 +227,11 @@ struct Stream {
     max_msgs: i64,
     max_bytes: i64,
     max_age_ns: i64,
+    max_msgs_per_subject: i64,
+    /// Sequences deleted in place (workqueue acks, per-subject eviction
+    /// of interior messages). The VecDeque keeps its indexing; get()
+    /// returns None for these, so consumers skip them.
+    deleted: std::collections::HashSet<u64>,
     storage: String,
     messages: VecDeque<StoredMsg>,
     /// Sequence number of messages[0]; next sequence is base_seq + len.
@@ -286,16 +376,18 @@ impl Stream {
     }
 
     fn first_seq(&self) -> u64 {
-        if self.messages.is_empty() {
-            self.base_seq + self.messages.len() as u64
-        } else {
-            self.base_seq
+        // Skip a deleted prefix (workqueue acks from the front).
+        let mut seq = self.base_seq;
+        while seq < self.base_seq + self.messages.len() as u64 && self.deleted.contains(&seq) {
+            seq += 1;
         }
+        seq
     }
 
     fn bytes(&self) -> u64 {
         self.messages
             .iter()
+            .filter(|m| !self.deleted.contains(&m.seq))
             .map(|m| {
                 m.payload.len() as u64 + m.headers.as_ref().map(|h| h.len() as u64).unwrap_or(0)
             })
@@ -303,16 +395,22 @@ impl Stream {
     }
 
     fn get(&self, seq: u64) -> Option<&StoredMsg> {
-        if seq < self.base_seq {
+        if seq < self.base_seq || self.deleted.contains(&seq) {
             return None;
         }
         self.messages.get((seq - self.base_seq) as usize)
+    }
+
+    /// Live (non-deleted) message count.
+    fn live_count(&self) -> usize {
+        self.messages.len().saturating_sub(self.deleted.len())
     }
 
     fn last_seq_for_subject(&self, subject: &str) -> Option<u64> {
         self.messages
             .iter()
             .rev()
+            .filter(|m| !self.deleted.contains(&m.seq))
             .find(|m| m.subject == subject)
             .map(|m| m.seq)
     }
@@ -337,7 +435,7 @@ impl Stream {
                 "max_msgs": if self.max_msgs <= 0 { -1 } else { self.max_msgs },
                 "max_bytes": if self.max_bytes <= 0 { -1 } else { self.max_bytes },
                 "max_age": self.max_age_ns,
-                "max_msgs_per_subject": -1,
+                "max_msgs_per_subject": if self.max_msgs_per_subject <= 0 { -1 } else { self.max_msgs_per_subject },
                 "max_msg_size": -1,
                 "discard": "old",
                 "storage": self.storage,
@@ -355,7 +453,7 @@ impl Stream {
             },
             "created": rfc3339(self.created_ns),
             "state": {
-                "messages": self.messages.len(),
+                "messages": self.live_count(),
                 "bytes": self.bytes(),
                 "first_seq": self.first_seq(),
                 "first_ts": first_ts,
@@ -557,6 +655,14 @@ fn drain_push(
             payload: m.payload.clone(),
             time_ns: m.time_ns,
         }) else {
+            // A deleted gap (workqueue ack, per-subject eviction) is
+            // skipped, not the end of the stream; only a sequence past
+            // the last stored message ends the drain.
+            if seq <= stream.last_seq() {
+                let cname = stream.consumers.get(consumer_name).unwrap().name.clone();
+                stream.consumers.get_mut(&cname).unwrap().next_stream_seq = seq + 1;
+                continue;
+            }
             break;
         };
         let matches = match &filter {
@@ -569,6 +675,8 @@ fn drain_push(
             continue;
         }
         let account = stream.account.clone();
+        let ack_none = consumer.ack_policy == AckPolicy::None;
+        let workqueue = stream.retention == "workqueue";
         deliver_to_consumer(
             stream_name,
             &account,
@@ -577,6 +685,11 @@ fn drain_push(
             &deliver_subject,
             actions,
         );
+        // Workqueue with ack policy none: no ack will ever come, so
+        // delivery itself deletes the message (as in nats-server).
+        if ack_none && workqueue {
+            stream.deleted.insert(msg.seq);
+        }
     }
 }
 
@@ -631,6 +744,14 @@ fn fulfill_pulls(
                     .unwrap()
                     .next_stream_seq = next + 1;
                 Some(next)
+            } else if next <= stream.last_seq() {
+                // Deleted gap: skip it and retry for a live message.
+                stream
+                    .consumers
+                    .get_mut(consumer_name)
+                    .unwrap()
+                    .next_stream_seq = next + 1;
+                continue;
             } else {
                 None
             }
@@ -683,6 +804,261 @@ impl Engine {
     /// Process one message. Returns (consumed, actions). API requests and
     /// acks are consumed; stream capture stores and still allows normal
     /// delivery, so it returns consumed=false.
+    /// Serialize the whole engine: streams, messages (payloads and
+    /// headers base64-encoded via the `base64` crate), dedup ids, and
+    /// consumer definitions with their positions. Pending ack state
+    /// is NOT persisted: messages delivered but unacked before a
+    /// restart are not redelivered (consumers resume from their
+    /// next_stream_seq).
+    fn snapshot_json(&self) -> Value {
+        use base64::Engine as _;
+        let enc = base64::engine::general_purpose::STANDARD;
+        let streams: Vec<Value> = self
+            .streams
+            .values()
+            .map(|s| {
+                let messages: Vec<Value> = s
+                    .messages
+                    .iter()
+                    .filter(|m| !s.deleted.contains(&m.seq))
+                    .map(|m| {
+                        json!({
+                            "seq": m.seq,
+                            "subject": m.subject,
+                            "headers": m.headers.as_ref().map(|h| enc.encode(h.as_ref())),
+                            "payload": enc.encode(m.payload.as_ref()),
+                            "time_ns": m.time_ns,
+                        })
+                    })
+                    .collect();
+                let consumers: Vec<Value> = s
+                    .consumers
+                    .values()
+                    .map(|c| {
+                        json!({
+                            "name": c.name,
+                            "deliver_subject": c.deliver_subject,
+                            "filter_subject": c.filter_subject,
+                            "ack_policy": match c.ack_policy {
+                                AckPolicy::Explicit => "explicit",
+                                AckPolicy::None => "none",
+                                AckPolicy::All => "all",
+                            },
+                            "ack_wait_ns": c.ack_wait.as_nanos() as u64,
+                            "max_deliver": c.max_deliver,
+                            "max_ack_pending": c.max_ack_pending,
+                            "deliver_policy": c.deliver_policy,
+                            "next_stream_seq": c.next_stream_seq,
+                            "consumer_seq": c.consumer_seq,
+                        })
+                    })
+                    .collect();
+                let msg_ids: Value = s
+                    .msg_ids
+                    .iter()
+                    .map(|(id, (seq, _))| (id.clone(), json!(seq)))
+                    .collect();
+                json!({
+                    "name": s.name,
+                    "account": s.account,
+                    "created_ns": s.created_ns,
+                    "subjects": s.subjects,
+                    "retention": s.retention,
+                    "max_msgs": s.max_msgs,
+                    "max_bytes": s.max_bytes,
+                    "max_age_ns": s.max_age_ns,
+                    "max_msgs_per_subject": s.max_msgs_per_subject,
+                    "storage": s.storage,
+                    "base_seq": s.base_seq,
+                    "messages": messages,
+                    "msg_ids": msg_ids,
+                    "consumers": consumers,
+                })
+            })
+            .collect();
+        json!({ "version": 1, "streams": streams })
+    }
+
+    /// Restore an engine from `snapshot_json` output. Deleted
+    /// sequences are not stored (deleted messages are simply absent,
+    /// so a restored stream's first_seq may jump past a deleted
+    /// prefix — equivalent, since those messages are gone).
+    fn from_snapshot_json(text: &str) -> Result<Engine, String> {
+        use base64::Engine as _;
+        let dec = base64::engine::general_purpose::STANDARD;
+        let root: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let mut engine = Engine {
+            streams: HashMap::new(),
+        };
+        let Some(streams) = root.get("streams").and_then(|v| v.as_array()) else {
+            return Err("snapshot has no streams array".to_string());
+        };
+        for sv in streams {
+            let get_s = |k: &str| sv.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            let get_i = |k: &str| sv.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+            let get_u = |k: &str| sv.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let mut stream = Stream {
+                name: get_s("name").to_string(),
+                account: {
+                    let a = get_s("account");
+                    if a.is_empty() {
+                        "$G".to_string()
+                    } else {
+                        a.to_string()
+                    }
+                },
+                created_ns: get_u("created_ns"),
+                subjects: sv
+                    .get("subjects")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                retention: get_s("retention").to_string(),
+                max_msgs: get_i("max_msgs"),
+                max_bytes: get_i("max_bytes"),
+                max_age_ns: get_i("max_age_ns"),
+                max_msgs_per_subject: get_i("max_msgs_per_subject"),
+                deleted: std::collections::HashSet::new(),
+                storage: get_s("storage").to_string(),
+                messages: VecDeque::new(),
+                base_seq: get_u("base_seq"),
+                msg_ids: HashMap::new(),
+                consumers: HashMap::new(),
+            };
+            if stream.base_seq == 0 {
+                stream.base_seq = 1;
+            }
+            // Load stored messages into a map, then rebuild the deque
+            // over base_seq..=last_seq, inserting placeholders for
+            // missing sequences (deleted messages are not stored).
+            // Placeholders keep VecDeque indexing exact and are
+            // marked deleted, so get()/bytes()/first_seq() skip them
+            // exactly as before the restart.
+            let mut by_seq: HashMap<u64, StoredMsg> = HashMap::new();
+            if let Some(msgs) = sv.get("messages").and_then(|v| v.as_array()) {
+                for mv in msgs {
+                    let payload = mv
+                        .get("payload")
+                        .and_then(|v| v.as_str())
+                        .and_then(|b| dec.decode(b).ok())
+                        .unwrap_or_default();
+                    let headers = mv
+                        .get("headers")
+                        .and_then(|v| v.as_str())
+                        .and_then(|b| dec.decode(b).ok())
+                        .map(Bytes::from);
+                    let stored = StoredMsg {
+                        seq: mv.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+                        subject: mv
+                            .get("subject")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        headers,
+                        payload: Bytes::from(payload),
+                        time_ns: mv.get("time_ns").and_then(|v| v.as_u64()).unwrap_or(0),
+                    };
+                    by_seq.insert(stored.seq, stored);
+                }
+            }
+            if let Some(last) = by_seq.keys().max().copied() {
+                let base = stream.base_seq;
+                for seq in base..=last {
+                    match by_seq.remove(&seq) {
+                        Some(m) => stream.messages.push_back(m),
+                        None => {
+                            stream.deleted.insert(seq);
+                            stream.messages.push_back(StoredMsg {
+                                seq,
+                                subject: String::new(),
+                                headers: None,
+                                payload: Bytes::new(),
+                                time_ns: 0,
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(ids) = sv.get("msg_ids").and_then(|v| v.as_object()) {
+                for (id, seq) in ids {
+                    if let Some(seq) = seq.as_u64() {
+                        stream.msg_ids.insert(id.clone(), (seq, Instant::now()));
+                    }
+                }
+            }
+            if let Some(consumers) = sv.get("consumers").and_then(|v| v.as_array()) {
+                for cv in consumers {
+                    let ack_policy = match cv
+                        .get("ack_policy")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("explicit")
+                    {
+                        "none" => AckPolicy::None,
+                        "all" => AckPolicy::All,
+                        _ => AckPolicy::Explicit,
+                    };
+                    let name = cv
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    stream.consumers.insert(
+                        name.clone(),
+                        Consumer {
+                            name,
+                            created_ns: now_ns(),
+                            deliver_subject: cv
+                                .get("deliver_subject")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            filter_subject: cv
+                                .get("filter_subject")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            ack_policy,
+                            ack_wait: Duration::from_nanos(
+                                cv.get("ack_wait_ns").and_then(|v| v.as_u64()).unwrap_or(0),
+                            ),
+                            max_deliver: cv
+                                .get("max_deliver")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(-1),
+                            max_ack_pending: cv
+                                .get("max_ack_pending")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(1000),
+                            deliver_policy: cv
+                                .get("deliver_policy")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("all")
+                                .to_string(),
+                            next_stream_seq: cv
+                                .get("next_stream_seq")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(1),
+                            consumer_seq: cv
+                                .get("consumer_seq")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            pending: HashMap::new(),
+                            redeliver: VecDeque::new(),
+                            waiting_pulls: VecDeque::new(),
+                            ack_floor_stream_seq: 0,
+                            ack_floor_consumer_seq: 0,
+                            num_redelivered: 0,
+                        },
+                    );
+                }
+            }
+            engine.streams.insert(stream.name.clone(), stream);
+        }
+        Ok(engine)
+    }
+
     /// Stream by name, only when it belongs to `account`.
     fn stream_for(&self, name: &str, account: &str) -> Option<&Stream> {
         self.streams.get(name).filter(|s| s.account == account)
@@ -783,19 +1159,60 @@ impl Engine {
             if let Some(id) = header_get(msg, "Nats-Msg-Id") {
                 stream.msg_ids.insert(id, (seq, Instant::now()));
             }
-            // Enforce limits (discard-old policy).
+            // Enforce limits (discard-old policy). Popping from the
+            // front also drops any deleted marker for that sequence.
             if stream.max_msgs > 0 {
-                while stream.messages.len() as i64 > stream.max_msgs {
-                    stream.messages.pop_front();
+                while stream.live_count() as i64 > stream.max_msgs {
+                    if let Some(front) = stream.messages.pop_front() {
+                        stream.deleted.remove(&front.seq);
+                    }
                     stream.base_seq += 1;
                 }
             }
             if stream.max_bytes > 0 {
                 while stream.bytes() > stream.max_bytes as u64 {
-                    if stream.messages.pop_front().is_none() {
+                    if let Some(front) = stream.messages.pop_front() {
+                        stream.deleted.remove(&front.seq);
+                    } else {
                         break;
                     }
                     stream.base_seq += 1;
+                }
+            }
+            if stream.max_msgs_per_subject > 0 {
+                let limit = stream.max_msgs_per_subject as usize;
+                loop {
+                    let count = stream
+                        .messages
+                        .iter()
+                        .filter(|m| m.subject == msg.subject && !stream.deleted.contains(&m.seq))
+                        .count();
+                    if count <= limit {
+                        break;
+                    }
+                    // Evict the oldest live message for this subject:
+                    // pop from the front when it is that subject, else
+                    // mark the oldest matching message deleted in place.
+                    let front_is_match = stream
+                        .messages
+                        .front()
+                        .map(|m| m.subject == msg.subject && !stream.deleted.contains(&m.seq))
+                        .unwrap_or(false);
+                    if front_is_match {
+                        if let Some(front) = stream.messages.pop_front() {
+                            stream.deleted.remove(&front.seq);
+                        }
+                        stream.base_seq += 1;
+                    } else if let Some(oldest) = stream
+                        .messages
+                        .iter()
+                        .find(|m| m.subject == msg.subject && !stream.deleted.contains(&m.seq))
+                        .map(|m| m.seq)
+                    {
+                        stream.deleted.insert(oldest);
+                    } else {
+                        break;
+                    }
                 }
             }
             stored.push((name.clone(), seq, false));
@@ -808,22 +1225,18 @@ impl Engine {
                     "seq": seq,
                     "duplicate": duplicate,
                 });
-                actions.push(Action::Deliver(Message::new(
-                    reply,
-                    None,
-                    None,
-                    Bytes::from(body.to_string()),
-                )));
+                actions.push(Action::Deliver(
+                    Message::new(reply, None, None, Bytes::from(body.to_string()))
+                        .with_account(&msg.account),
+                ));
             } else if let Some((code, err_code, desc)) = first_error {
                 let body = json!({
                     "error": { "code": code, "err_code": err_code, "description": desc },
                 });
-                actions.push(Action::Deliver(Message::new(
-                    reply,
-                    None,
-                    None,
-                    Bytes::from(body.to_string()),
-                )));
+                actions.push(Action::Deliver(
+                    Message::new(reply, None, None, Bytes::from(body.to_string()))
+                        .with_account(&msg.account),
+                ));
             }
         }
         // Fan out to push consumers and waiting pulls of every stream
@@ -924,12 +1337,15 @@ impl Engine {
                                 ncseq,
                                 consumer.pending.len() + 1,
                             );
-                            actions.push(Action::Deliver(Message::new(
-                                &to,
-                                Some(reply),
-                                m.headers.clone(),
-                                m.payload.clone(),
-                            )));
+                            actions.push(Action::Deliver(
+                                Message::new(
+                                    &to,
+                                    Some(reply),
+                                    m.headers.clone(),
+                                    m.payload.clone(),
+                                )
+                                .with_account(&msg.account),
+                            ));
                             consumer.pending.insert(
                                 ncseq,
                                 Pending {
@@ -967,6 +1383,15 @@ impl Engine {
         if consumer.deliver_subject.is_some() {
             let cname = consumer.name.clone();
             drain_push(stream_name, stream, &cname, actions);
+        }
+        // Workqueue retention: a plain ack deletes the message (after
+        // its first ack). NAK/TERM/WPI do not delete. Note: ack policy
+        // All is not bulk-aware here — only the acked message itself
+        // is deleted; other messages covered by an All ack are deleted
+        // when they are individually acked.
+        let plain_ack = !matches!(payload.as_ref(), "-NAK" | "+NAK" | "+TERM" | "+WPI");
+        if plain_ack && stream.retention == "workqueue" {
+            stream.deleted.insert(sseq);
         }
     }
 }
@@ -1028,12 +1453,12 @@ impl Engine {
             ["STREAM", "MSG", "GET", name] => {
                 self.api_stream_msg_get(&msg.account, name, &body, &reply, &type_name, actions)
             }
-            ["CONSUMER", "CREATE", stream] | ["CONSUMER", "CREATE", stream, _] => {
-                let from_subject = if parts.len() == 4 {
-                    Some(parts[3].to_string())
-                } else {
-                    None
-                };
+            // The consumer name is parts[3] when present; clients
+            // append the filter subject as further tokens
+            // (CREATE.<stream>.<consumer>.<filter...>), which are
+            // ignored here because the body carries filter_subject.
+            ["CONSUMER", "CREATE", stream, ..] => {
+                let from_subject = parts.get(3).map(|s| s.to_string());
                 self.api_consumer_create(
                     &msg.account,
                     stream,
@@ -1145,14 +1570,14 @@ impl Engine {
             .and_then(|v| v.as_str())
             .unwrap_or("limits")
             .to_string();
-        if retention != "limits" {
+        if retention != "limits" && retention != "workqueue" {
             api_error_action(
                 account,
                 reply,
                 type_name,
                 400,
                 10002,
-                "only limits retention is supported",
+                "only limits and workqueue retention are supported",
                 actions,
             );
             return;
@@ -1171,6 +1596,11 @@ impl Engine {
             max_msgs: body.get("max_msgs").and_then(|v| v.as_i64()).unwrap_or(0),
             max_bytes: body.get("max_bytes").and_then(|v| v.as_i64()).unwrap_or(0),
             max_age_ns: body.get("max_age").and_then(|v| v.as_i64()).unwrap_or(0),
+            max_msgs_per_subject: body
+                .get("max_msgs_per_subject")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            deleted: std::collections::HashSet::new(),
             storage,
             messages: VecDeque::new(),
             base_seq: 1,
@@ -1503,11 +1933,31 @@ impl Engine {
         let start_seq = match deliver_policy.as_str() {
             "new" => stream.last_seq() + 1,
             "last" => {
-                if stream.messages.is_empty() {
+                // With a filter, "last" means the last message matching
+                // the filter, not the stream's last message (which the
+                // drain would otherwise skip past).
+                if let Some(filter) = &filter_subject {
+                    stream
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| {
+                            !stream.deleted.contains(&m.seq) && subject_matches(filter, &m.subject)
+                        })
+                        .map(|m| m.seq)
+                        .unwrap_or_else(|| stream.last_seq() + 1)
+                } else if stream.messages.is_empty() {
                     stream.base_seq + stream.messages.len() as u64
                 } else {
                     stream.last_seq()
                 }
+            }
+            "by_start_sequence" => {
+                let wanted = config
+                    .get("opt_start_seq")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                wanted.max(stream.first_seq())
             }
             _ => stream.first_seq(),
         };
@@ -1765,14 +2215,17 @@ impl Engine {
                 });
         } else if delivered == 0 && no_wait {
             // Immediate "no messages" status message, as nats-server does.
-            actions.push(Action::Deliver(Message::new(
-                reply,
-                None,
-                Some(Bytes::from(
-                    "NATS/1.0\r\nStatus: 404\r\nDescription: No Messages\r\n\r\n",
-                )),
-                Bytes::new(),
-            )));
+            actions.push(Action::Deliver(
+                Message::new(
+                    reply,
+                    None,
+                    Some(Bytes::from(
+                        "NATS/1.0\r\nStatus: 404\r\nDescription: No Messages\r\n\r\n",
+                    )),
+                    Bytes::new(),
+                )
+                .with_account(account),
+            ));
         }
     }
 
@@ -1796,7 +2249,9 @@ impl Engine {
                 let cutoff = now_ns.saturating_sub(stream.max_age_ns as u64);
                 while let Some(front) = stream.messages.front() {
                     if front.time_ns < cutoff {
+                        let seq = front.seq;
                         stream.messages.pop_front();
+                        stream.deleted.remove(&seq);
                         stream.base_seq += 1;
                     } else {
                         break;
@@ -1824,14 +2279,17 @@ impl Engine {
                 };
                 for pull in expired {
                     if pull.delivered == 0 {
-                        actions.push(Action::Deliver(Message::new(
-                            &pull.reply,
-                            None,
-                            Some(Bytes::from(
-                                "NATS/1.0\r\nStatus: 404\r\nDescription: No Messages\r\n\r\n",
-                            )),
-                            Bytes::new(),
-                        )));
+                        actions.push(Action::Deliver(
+                            Message::new(
+                                &pull.reply,
+                                None,
+                                Some(Bytes::from(
+                                    "NATS/1.0\r\nStatus: 404\r\nDescription: No Messages\r\n\r\n",
+                                )),
+                                Bytes::new(),
+                            )
+                            .with_account(&account),
+                        ));
                     }
                 }
                 // Redeliver expired pending messages.
@@ -1866,12 +2324,15 @@ impl Engine {
                             c.consumer_seq += 1;
                             let ncseq = c.consumer_seq;
                             let reply = c.ack_subject(&name, nd, sseq, ncseq, c.pending.len() + 1);
-                            actions.push(Action::Deliver(Message::new(
-                                &to,
-                                Some(reply),
-                                m.headers.clone(),
-                                m.payload.clone(),
-                            )));
+                            actions.push(Action::Deliver(
+                                Message::new(
+                                    &to,
+                                    Some(reply),
+                                    m.headers.clone(),
+                                    m.payload.clone(),
+                                )
+                                .with_account(&account),
+                            ));
                             c.pending.insert(
                                 ncseq,
                                 Pending {
@@ -1910,6 +2371,10 @@ pub fn handle_message(
         let mut engine = js.engine.lock().unwrap();
         engine.process(msg, origin)
     };
+    // Persist after every mutating operation (capture, API, ack) so
+    // a restart restores the engine. Cheap at this scale (whole-engine
+    // JSON); a no-op without a store dir.
+    js.persist();
     for action in actions {
         match action {
             Action::Deliver(m) => {
@@ -1930,6 +2395,8 @@ pub async fn redelivery_loop(js: std::sync::Arc<JetStream>, shared: std::sync::A
                     let mut engine = js.engine.lock().unwrap();
                     engine.tick()
                 };
+                // Tick can evict messages, so it is a mutation too.
+                js.persist();
                 for action in actions {
                     match action {
                         Action::Deliver(m) => {

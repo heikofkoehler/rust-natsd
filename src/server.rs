@@ -291,7 +291,9 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
     };
     let http_addr = http_listener.as_ref().map(|l| l.local_addr()).transpose()?;
     let jetstream = if config.jetstream {
-        Some(Arc::new(crate::jetstream::JetStream::new()))
+        Some(Arc::new(crate::jetstream::JetStream::with_store_dir(
+            config.js_store_dir.as_ref().map(std::path::PathBuf::from),
+        )))
     } else {
         None
     };
