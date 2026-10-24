@@ -167,6 +167,16 @@ mod tests {
     }
 
     #[test]
+    fn auth_token_flag() {
+        let c = Config::from_args(&args(&["--auth-token", "tok123"])).unwrap();
+        assert_eq!(c.auth_token.as_deref(), Some("tok123"));
+        let mut ci = ConnectInfo::default();
+        assert!(!c.authorize(&ci));
+        ci.auth_token = Some("tok123".into());
+        assert!(c.authorize(&ci));
+    }
+
+    #[test]
     fn arg_errors() {
         assert!(Config::from_args(&args(&["--bogus"])).is_err());
         assert!(Config::from_args(&args(&["-p"])).is_err());

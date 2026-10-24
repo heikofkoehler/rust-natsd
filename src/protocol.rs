@@ -627,6 +627,68 @@ mod tests {
     }
 
     #[test]
+    fn pong_and_hpub_with_reply() {
+        let ops = parse_all(b"PONG\r\n").unwrap();
+        assert_eq!(ops, vec![ClientOp::Pong]);
+        let hdrs = b"NATS/1.0\r\n\r\n";
+        let mut wire =
+            format!("HPUB foo inbox.1 {} {}\r\n", hdrs.len(), hdrs.len() + 2).into_bytes();
+        wire.extend_from_slice(hdrs);
+        wire.extend_from_slice(b"hi\r\n");
+        let ops = parse_all(&wire).unwrap();
+        match &ops[0] {
+            ClientOp::HPub {
+                reply_to, payload, ..
+            } => {
+                assert_eq!(reply_to.as_deref(), Some("inbox.1"));
+                assert_eq!(payload.as_ref(), b"hi");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn more_error_branches() {
+        // HPUB header length beyond total length.
+        assert!(matches!(
+            parse_all(b"HPUB foo 10 5\r\n"),
+            Err(ParseError::InvalidSize(_))
+        ));
+        // PUB with wildcard reply subject.
+        assert!(matches!(
+            parse_all(b"PUB foo a.* 1\r\nx\r\n"),
+            Err(ParseError::InvalidSubject(_))
+        ));
+        // Wrong arg counts.
+        assert!(matches!(
+            parse_all(b"SUB foo\r\n"),
+            Err(ParseError::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            parse_all(b"UNSUB 1 2 3\r\n"),
+            Err(ParseError::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            parse_all(b"PUB foo bar baz 1\r\nx\r\n"),
+            Err(ParseError::InvalidArgs(_))
+        ));
+        // UNSUB with non-numeric max.
+        assert!(matches!(
+            parse_all(b"UNSUB 1 x\r\n"),
+            Err(ParseError::InvalidSize(_))
+        ));
+        // HPUB payload exceeding max payload (accounting headers).
+        let mut p = Parser::new(4);
+        let hdrs = b"NATS/1.0\r\n\r\n";
+        p.feed(format!("HPUB foo {} {}\r\n", hdrs.len(), hdrs.len() + 5).as_bytes());
+        assert!(matches!(p.next_op(), Err(ParseError::PayloadTooLarge(5))));
+        // Display strings are stable (they go on the wire in -ERR).
+        assert!(ParseError::ControlLineTooLong
+            .to_string()
+            .contains("Control Line Too Long"));
+    }
+
+    #[test]
     fn lowercase_verbs_accepted() {
         let ops = parse_all(b"ping\r\npub foo 1\r\nx\r\n").unwrap();
         assert_eq!(ops.len(), 2);
@@ -664,6 +726,7 @@ mod tests {
         want.extend_from_slice(b"yo\r\n");
         assert_eq!(hmsg.as_ref(), want.as_slice());
 
+        assert_eq!(encode_ping().as_ref(), b"PING\r\n");
         assert_eq!(encode_pong().as_ref(), b"PONG\r\n");
         assert_eq!(encode_ok().as_ref(), b"+OK\r\n");
         assert_eq!(

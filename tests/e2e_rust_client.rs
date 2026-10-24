@@ -89,7 +89,12 @@ async fn rust_client_queue_group() {
     publisher.flush().await.unwrap();
     let mut total = 0;
     let mut per_worker = [0usize; 2];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while total < 20 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out collecting queue deliveries: got {total}/20 ({per_worker:?})"
+        );
         tokio::select! {
             // Poll each subscriber in its own task-free loop is complex;
             // alternate short-timeout polls instead.

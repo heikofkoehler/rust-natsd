@@ -10,6 +10,13 @@ Explicitly out of scope (future phases, see end): JetStream persistence,
 clustering/routes, gateways, leaf nodes, MQTT/WebSocket gateways, monitoring
 HTTP endpoint.
 
+## Status (2026-10-23)
+
+Phases 0–6 **complete**: the Core NATS pub-sub protocol is fully implemented
+and verified against the unmodified official Go (`nats.go` v1.55.0) and Rust
+(`async-nats` 0.38) clients, plus raw-wire protocol tests. Future phases
+(routes, leaf nodes, JetStream) are listed at the end and not yet started.
+
 ## Phases
 
 ### Phase 0 — Scaffolding
