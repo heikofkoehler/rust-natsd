@@ -12,8 +12,12 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn write_conf(body: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("rust-natsd-conf-{}.conf", std::process::id()));
+fn write_conf(name: &str, body: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "rust-natsd-conf-{}-{}.conf",
+        std::process::id(),
+        name
+    ));
     std::fs::write(&path, body).expect("write conf");
     path
 }
@@ -22,7 +26,7 @@ fn write_conf(body: &str) -> std::path::PathBuf {
 async fn file_config_loads_and_cli_wins() {
     let http = free_port();
     let client_port = free_port();
-    let path = write_conf(&format!(
+    let path = write_conf("main", &format!(
         "host: 127.0.0.1\nport: 0\nserver_name: conf-name\nhttp_port: {http}\njetstream {{}}\ncluster {{\n  name: conf-cluster\n  port: 0\n  routes: [\"nats://127.0.0.1:6222\"]\n}}\n"
     ));
     let cfg = Config::from_args(&[
@@ -75,6 +79,7 @@ fn missing_config_file_errors() {
 #[test]
 fn file_auth_and_leafnodes() {
     let path = write_conf(
+        "auth",
         "authorization {\n  user: alice\n  password: secret\n}\nleafnodes {\n  port: 7433\n  remotes: [{url: \"nats://127.0.0.1:7432\"}]\n  authorization { user: leafu password: leafp }\n}\n",
     );
     let cfg = Config::from_args(&["-c".to_string(), path.to_string_lossy().to_string()])
