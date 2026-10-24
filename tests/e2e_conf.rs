@@ -13,10 +13,7 @@ fn free_port() -> u16 {
 }
 
 fn write_conf(body: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "rust-natsd-conf-{}.conf",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("rust-natsd-conf-{}.conf", std::process::id()));
     std::fs::write(&path, body).expect("write conf");
     path
 }
@@ -59,7 +56,10 @@ async fn file_config_loads_and_cli_wins() {
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await.expect("read");
     let text = String::from_utf8_lossy(&raw);
-    assert!(text.starts_with("HTTP/1.1 200"), "jsz enabled via file: {text}");
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "jsz enabled via file: {text}"
+    );
     std::fs::remove_file(&path).ok();
 }
 

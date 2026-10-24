@@ -13,9 +13,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$BIN" -a 127.0.0.1 -p 14231 &>/tmp/rust-natsd-go-e2e.log &
+# Single-node tests: disable the route listener, or both servers would
+# fight over the default cluster port 6222.
+"$BIN" -a 127.0.0.1 -p 14231 --cluster-port 0 &>/tmp/rust-natsd-go-e2e.log &
 PID1=$!
-"$BIN" -a 127.0.0.1 -p 14232 --user derek --pass s3cret &>/tmp/rust-natsd-go-e2e-auth.log &
+"$BIN" -a 127.0.0.1 -p 14232 --cluster-port 0 --user derek --pass s3cret &>/tmp/rust-natsd-go-e2e-auth.log &
 PID2=$!
 
 # Wait for both ports.
