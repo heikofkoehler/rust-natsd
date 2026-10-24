@@ -11,15 +11,16 @@
 //! - `cluster { name, host, port, routes }`
 //! - `leafnodes { port, remotes, authorization { user, password } }`
 //! - `jetstream` (boolean, or a block with `store_dir`)
+//! - `tls { cert_file, key_file, ca_file, verify }` (client listener only)
 //!
 //! Not supported (ignored or, for `include`, rejected): `include`,
-//! TLS sections, `accounts`, `system_account`, `no_auth_user`,
+//! `accounts`, `system_account`, `no_auth_user`,
 //! logging, limits, websocket/mqtt/gateway sections. A config using
 //! those will load, but the features stay off — the README says so.
 
 use std::collections::HashMap;
 
-use crate::config::{parse_size, Config};
+use crate::config::{parse_size, Config, TlsSettings};
 
 /// A parsed config value.
 #[derive(Debug, Clone, PartialEq)]
@@ -417,6 +418,23 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
                 cfg.leaf_pass = Some(p.to_string());
             }
         }
+    }
+    if let Some(v) = lookup(&top, "tls") {
+        let map = map_of(&v).ok_or("tls must be a block")?;
+        let mut tls: TlsSettings = cfg.tls.clone().unwrap_or_default();
+        if let Some(c) = map.get("cert_file").and_then(|v| v.as_str()) {
+            tls.cert_file = c.to_string();
+        }
+        if let Some(k) = map.get("key_file").and_then(|v| v.as_str()) {
+            tls.key_file = k.to_string();
+        }
+        if let Some(ca) = map.get("ca_file").and_then(|v| v.as_str()) {
+            tls.ca_file = Some(ca.to_string());
+        }
+        if let Some(b) = map.get("verify") {
+            tls.verify = matches!(b, Value::Bool(true));
+        }
+        cfg.tls = Some(tls);
     }
     if let Some(v) = lookup(&top, "jetstream") {
         match &v {

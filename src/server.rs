@@ -179,6 +179,9 @@ pub struct Shared {
     pub(crate) listen_addr: SocketAddr,
     pub(crate) cluster_addr: Option<SocketAddr>,
     pub(crate) leaf_addr: Option<SocketAddr>,
+    pub(crate) http_addr: Option<SocketAddr>,
+    /// TLS acceptor for client connections; None means plain text.
+    pub(crate) tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
     pub(crate) server_id: String,
     pub(crate) started: Instant,
     /// Wall-clock start time, for the monitoring endpoint's `start` field.
@@ -256,11 +259,21 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
     } else {
         None
     };
+    // Build the TLS acceptor up front so a bad cert/key is a startup
+    // error, not a per-connection failure.
+    let tls_acceptor = match &config.tls {
+        Some(settings) => Some(Arc::new(tokio_rustls::TlsAcceptor::from(
+            crate::tls::build_server_config(settings).map_err(|e| io::Error::other(e))?,
+        ))),
+        None => None,
+    };
     let shared = Arc::new(Shared {
         config,
         listen_addr: addr,
         cluster_addr,
         leaf_addr,
+        http_addr,
+        tls_acceptor,
         server_id: gen_server_id(),
         started: Instant::now(),
         started_wall: std::time::SystemTime::now(),
@@ -361,12 +374,64 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                         id, kind: "client", addr: peer.to_string(),
                         peer_id: None, started: Instant::now(),
                     });
-                    tokio::spawn(handle_conn(stream, shared.clone(), id));
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        match &shared.tls_acceptor {
+                            Some(acceptor) => {
+                                // Handshake first, INFO only inside TLS:
+                                // a plain-text client fails here and
+                                // never sees protocol bytes.
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        let (reader, writer) = tokio::io::split(tls_stream);
+                                        handle_conn(reader, writer, shared, id).await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("rust-natsd: TLS handshake failed: {e}");
+                                        shared.conn_info.lock().unwrap().remove(&id);
+                                    }
+                                }
+                            }
+                            None => {
+                                let (reader, writer) = stream.into_split();
+                                handle_conn(reader, writer, shared, id).await;
+                            }
+                        }
+                    });
                 }
                 Err(e) => eprintln!("rust-natsd: accept error: {e}"),
             },
         }
     }
+}
+
+/// Per-connection INFO nonce: 16 random bytes as hex. Read from
+/// /dev/urandom on Unix; on other platforms fall back to a
+/// time/pid/counter mix (documented as weak in protocol.rs).
+fn gen_nonce() -> String {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 16];
+            if f.read_exact(&mut buf).is_ok() {
+                return buf.iter().map(|b| format!("{b:02x}")).collect();
+            }
+        }
+    }
+    let mut x = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        ^ (std::process::id() as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
+    let mut s = String::with_capacity(32);
+    for _ in 0..16 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.push_str(&format!("{:02x}", (x & 0xff) as u8));
+    }
+    s
 }
 
 async fn route_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
@@ -402,10 +467,11 @@ async fn leaf_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
 /// Create a connection handle and spawn its writer task. Returns
 /// (handle, sender). The writer holds no sender itself, so dropping all
 /// senders flushes pending frames before the socket closes.
-fn spawn_writer(
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
-    shared: Arc<Shared>,
-) -> (Arc<ConnHandle>, mpsc::Sender<Bytes>) {
+/// Generic over the write half so plain TCP and TLS streams share it.
+fn spawn_writer<W>(mut writer: W, shared: Arc<Shared>) -> (Arc<ConnHandle>, mpsc::Sender<Bytes>)
+where
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOUND_CHANNEL_CAPACITY);
     let handle = ConnHandle::new(tx.clone());
     let closed = handle.closed.clone();
@@ -830,8 +896,11 @@ struct ConnState {
     echo: bool,
 }
 
-async fn handle_conn(stream: TcpStream, shared: Arc<Shared>, client_id: u64) {
-    let (mut reader, writer) = stream.into_split();
+async fn handle_conn<R, W>(mut reader: R, writer: W, shared: Arc<Shared>, client_id: u64)
+where
+    R: AsyncReadExt + Unpin + Send,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     let (handle, tx) = spawn_writer(writer, shared.clone());
     shared
         .conns
@@ -839,7 +908,9 @@ async fn handle_conn(stream: TcpStream, shared: Arc<Shared>, client_id: u64) {
         .unwrap()
         .insert(client_id, handle.clone());
 
-    // Send INFO first, per protocol.
+    // Send INFO first, per protocol. The nonce is generated per
+    // connection and is what an nkey client signs in CONNECT.
+    let nonce = gen_nonce();
     let info = ServerInfo {
         server_id: shared.server_id.clone(),
         server_name: shared.config.name.clone(),
@@ -850,6 +921,10 @@ async fn handle_conn(stream: TcpStream, shared: Arc<Shared>, client_id: u64) {
         host: shared.listen_addr.ip().to_string(),
         port: shared.listen_addr.port(),
         client_id,
+        nonce,
+        auth_required: shared.config.user.is_some() || shared.config.auth_token.is_some(),
+        tls_required: shared.config.tls_required(),
+        jetstream: shared.config.jetstream,
     };
     let _ = tx.send(encode_info(&info)).await;
 

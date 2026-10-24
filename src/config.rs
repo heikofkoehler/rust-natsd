@@ -2,6 +2,19 @@
 
 use crate::protocol::DEFAULT_MAX_PAYLOAD;
 
+/// TLS settings for the client listener. Presence of this struct (with a
+/// cert and key) means TLS is *required* on the client port: the server
+/// handshakes before sending INFO, so plain-text clients fail at the
+/// handshake. There is no mixed plain/TLS mode on one port, matching
+/// `nats-server` with a `tls {}` block.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TlsSettings {
+    pub cert_file: String,
+    pub key_file: String,
+    pub ca_file: Option<String>,
+    pub verify: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub host: String,
@@ -30,6 +43,8 @@ pub struct Config {
     pub js_store_dir: Option<String>,
     /// Monitoring HTTP port; 0 disables the monitor.
     pub http_port: u16,
+    /// TLS for client connections; None means plain text.
+    pub tls: Option<TlsSettings>,
 }
 
 impl Default for Config {
@@ -53,6 +68,7 @@ impl Default for Config {
             jetstream: false,
             js_store_dir: None,
             http_port: 0,
+            tls: None,
         }
     }
 }
@@ -177,6 +193,24 @@ impl Config {
                         .parse()
                         .map_err(|_| "invalid http port".to_string())?
                 }
+                "--tls" => {
+                    cfg.tls.get_or_insert_with(TlsSettings::default);
+                }
+                "--tlscert" => {
+                    let path = next(&mut i)?;
+                    cfg.tls.get_or_insert_with(TlsSettings::default).cert_file = path;
+                }
+                "--tlskey" => {
+                    let path = next(&mut i)?;
+                    cfg.tls.get_or_insert_with(TlsSettings::default).key_file = path;
+                }
+                "--tlsverify" => {
+                    cfg.tls.get_or_insert_with(TlsSettings::default).verify = true;
+                }
+                "--tlscacert" => {
+                    let path = next(&mut i)?;
+                    cfg.tls.get_or_insert_with(TlsSettings::default).ca_file = Some(path);
+                }
                 "-h" | "--help" => return Err(Self::usage()),
                 other => return Err(format!("unknown argument: {other}\n\n{}", Self::usage())),
             }
@@ -184,6 +218,17 @@ impl Config {
         }
         if cfg.pass.is_some() && cfg.user.is_none() {
             return Err("--pass requires --user".to_string());
+        }
+        if let Some(t) = &cfg.tls {
+            if t.cert_file.is_empty() || t.key_file.is_empty() {
+                return Err(
+                    "--tls requires --tlscert and --tlskey (or a tls block in the config file)"
+                        .to_string(),
+                );
+            }
+            if t.verify && t.ca_file.is_none() {
+                return Err("--tlsverify requires --tlscacert".to_string());
+            }
         }
         Ok(cfg)
     }
@@ -212,9 +257,19 @@ impl Config {
          \x20   --jetstream             Enable JetStream (in-memory)\n\
          \x20   --js-store-dir <DIR>    JetStream store dir (reserved)\n\
          \x20   --http-port <PORT>      Monitoring HTTP port, 0 disables (default 0)\n\
+         \x20   --tls                   Require TLS on the client port\n\
+         \x20   --tlscert <FILE>        TLS server certificate (PEM)\n\
+         \x20   --tlskey <FILE>         TLS server private key (PEM)\n\
+         \x20   --tlsverify             Require and verify client certificates\n\
+         \x20   --tlscacert <FILE>      CA file for client-certificate verification\n\
          \x20   -c, --config <FILE>     Config file (nats-server .conf subset)\n\
          \x20   -h, --help              Show this help"
             .to_string()
+    }
+
+    /// True when client connections must use TLS (a TLS config is set).
+    pub fn tls_required(&self) -> bool {
+        self.tls.is_some()
     }
 
     /// Effective cluster name: explicit value, else the server name.

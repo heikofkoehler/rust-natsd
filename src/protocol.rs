@@ -43,6 +43,22 @@ pub struct ConnectInfo {
     pub headers: bool,
     #[serde(default)]
     pub no_responders: bool,
+    /// NKey public key (standalone nkey auth; JWT operator mode is out of
+    /// scope — a `jwt` field alone does not authenticate).
+    #[serde(default, deserialize_with = "de_opt_string_null_as_none")]
+    pub nkey: Option<String>,
+    /// Base64-encoded Ed25519 signature of the INFO nonce bytes.
+    #[serde(default, deserialize_with = "de_opt_string_null_as_none")]
+    pub sig: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_string_null_as_none")]
+    pub jwt: Option<String>,
+}
+
+fn de_opt_string_null_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 fn default_true() -> bool {
@@ -59,6 +75,13 @@ where
 }
 
 /// Server `INFO` sent on connect.
+///
+/// `nonce` is always sent (not only when nkey auth is configured): clients
+/// that do not use nkeys ignore it, and always sending it keeps the INFO
+/// shape stable. It is a per-connection challenge string; the client
+/// signs its bytes for nkey auth. On Linux it is read from /dev/urandom
+/// (see server.rs); elsewhere it falls back to a time/pid/counter mix
+/// and is therefore not a strong nonce on non-Linux builds.
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerInfo {
     pub server_id: String,
@@ -70,6 +93,10 @@ pub struct ServerInfo {
     pub host: String,
     pub port: u16,
     pub client_id: u64,
+    pub nonce: String,
+    pub auth_required: bool,
+    pub tls_required: bool,
+    pub jetstream: bool,
 }
 
 /// A parsed client operation.
@@ -707,6 +734,10 @@ mod tests {
             host: "0.0.0.0".into(),
             port: 4222,
             client_id: 7,
+            nonce: "test-nonce".into(),
+            auth_required: false,
+            tls_required: false,
+            jetstream: false,
         };
         let bytes = encode_info(&info);
         let s = String::from_utf8_lossy(&bytes);

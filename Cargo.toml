@@ -18,6 +18,14 @@ tokio = { version = "1", features = ["full"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TLS: rustls with the ring provider (aws-lc-rs, rustls's default, is not
+# in the local cargo cache; ring is). tokio-rustls for the async adapter.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+# NKeys: standalone (non-JWT-operator) user auth, Ed25519 over the INFO nonce.
+nkeys = "0.4"
+base64 = "0.22"
 
 [dev-dependencies]
 async-nats = "0.38"
