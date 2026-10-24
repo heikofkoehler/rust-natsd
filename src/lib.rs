@@ -3,6 +3,7 @@
 //!
 //! See `PLAN.md` in the repository for the phased implementation plan.
 
+pub mod conf;
 pub mod config;
 pub mod jetstream;
 pub mod leaf;

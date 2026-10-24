@@ -107,7 +107,32 @@ impl Config {
     /// stdout via the returned Err message with exit code 0 semantics handled
     /// by the caller through `Config::usage()`.
     pub fn from_args(args: &[String]) -> Result<Config, String> {
-        let mut cfg = Config::default();
+        // A config file (-c/--config) loads first; explicit CLI flags
+        // applied afterwards win over file values.
+        let mut config_path: Option<String> = None;
+        let mut filtered: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = args[i].as_str();
+            if arg == "-c" || arg == "--config" {
+                i += 1;
+                config_path = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| format!("missing value for {arg}"))?,
+                );
+            } else if let Some(path) = arg.strip_prefix("--config=") {
+                config_path = Some(path.to_string());
+            } else {
+                filtered.push(args[i].clone());
+            }
+            i += 1;
+        }
+        let mut cfg = match &config_path {
+            Some(path) => crate::conf::load_file(&Config::default(), path)?,
+            None => Config::default(),
+        };
+        let args = &filtered;
         let mut i = 0;
         while i < args.len() {
             let arg = args[i].as_str();
@@ -187,6 +212,7 @@ impl Config {
          \x20   --jetstream             Enable JetStream (in-memory)\n\
          \x20   --js-store-dir <DIR>    JetStream store dir (reserved)\n\
          \x20   --http-port <PORT>      Monitoring HTTP port, 0 disables (default 0)\n\
+         \x20   -c, --config <FILE>     Config file (nats-server .conf subset)\n\
          \x20   -h, --help              Show this help"
             .to_string()
     }
