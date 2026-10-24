@@ -11,6 +11,25 @@ pub struct Config {
     pub user: Option<String>,
     pub pass: Option<String>,
     pub auth_token: Option<String>,
+    /// Cluster name; defaults to the server name (like `nats-server`).
+    pub cluster_name: Option<String>,
+    pub cluster_host: String,
+    /// Cluster (route) listener port; 0 disables the route listener.
+    pub cluster_port: u16,
+    /// Route endpoints to solicit, e.g. `nats://127.0.0.1:6222` (comma list).
+    pub routes: Vec<String>,
+    /// Leafnode listener port; 0 disables the leaf listener.
+    pub leaf_port: u16,
+    /// Hub leafnode endpoints to solicit (comma list).
+    pub leaf_urls: Vec<String>,
+    pub leaf_user: Option<String>,
+    pub leaf_pass: Option<String>,
+    /// Enable JetStream (in-memory streams; see jetstream.rs).
+    pub jetstream: bool,
+    /// JetStream store directory (reserved; current engine is in-memory).
+    pub js_store_dir: Option<String>,
+    /// Monitoring HTTP port; 0 disables the monitor.
+    pub http_port: u16,
 }
 
 impl Default for Config {
@@ -23,8 +42,45 @@ impl Default for Config {
             user: None,
             pass: None,
             auth_token: None,
+            cluster_name: None,
+            cluster_host: "0.0.0.0".to_string(),
+            cluster_port: 6222,
+            routes: Vec::new(),
+            leaf_port: 0,
+            leaf_urls: Vec::new(),
+            leaf_user: None,
+            leaf_pass: None,
+            jetstream: false,
+            js_store_dir: None,
+            http_port: 0,
         }
     }
+}
+
+/// Split a comma-separated CLI list, dropping empties.
+pub fn split_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Parse a route/leaf URL (`nats://host:port`, `nats-route://host:port`,
+/// or bare `host:port`) into (host, port).
+pub fn parse_route_url(url: &str) -> Result<(String, u16), String> {
+    let stripped = url
+        .strip_prefix("nats://")
+        .or_else(|| url.strip_prefix("nats-route://"))
+        .or_else(|| url.strip_prefix("nats-leaf://"))
+        .unwrap_or(url);
+    let stripped = stripped.trim_end_matches('/');
+    let (host, port) = stripped
+        .rsplit_once(':')
+        .ok_or_else(|| format!("invalid route url (need host:port): {url}"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("invalid route port: {url}"))?;
+    Ok((host.to_string(), port))
 }
 
 pub fn parse_size(s: &str) -> Result<usize, String> {
@@ -73,6 +129,29 @@ impl Config {
                 "--user" => cfg.user = Some(next(&mut i)?),
                 "--pass" => cfg.pass = Some(next(&mut i)?),
                 "--auth-token" => cfg.auth_token = Some(next(&mut i)?),
+                "--cluster-name" => cfg.cluster_name = Some(next(&mut i)?),
+                "--cluster-host" => cfg.cluster_host = next(&mut i)?,
+                "--cluster-port" => {
+                    cfg.cluster_port = next(&mut i)?
+                        .parse()
+                        .map_err(|_| "invalid cluster port".to_string())?
+                }
+                "--routes" => cfg.routes.extend(split_list(&next(&mut i)?)),
+                "--leaf-port" => {
+                    cfg.leaf_port = next(&mut i)?
+                        .parse()
+                        .map_err(|_| "invalid leaf port".to_string())?
+                }
+                "--leaf-urls" => cfg.leaf_urls.extend(split_list(&next(&mut i)?)),
+                "--leaf-user" => cfg.leaf_user = Some(next(&mut i)?),
+                "--leaf-pass" => cfg.leaf_pass = Some(next(&mut i)?),
+                "--jetstream" => cfg.jetstream = true,
+                "--js-store-dir" => cfg.js_store_dir = Some(next(&mut i)?),
+                "--http-port" => {
+                    cfg.http_port = next(&mut i)?
+                        .parse()
+                        .map_err(|_| "invalid http port".to_string())?
+                }
                 "-h" | "--help" => return Err(Self::usage()),
                 other => return Err(format!("unknown argument: {other}\n\n{}", Self::usage())),
             }
@@ -97,8 +176,26 @@ impl Config {
          \x20   --user <USER>           Require this username for CONNECT\n\
          \x20   --pass <PASS>           Require this password for CONNECT\n\
          \x20   --auth-token <TOKEN>    Require this auth token for CONNECT\n\
+         \x20   --cluster-name <NAME>   Cluster name (default: server name)\n\
+         \x20   --cluster-host <HOST>   Route listener host (default 0.0.0.0)\n\
+         \x20   --cluster-port <PORT>   Route listener port, 0 disables (default 6222)\n\
+         \x20   --routes <URLS>         Routes to solicit, comma list\n\
+         \x20   --leaf-port <PORT>      Leafnode listener port, 0 disables (default 0)\n\
+         \x20   --leaf-urls <URLS>      Hub leafnode endpoints, comma list\n\
+         \x20   --leaf-user <USER>      Username for solicited leaf connections\n\
+         \x20   --leaf-pass <PASS>      Password for solicited leaf connections\n\
+         \x20   --jetstream             Enable JetStream (in-memory)\n\
+         \x20   --js-store-dir <DIR>    JetStream store dir (reserved)\n\
+         \x20   --http-port <PORT>      Monitoring HTTP port, 0 disables (default 0)\n\
          \x20   -h, --help              Show this help"
             .to_string()
+    }
+
+    /// Effective cluster name: explicit value, else the server name.
+    pub fn effective_cluster_name(&self) -> String {
+        self.cluster_name
+            .clone()
+            .unwrap_or_else(|| self.name.clone())
     }
 
     /// Check a client's CONNECT credentials against the configured auth.

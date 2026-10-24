@@ -18,6 +18,7 @@ fn test_config() -> Config {
     Config {
         host: "127.0.0.1".into(),
         port: 0,
+        cluster_port: 0,
         ..Default::default()
     }
 }

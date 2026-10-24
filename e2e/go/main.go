@@ -210,15 +210,119 @@ func auth(url string) {
 	_ = nc
 }
 
+// cluster runs cross-node checks: subscribe on addr2, publish on addr1
+// (and the reverse), plus a queue group split across both nodes and a
+// request/reply across nodes. Used for route and leaf interop tests.
+func cluster(url1, url2 string) {
+	subConn, err := nats.Connect(url2, nats.Timeout(5*time.Second))
+	check("cluster connect node2", err)
+	if err != nil {
+		return
+	}
+	defer subConn.Close()
+	pubConn, err := nats.Connect(url1, nats.Timeout(5*time.Second))
+	check("cluster connect node1", err)
+	if err != nil {
+		return
+	}
+	defer pubConn.Close()
+
+	sub, err := subConn.SubscribeSync("xnode")
+	check("cluster subscribe node2", err)
+	_ = subConn.Flush()
+	// Retry publish until the route/leaf interest propagates.
+	got := false
+	for i := 0; i < 50 && !got; i++ {
+		_ = pubConn.Publish("xnode", []byte("across"))
+		_ = pubConn.Flush()
+		if msg, err := sub.NextMsg(100 * time.Millisecond); err == nil {
+			expect("cluster payload node1->node2", string(msg.Data) == "across", string(msg.Data))
+			got = true
+		}
+	}
+	expect("cluster delivery node1->node2", got, "no message in 5s")
+
+	// Reverse direction.
+	sub2, err := pubConn.SubscribeSync("xnode2")
+	check("cluster subscribe node1", err)
+	_ = pubConn.Flush()
+	got = false
+	for i := 0; i < 50 && !got; i++ {
+		_ = subConn.Publish("xnode2", []byte("back"))
+		_ = subConn.Flush()
+		if msg, err := sub2.NextMsg(100 * time.Millisecond); err == nil {
+			expect("cluster payload node2->node1", string(msg.Data) == "back", string(msg.Data))
+			got = true
+		}
+	}
+	expect("cluster delivery node2->node1", got, "no message in 5s")
+
+	// Queue group split across nodes: exactly 20 deliveries total.
+	q1, err := pubConn.QueueSubscribeSync("xjobs", "workers")
+	check("cluster queue node1", err)
+	q2, err := subConn.QueueSubscribeSync("xjobs", "workers")
+	check("cluster queue node2", err)
+	_ = pubConn.Flush()
+	_ = subConn.Flush()
+	time.Sleep(300 * time.Millisecond)
+	for i := 0; i < 20; i++ {
+		_ = pubConn.Publish("xjobs", []byte("x"))
+	}
+	_ = pubConn.Flush()
+	total := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for total < 20 && time.Now().Before(deadline) {
+		if _, err := q1.NextMsg(100 * time.Millisecond); err == nil {
+			total++
+			continue
+		}
+		if _, err := q2.NextMsg(100 * time.Millisecond); err == nil {
+			total++
+		}
+	}
+	expect("cluster queue total == 20", total == 20, fmt.Sprintf("got %d", total))
+
+	// Request/reply across nodes.
+	respSub, err := subConn.Subscribe("xsvc", func(m *nats.Msg) {
+		_ = m.Respond([]byte("pong"))
+	})
+	check("cluster responder", err)
+	defer respSub.Unsubscribe()
+	_ = subConn.Flush()
+	resp, err := pubConn.Request("xsvc", []byte("ping"), 5*time.Second)
+	check("cluster request", err)
+	if err == nil {
+		expect("cluster reply", string(resp.Data) == "pong", string(resp.Data))
+	}
+
+	// Headers across nodes.
+	hsub, err := subConn.SubscribeSync("xhdr")
+	check("cluster header subscribe", err)
+	_ = subConn.Flush()
+	hmsg := nats.NewMsg("xhdr")
+	hmsg.Data = []byte("body")
+	hmsg.Header.Set("X-Cross", "yes")
+	_ = pubConn.PublishMsg(hmsg)
+	msg, err := hsub.NextMsg(5 * time.Second)
+	check("cluster header receive", err)
+	if err == nil {
+		expect("cluster header value", msg.Header.Get("X-Cross") == "yes",
+			fmt.Sprintf("headers: %v", msg.Header))
+	}
+}
+
 func main() {
 	addr := flag.String("addr", "nats://127.0.0.1:4222", "server URL")
-	mode := flag.String("mode", "basic", "basic|auth")
+	addr2 := flag.String("addr2", "", "second server URL (cluster mode)")
+	mode := flag.String("mode", "basic", "basic|auth|cluster")
 	flag.Parse()
 	switch *mode {
 	case "basic":
 		basic(*addr)
 	case "auth":
 		auth(*addr)
+	case "cluster":
+		cluster(*addr, *addr2)
 	default:
 		fmt.Println("unknown mode:", *mode)
 		os.Exit(2)

@@ -1,22 +1,42 @@
-//! Tokio server core: listener, per-connection tasks, message routing.
+//! Tokio server core: client listener, cluster routes, leaf nodes, and
+//! message routing between them.
+//!
+//! Topology rules (full mesh for routes, hub-and-spoke for leafs):
+//! - A message published by a local client is delivered to local subscribers
+//!   and forwarded to every route/leaf with matching interest.
+//! - A message arriving on a route is delivered locally only (full mesh: the
+//!   origin already forwarded to every other node directly).
+//! - A message arriving on a leaf is delivered locally only (the leaf's hub
+//!   never forwards it back down the same leaf, and vice versa).
+//! - Subscription interest is propagated as RS+/RS- (routes) and LS+/LS-
+//!   (leafs) with a per-(pattern, queue) count, mirroring Go's weight
+//!   accounting closely enough for interop.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinSet;
 
-use crate::config::Config;
+use crate::config::{parse_route_url, Config};
+use crate::leaf::{
+    encode_lmsg, encode_ls_minus, encode_ls_plus, leaf_connect_json, leaf_info_json, LeafOp,
+    LeafParser,
+};
 use crate::protocol::{
     encode_err, encode_hmsg, encode_info, encode_msg, encode_ok, encode_pong, ClientOp, Parser,
     ServerInfo,
+};
+use crate::route::{
+    encode_rmsg, encode_route_hmsg, encode_rs_minus, encode_rs_plus, route_connect_json,
+    route_info_json, RouteOp, RouteParser,
 };
 use crate::sublist::{Sublist, Subscription};
 
@@ -24,14 +44,84 @@ use crate::sublist::{Sublist, Subscription};
 /// (queue full) is disconnected as a slow consumer, like `nats-server`.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
 
-struct ConnHandle {
+/// A message in flight: subject, optional reply, optional raw header block
+/// (starts with `NATS/1.0\r\n`, ends with `\r\n\r\n`), payload.
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub subject: String,
+    pub reply_to: Option<String>,
+    pub headers: Option<Bytes>,
+    pub payload: Bytes,
+}
+
+impl Message {
+    pub fn new(
+        subject: &str,
+        reply_to: Option<String>,
+        headers: Option<Bytes>,
+        payload: Bytes,
+    ) -> Self {
+        Message {
+            subject: subject.to_string(),
+            reply_to,
+            headers,
+            payload,
+        }
+    }
+
+    /// Parse the raw header block into (name, value) pairs. Malformed lines
+    /// are skipped; the `NATS/1.0` status line is skipped.
+    pub fn header_map(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        if let Some(h) = &self.headers {
+            let text = String::from_utf8_lossy(h);
+            for line in text.lines() {
+                if line.starts_with("NATS/") || line.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    out.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Where a message came from. Local carries (conn_id, echo flag).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Origin {
+    Local(u64, bool),
+    Route(u64),
+    Leaf(u64),
+    Internal,
+}
+
+/// Outbound channel + close signalling, shared by client, route and leaf
+/// connections. The writer task holds no sender, so dropping all senders
+/// flushes pending frames (e.g. a final -ERR) before the socket closes.
+pub(crate) struct ConnHandle {
     tx: mpsc::Sender<Bytes>,
     headers: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     close: Arc<Notify>,
+    in_msgs: AtomicU64,
+    out_msgs: AtomicU64,
+    out_bytes: AtomicU64,
 }
 
 impl ConnHandle {
+    fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
+        Arc::new(ConnHandle {
+            tx,
+            headers: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            close: Arc::new(Notify::new()),
+            in_msgs: AtomicU64::new(0),
+            out_msgs: AtomicU64::new(0),
+            out_bytes: AtomicU64::new(0),
+        })
+    }
     fn mark_closed(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.close.notify_waiters();
@@ -41,25 +131,83 @@ impl ConnHandle {
     }
 }
 
-struct Shared {
-    config: Config,
-    listen_addr: SocketAddr,
-    server_id: String,
-    sublist: Mutex<Sublist>,
-    conns: Mutex<HashMap<u64, Arc<ConnHandle>>>,
-    next_client_id: AtomicU64,
-    shutdown: Arc<Notify>,
+/// One inter-server connection's interest: pattern -> queue -> count.
+type InterestMap = HashMap<(String, Option<String>), u32>;
+
+/// A route peer connection.
+pub(crate) struct RouteConn {
+    peer_id: Mutex<Option<String>>,
+    /// The peer's cluster listen address (host:port from its INFO), used to
+    /// avoid dialing a peer we already have a connection to.
+    peer_listen_addr: Mutex<Option<String>>,
+    /// Server id of the connection's initiator (for duplicate resolution:
+    /// the connection initiated by the smaller server id wins).
+    initiator: String,
+    handle: Arc<ConnHandle>,
+}
+
+/// A leaf connection (either side of it: hub-side accepted, or leaf-side
+/// solicited — the protocol is symmetric after the handshake).
+pub(crate) struct LeafConn {
+    handle: Arc<ConnHandle>,
+}
+
+/// Connection metadata for the monitoring endpoint.
+#[derive(Debug, Clone)]
+pub struct ConnInfo {
+    pub id: u64,
+    pub kind: &'static str,
+    pub addr: String,
+    pub peer_id: Option<String>,
+    pub started: Instant,
+}
+
+/// Server-wide counters for the monitoring endpoint.
+#[derive(Default)]
+pub struct Stats {
+    pub in_msgs: AtomicU64,
+    pub out_msgs: AtomicU64,
+    pub in_bytes: AtomicU64,
+    pub out_bytes: AtomicU64,
+    pub total_connections: AtomicU64,
+}
+
+pub struct Shared {
+    pub(crate) config: Config,
+    pub(crate) listen_addr: SocketAddr,
+    pub(crate) cluster_addr: Option<SocketAddr>,
+    pub(crate) leaf_addr: Option<SocketAddr>,
+    pub(crate) server_id: String,
+    /// Read by the monitoring endpoint (Phase 10) for uptime.
+    #[allow(dead_code)]
+    pub(crate) started: Instant,
+    pub(crate) sublist: Mutex<Sublist>,
+    pub(crate) conns: Mutex<HashMap<u64, Arc<ConnHandle>>>,
+    pub(crate) conn_info: Mutex<HashMap<u64, ConnInfo>>,
+    pub(crate) routes: Mutex<HashMap<u64, Arc<RouteConn>>>,
+    pub(crate) route_subs: Mutex<HashMap<u64, InterestMap>>,
+    pub(crate) leafs: Mutex<HashMap<u64, Arc<LeafConn>>>,
+    pub(crate) leaf_subs: Mutex<HashMap<u64, InterestMap>>,
+    pub(crate) next_conn_id: AtomicU64,
+    pub(crate) stats: Stats,
+    pub(crate) shutdown: Arc<Notify>,
+    pub(crate) shutdown_flag: AtomicBool,
+    /// JetStream engine, present when `--jetstream` is set (Phase 9).
+    pub(crate) jetstream: Option<Arc<crate::jetstream::JetStream>>,
 }
 
 /// A running server instance; used by `main` and by tests.
 pub struct RunningServer {
     pub addr: SocketAddr,
+    pub cluster_addr: Option<SocketAddr>,
+    pub leaf_addr: Option<SocketAddr>,
+    pub http_addr: Option<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
     task: tokio::task::JoinHandle<io::Result<()>>,
 }
 
 impl RunningServer {
-    /// Signal shutdown and wait for the listener and connections to drain.
+    /// Signal shutdown and wait for listeners and connections to drain.
     pub async fn shutdown(self) -> io::Result<()> {
         let _ = self.shutdown_tx.send(true);
         match self.task.await {
@@ -69,112 +217,505 @@ impl RunningServer {
     }
 }
 
-/// Bind the listener and start serving in a background task.
+/// Bind listeners and start serving in a background supervisor task.
 pub async fn start(config: Config) -> io::Result<RunningServer> {
     let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
     let addr = listener.local_addr()?;
+    let cluster_listener = if config.cluster_port != 0 {
+        Some(TcpListener::bind((config.cluster_host.as_str(), config.cluster_port)).await?)
+    } else {
+        None
+    };
+    let cluster_addr = cluster_listener
+        .as_ref()
+        .map(|l| l.local_addr())
+        .transpose()?;
+    let leaf_listener = if config.leaf_port != 0 {
+        Some(TcpListener::bind((config.host.as_str(), config.leaf_port)).await?)
+    } else {
+        None
+    };
+    let leaf_addr = leaf_listener.as_ref().map(|l| l.local_addr()).transpose()?;
+    let jetstream = if config.jetstream {
+        Some(Arc::new(crate::jetstream::JetStream::new()))
+    } else {
+        None
+    };
     let shared = Arc::new(Shared {
         config,
         listen_addr: addr,
+        cluster_addr,
+        leaf_addr,
         server_id: gen_server_id(),
+        started: Instant::now(),
         sublist: Mutex::new(Sublist::new()),
         conns: Mutex::new(HashMap::new()),
-        next_client_id: AtomicU64::new(1),
+        conn_info: Mutex::new(HashMap::new()),
+        routes: Mutex::new(HashMap::new()),
+        route_subs: Mutex::new(HashMap::new()),
+        leafs: Mutex::new(HashMap::new()),
+        leaf_subs: Mutex::new(HashMap::new()),
+        next_conn_id: AtomicU64::new(1),
+        stats: Stats::default(),
         shutdown: Arc::new(Notify::new()),
+        shutdown_flag: AtomicBool::new(false),
+        jetstream,
     });
+    // JetStream nodes advertise $JS.API.> interest to routes/leafs so API
+    // requests published on other nodes are forwarded to the node that
+    // hosts the stream (see jetstream.rs).
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let task = tokio::spawn(run_loop(listener, shared, shutdown_rx));
+    let task = tokio::spawn(supervisor(
+        listener,
+        cluster_listener,
+        leaf_listener,
+        shared,
+        shutdown_rx,
+    ));
     Ok(RunningServer {
         addr,
+        cluster_addr,
+        leaf_addr,
+        http_addr: None,
         shutdown_tx,
         task,
     })
 }
 
-async fn run_loop(
+async fn supervisor(
     listener: TcpListener,
+    cluster_listener: Option<TcpListener>,
+    leaf_listener: Option<TcpListener>,
     shared: Arc<Shared>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let mut conn_tasks = JoinSet::new();
+    let mut tasks = JoinSet::new();
+    tasks.spawn(client_accept_loop(listener, shared.clone()));
+    if let Some(l) = cluster_listener {
+        tasks.spawn(route_accept_loop(l, shared.clone()));
+    }
+    if let Some(l) = leaf_listener {
+        tasks.spawn(leaf_accept_loop(l, shared.clone()));
+    }
+    // Solicited routes and leafs, each with its own retry loop.
+    for url in shared.config.routes.clone() {
+        tasks.spawn(solicit_route_loop(url, shared.clone()));
+    }
+    for url in shared.config.leaf_urls.clone() {
+        tasks.spawn(solicit_leaf_loop(url, shared.clone()));
+    }
+    if let Some(js) = &shared.jetstream {
+        tasks.spawn(crate::jetstream::redelivery_loop(
+            js.clone(),
+            shared.clone(),
+        ));
+    }
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() { break; }
             }
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, _peer)) => {
-                        let _ = stream.set_nodelay(true);
-                        conn_tasks.spawn(handle_conn(stream, shared.clone()));
-                    }
-                    Err(e) => {
-                        eprintln!("rust-natsd: accept error: {e}");
-                    }
-                }
-            }
-            _ = conn_tasks.join_next(), if !conn_tasks.is_empty() => {}
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
+    shared.shutdown_flag.store(true, Ordering::SeqCst);
     shared.shutdown.notify_waiters();
-    let drain = async { while conn_tasks.join_next().await.is_some() {} };
+    let drain = async { while tasks.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(Duration::from_secs(2), drain).await;
-    conn_tasks.abort_all();
+    tasks.abort_all();
     Ok(())
 }
+
+async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
+    loop {
+        tokio::select! {
+            _ = shared.shutdown.notified() => break,
+            res = listener.accept() => match res {
+                Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
+                    let id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
+                    shared.stats.total_connections.fetch_add(1, Ordering::Relaxed);
+                    shared.conn_info.lock().unwrap().insert(id, ConnInfo {
+                        id, kind: "client", addr: peer.to_string(),
+                        peer_id: None, started: Instant::now(),
+                    });
+                    tokio::spawn(handle_conn(stream, shared.clone(), id));
+                }
+                Err(e) => eprintln!("rust-natsd: accept error: {e}"),
+            },
+        }
+    }
+}
+
+async fn route_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
+    loop {
+        tokio::select! {
+            _ = shared.shutdown.notified() => break,
+            res = listener.accept() => match res {
+                Ok((stream, _peer)) => {
+                    let _ = stream.set_nodelay(true);
+                    tokio::spawn(handle_route_accepted(stream, shared.clone()));
+                }
+                Err(e) => eprintln!("rust-natsd: route accept error: {e}"),
+            },
+        }
+    }
+}
+
+async fn leaf_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
+    loop {
+        tokio::select! {
+            _ = shared.shutdown.notified() => break,
+            res = listener.accept() => match res {
+                Ok((stream, _peer)) => {
+                    let _ = stream.set_nodelay(true);
+                    tokio::spawn(handle_leaf_accepted(stream, shared.clone()));
+                }
+                Err(e) => eprintln!("rust-natsd: leaf accept error: {e}"),
+            },
+        }
+    }
+}
+
+/// Create a connection handle and spawn its writer task. Returns
+/// (handle, sender). The writer holds no sender itself, so dropping all
+/// senders flushes pending frames before the socket closes.
+fn spawn_writer(
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    shared: Arc<Shared>,
+) -> (Arc<ConnHandle>, mpsc::Sender<Bytes>) {
+    let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOUND_CHANNEL_CAPACITY);
+    let handle = ConnHandle::new(tx.clone());
+    let closed = handle.closed.clone();
+    let close = handle.close.clone();
+    let shutdown = shared.shutdown.clone();
+    tokio::spawn(async move {
+        let shutdown = shutdown.notified();
+        tokio::pin!(shutdown);
+        loop {
+            if closed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(bytes) => {
+                        if writer.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = close.notified() => break,
+                _ = &mut shutdown => break,
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+    (handle, tx)
+}
+
+/// Send a frame to a connection's queue. Returns false when the queue is
+/// full (slow consumer) or closed.
+fn try_send(handle: &ConnHandle, frame: Bytes) -> bool {
+    let n = frame.len() as u64;
+    match handle.tx.try_send(frame) {
+        Ok(()) => {
+            handle.out_msgs.fetch_add(1, Ordering::Relaxed);
+            handle.out_bytes.fetch_add(n, Ordering::Relaxed);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+/// Deliver a message: to local subscribers, and (unless it arrived on a
+/// route/leaf) forward it to routes and leafs with matching interest.
+pub fn deliver(shared: &Arc<Shared>, msg: &Message, origin: Origin) {
+    // JetStream capture / API handling happens before core delivery so a
+    // stream message is stored even when nobody is subscribed, and API
+    // requests are answered by the hosting node.
+    if let Some(js) = &shared.jetstream {
+        if crate::jetstream::handle_message(shared, js, msg, origin) {
+            // API requests and acks are consumed by JetStream; they are not
+            // also delivered as ordinary messages.
+            return;
+        }
+    }
+
+    let (publisher_conn, publisher_echo) = match origin {
+        Origin::Local(id, echo) => (id, echo),
+        _ => (u64::MAX, true),
+    };
+    let result = {
+        let mut sl = shared.sublist.lock().unwrap();
+        sl.match_recipients(&msg.subject, publisher_conn, publisher_echo)
+    };
+    let mut expired: Vec<(u64, String)> = Vec::new();
+    for d in &result.deliveries {
+        let target = shared.conns.lock().unwrap().get(&d.conn_id).cloned();
+        let Some(target) = target else { continue };
+        let frame = match &msg.headers {
+            Some(h) if target.headers.load(Ordering::SeqCst) => encode_hmsg(
+                &msg.subject,
+                &d.sid,
+                msg.reply_to.as_deref(),
+                h,
+                &msg.payload,
+            ),
+            _ => encode_msg(&msg.subject, &d.sid, msg.reply_to.as_deref(), &msg.payload),
+        };
+        if !try_send(&target, frame) {
+            eprintln!(
+                "rust-natsd: slow consumer, dropping connection {}",
+                d.conn_id
+            );
+            shared.sublist.lock().unwrap().remove_conn(d.conn_id);
+            if let Some(h) = shared.conns.lock().unwrap().remove(&d.conn_id) {
+                h.mark_closed();
+            }
+            shared.conn_info.lock().unwrap().remove(&d.conn_id);
+        }
+    }
+    expired.extend(result.expired.iter().cloned());
+    if !expired.is_empty() {
+        // Capture patterns before removal for RS-/LS- propagation.
+        let patterns: Vec<(String, Option<String>)> = {
+            let sl = shared.sublist.lock().unwrap();
+            expired
+                .iter()
+                .filter_map(|(cid, sid)| sl.pattern_of(*cid, sid))
+                .collect()
+        };
+        {
+            let mut sl = shared.sublist.lock().unwrap();
+            for (cid, sid) in &expired {
+                sl.remove(*cid, sid);
+            }
+        }
+        for (subject, queue) in patterns {
+            if !local_pattern_in_use(shared, &subject, queue.as_deref()) {
+                propagate_local_sub(shared, &subject, queue.as_deref(), false);
+            }
+        }
+    }
+    shared
+        .stats
+        .out_msgs
+        .fetch_add(result.deliveries.len() as u64, Ordering::Relaxed);
+
+    // Forward to routes (unless it came from a route).
+    if !matches!(origin, Origin::Route(_)) {
+        forward_to_routes(shared, msg);
+    }
+    // Forward to leafs (unless it came from a leaf).
+    if !matches!(origin, Origin::Leaf(_)) {
+        forward_to_leafs(shared, msg);
+    }
+}
+
+/// Compute (plain_match, queue_groups) for a subject against an interest map.
+fn match_interest(subs: &InterestMap, subject: &str) -> (bool, Vec<String>) {
+    let mut plain = false;
+    let mut queues: Vec<String> = Vec::new();
+    for ((pattern, queue), count) in subs {
+        if *count == 0 {
+            continue;
+        }
+        if !crate::subject::subject_matches(pattern, subject) {
+            continue;
+        }
+        match queue {
+            None => plain = true,
+            Some(q) => {
+                if !queues.contains(q) {
+                    queues.push(q.clone());
+                }
+            }
+        }
+    }
+    (plain, queues)
+}
+
+fn forward_to_routes(shared: &Arc<Shared>, msg: &Message) {
+    let routes: Vec<(u64, Arc<ConnHandle>)> = shared
+        .routes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, r)| (*id, r.handle.clone()))
+        .collect();
+    for (id, handle) in routes {
+        if handle.is_closed() {
+            continue;
+        }
+        let (plain, queues) = {
+            let subs = shared.route_subs.lock().unwrap();
+            match subs.get(&id) {
+                Some(m) => match_interest(m, &msg.subject),
+                None => (false, Vec::new()),
+            }
+        };
+        if !plain && queues.is_empty() {
+            continue;
+        }
+        let frame = match &msg.headers {
+            Some(h) => encode_route_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+            None => encode_rmsg(&msg.subject, msg.reply_to.as_deref(), &queues, &msg.payload),
+        };
+        if !try_send(&handle, frame) {
+            eprintln!("rust-natsd: slow route {id}, closing");
+            close_route(shared, id);
+        }
+    }
+}
+
+fn forward_to_leafs(shared: &Arc<Shared>, msg: &Message) {
+    let leafs: Vec<(u64, Arc<ConnHandle>)> = shared
+        .leafs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, l)| (*id, l.handle.clone()))
+        .collect();
+    for (id, handle) in leafs {
+        if handle.is_closed() {
+            continue;
+        }
+        let (plain, queues) = {
+            let subs = shared.leaf_subs.lock().unwrap();
+            match subs.get(&id) {
+                Some(m) => match_interest(m, &msg.subject),
+                None => (false, Vec::new()),
+            }
+        };
+        if !plain && queues.is_empty() {
+            continue;
+        }
+        let frame = encode_lmsg(
+            &msg.subject,
+            msg.reply_to.as_deref(),
+            &queues,
+            msg.headers.as_deref(),
+            &msg.payload,
+        );
+        if !try_send(&handle, frame) {
+            eprintln!("rust-natsd: slow leaf {id}, closing");
+            close_leaf(shared, id);
+        }
+    }
+}
+
+/// Broadcast a local subscription change to all routes and leafs.
+fn propagate_local_sub(shared: &Arc<Shared>, subject: &str, queue: Option<&str>, added: bool) {
+    let rframe = if added {
+        encode_rs_plus(subject, queue)
+    } else {
+        encode_rs_minus(subject, queue)
+    };
+    for r in shared.routes.lock().unwrap().values() {
+        if !r.handle.is_closed() {
+            let _ = try_send(&r.handle, rframe.clone());
+        }
+    }
+    let lframe = if added {
+        encode_ls_plus(subject, queue)
+    } else {
+        encode_ls_minus(subject, queue)
+    };
+    for l in shared.leafs.lock().unwrap().values() {
+        if !l.handle.is_closed() {
+            let _ = try_send(&l.handle, lframe.clone());
+        }
+    }
+}
+
+/// Does any local subscription (or JetStream internal pattern) still use
+/// this pattern+queue?
+fn local_pattern_in_use(shared: &Arc<Shared>, subject: &str, queue: Option<&str>) -> bool {
+    if shared.jetstream.is_some() && subject == "$JS.API.>" && queue.is_none() {
+        return true;
+    }
+    shared.sublist.lock().unwrap().has_pattern(subject, queue)
+}
+
+/// Send every local subscription (plus JetStream internal patterns) to one
+/// route or leaf connection as RS+/LS+ frames.
+fn send_local_interest(shared: &Arc<Shared>, handle: &ConnHandle, is_route: bool) {
+    let subs: Vec<(String, Option<String>)> = {
+        let sl = shared.sublist.lock().unwrap();
+        sl.patterns()
+    };
+    for (subject, queue) in subs {
+        let frame = if is_route {
+            encode_rs_plus(&subject, queue.as_deref())
+        } else {
+            encode_ls_plus(&subject, queue.as_deref())
+        };
+        let _ = try_send(handle, frame);
+    }
+    if shared.jetstream.is_some() {
+        let frame = if is_route {
+            encode_rs_plus("$JS.API.>", None)
+        } else {
+            encode_ls_plus("$JS.API.>", None)
+        };
+        let _ = try_send(handle, frame);
+    }
+}
+
+fn close_route(shared: &Arc<Shared>, id: u64) {
+    let removed = shared.routes.lock().unwrap().remove(&id);
+    shared.route_subs.lock().unwrap().remove(&id);
+    shared.conn_info.lock().unwrap().remove(&id);
+    if let Some(r) = removed {
+        r.handle.mark_closed();
+    }
+}
+
+fn close_leaf(shared: &Arc<Shared>, id: u64) {
+    let removed = shared.leafs.lock().unwrap().remove(&id);
+    shared.leaf_subs.lock().unwrap().remove(&id);
+    shared.conn_info.lock().unwrap().remove(&id);
+    if let Some(l) = removed {
+        l.handle.mark_closed();
+    }
+}
+
+/// Bump a counted interest entry by `delta` (+1 / -1), removing at zero.
+fn bump_interest(map: &mut InterestMap, subject: &str, queue: Option<&str>, delta: i32) {
+    let key = (subject.to_string(), queue.map(|q| q.to_string()));
+    let entry = map.entry(key).or_insert(0);
+    if delta > 0 {
+        *entry = entry.saturating_add(delta as u32);
+    } else {
+        *entry = entry.saturating_sub((-delta) as u32);
+        if *entry == 0 {
+            map.remove(&(subject.to_string(), queue.map(|q| q.to_string())));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client connections
+// ---------------------------------------------------------------------------
 
 struct ConnState {
     verbose: bool,
     echo: bool,
 }
 
-async fn handle_conn(stream: TcpStream, shared: Arc<Shared>) {
-    let client_id = shared.next_client_id.fetch_add(1, Ordering::SeqCst);
-    let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOUND_CHANNEL_CAPACITY);
-    let handle = Arc::new(ConnHandle {
-        tx: tx.clone(),
-        headers: Arc::new(AtomicBool::new(false)),
-        closed: Arc::new(AtomicBool::new(false)),
-        close: Arc::new(Notify::new()),
-    });
+async fn handle_conn(stream: TcpStream, shared: Arc<Shared>, client_id: u64) {
+    let (mut reader, writer) = stream.into_split();
+    let (handle, tx) = spawn_writer(writer, shared.clone());
     shared
         .conns
         .lock()
         .unwrap()
         .insert(client_id, handle.clone());
-
-    // Writer task: drain the outbound queue to the socket. It holds no
-    // channel sender, so when the reader side drops every sender the queue
-    // closes and the writer flushes what remains (e.g. a final -ERR) before
-    // exiting.
-    let writer_closed = handle.closed.clone();
-    let writer_close = handle.close.clone();
-    let writer_shutdown = shared.shutdown.clone();
-    tokio::spawn(async move {
-        let writer_shutdown = writer_shutdown.notified();
-        tokio::pin!(writer_shutdown);
-        loop {
-            if writer_closed.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::select! {
-                msg = rx.recv() => {
-                    match msg {
-                        Some(bytes) => {
-                            if writer.write_all(&bytes).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                _ = writer_close.notified() => break,
-                _ = &mut writer_shutdown => break,
-            }
-        }
-        let _ = writer.shutdown().await;
-    });
 
     // Send INFO first, per protocol.
     let info = ServerInfo {
@@ -229,8 +770,19 @@ async fn handle_conn(stream: TcpStream, shared: Arc<Shared>) {
     // Cleanup: subscriptions and connection registry. Dropping the last
     // channel senders closes the writer queue, so the writer flushes any
     // pending frames (e.g. a final -ERR) and then exits on its own.
-    shared.sublist.lock().unwrap().remove_conn(client_id);
+    let removed = {
+        let mut sl = shared.sublist.lock().unwrap();
+        let patterns = sl.patterns_for_conn(client_id);
+        sl.remove_conn(client_id);
+        patterns
+    };
+    for (subject, queue) in removed {
+        if !local_pattern_in_use(&shared, &subject, queue.as_deref()) {
+            propagate_local_sub(&shared, &subject, queue.as_deref(), false);
+        }
+    }
     shared.conns.lock().unwrap().remove(&client_id);
+    shared.conn_info.lock().unwrap().remove(&client_id);
     drop(tx);
     drop(handle);
 }
@@ -268,8 +820,16 @@ async fn process_op(
             reply_to,
             payload,
         } => {
-            route_message(
-                shared, client_id, state.echo, &subject, reply_to, None, payload,
+            handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared
+                .stats
+                .in_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            deliver(
+                shared,
+                &Message::new(&subject, reply_to, None, payload),
+                Origin::Local(client_id, state.echo),
             );
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
@@ -282,14 +842,16 @@ async fn process_op(
             headers,
             payload,
         } => {
-            route_message(
+            handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared
+                .stats
+                .in_bytes
+                .fetch_add((headers.len() + payload.len()) as u64, Ordering::Relaxed);
+            deliver(
                 shared,
-                client_id,
-                state.echo,
-                &subject,
-                reply_to,
-                Some(headers),
-                payload,
+                &Message::new(&subject, reply_to, Some(headers), payload),
+                Origin::Local(client_id, state.echo),
             );
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
@@ -301,11 +863,20 @@ async fn process_op(
             queue,
             sid,
         } => {
-            shared
-                .sublist
-                .lock()
-                .unwrap()
-                .add(Subscription::new(client_id, sid, subject, queue));
+            let is_new = {
+                let mut sl = shared.sublist.lock().unwrap();
+                let is_new = !sl.has_pattern(&subject, queue.as_deref());
+                sl.add(Subscription::new(
+                    client_id,
+                    sid,
+                    subject.clone(),
+                    queue.clone(),
+                ));
+                is_new
+            };
+            if is_new {
+                propagate_local_sub(shared, &subject, queue.as_deref(), true);
+            }
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
             }
@@ -314,7 +885,17 @@ async fn process_op(
         ClientOp::Unsub { sid, max } => {
             match max {
                 None => {
-                    shared.sublist.lock().unwrap().remove(client_id, &sid);
+                    let pattern = {
+                        let mut sl = shared.sublist.lock().unwrap();
+                        let p = sl.pattern_of(client_id, &sid);
+                        sl.remove(client_id, &sid);
+                        p
+                    };
+                    if let Some((subject, queue)) = pattern {
+                        if !local_pattern_in_use(shared, &subject, queue.as_deref()) {
+                            propagate_local_sub(shared, &subject, queue.as_deref(), false);
+                        }
+                    }
                 }
                 Some(max) => {
                     shared.sublist.lock().unwrap().set_max(client_id, &sid, max);
@@ -328,50 +909,678 @@ async fn process_op(
     }
 }
 
-/// Resolve recipients and deliver one message. Called without holding any
-/// lock while writing to subscriber queues.
-fn route_message(
-    shared: &Arc<Shared>,
-    publisher_id: u64,
-    publisher_echo: bool,
-    subject: &str,
-    reply_to: Option<String>,
-    headers: Option<Bytes>,
-    payload: Bytes,
-) {
-    let result = {
-        let mut sl = shared.sublist.lock().unwrap();
-        sl.match_recipients(subject, publisher_id, publisher_echo)
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+fn json_str(json: &str, field: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get(field)?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+fn json_u64(json: &str, field: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get(field)?
+        .as_u64()
+}
+
+/// Read one CRLF-terminated line from a buffered reader.
+async fn read_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> io::Result<String> {
+    let mut buf = Vec::new();
+    let n = reader.read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+    }
+    Ok(String::from_utf8_lossy(&buf).trim_end().to_string())
+}
+
+fn route_info_text(shared: &Arc<Shared>) -> String {
+    let (host, port) = match shared.cluster_addr {
+        Some(a) => (a.ip().to_string(), a.port()),
+        None => (
+            shared.config.cluster_host.clone(),
+            shared.config.cluster_port,
+        ),
     };
-    for d in &result.deliveries {
-        let target = shared.conns.lock().unwrap().get(&d.conn_id).cloned();
-        let Some(target) = target else { continue };
-        let frame = match &headers {
-            Some(h) if target.headers.load(Ordering::SeqCst) => {
-                encode_hmsg(subject, &d.sid, reply_to.as_deref(), h, &payload)
-            }
-            _ => encode_msg(subject, &d.sid, reply_to.as_deref(), &payload),
-        };
-        match target.tx.try_send(frame) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Slow consumer: drop the connection entirely.
-                eprintln!(
-                    "rust-natsd: slow consumer, dropping connection {}",
-                    d.conn_id
-                );
-                shared.sublist.lock().unwrap().remove_conn(d.conn_id);
-                if let Some(h) = shared.conns.lock().unwrap().remove(&d.conn_id) {
-                    h.mark_closed();
-                }
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+    route_info_json(
+        &shared.server_id,
+        &shared.config.name,
+        &shared.config.effective_cluster_name(),
+        &host,
+        port,
+        shared.config.max_payload,
+        shared.listen_addr,
+    )
+}
+
+async fn handle_route_accepted(stream: TcpStream, shared: Arc<Shared>) {
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let (handle, tx) = spawn_writer(writer, shared.clone());
+    // Accepter sends INFO first.
+    if tx
+        .send(Bytes::from(format!(
+            "INFO {}\r\n",
+            route_info_text(&shared)
+        )))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Then expects CONNECT, then INFO from the peer.
+    let connect_line = match read_line(&mut reader).await {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let Some(connect_json) = connect_line.strip_prefix("CONNECT ") else {
+        return;
+    };
+    if let Some(cluster) = json_str(connect_json, "cluster") {
+        if cluster != shared.config.effective_cluster_name() {
+            let _ = tx.send(encode_err("Cluster Name Mismatch")).await;
+            return;
         }
     }
-    if !result.expired.is_empty() {
-        let mut sl = shared.sublist.lock().unwrap();
-        for (cid, sid) in &result.expired {
-            sl.remove(*cid, sid);
+    let info_line = match read_line(&mut reader).await {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let Some(info_json) = info_line.strip_prefix("INFO ") else {
+        return;
+    };
+    let Some(peer_id) = json_str(info_json, "server_id") else {
+        return;
+    };
+    if let Some(cluster) = json_str(info_json, "cluster") {
+        if cluster != shared.config.effective_cluster_name() {
+            let _ = tx.send(encode_err("Cluster Name Mismatch")).await;
+            return;
+        }
+    }
+    let peer_listen = match (json_str(info_json, "host"), json_u64(info_json, "port")) {
+        (Some(h), Some(p)) => Some(format!("{h}:{p}")),
+        _ => None,
+    };
+    let id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
+    shared
+        .stats
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    // Inbound connection: the initiator is the peer.
+    if !register_route(
+        &shared,
+        id,
+        peer_id.clone(),
+        peer_listen,
+        peer_id.clone(),
+        handle.clone(),
+    ) {
+        handle.mark_closed();
+        return;
+    }
+    shared.conn_info.lock().unwrap().insert(
+        id,
+        ConnInfo {
+            id,
+            kind: "route",
+            addr: peer_listen_addr(&shared, id),
+            peer_id: Some(peer_id),
+            started: Instant::now(),
+        },
+    );
+    send_local_interest(&shared, &handle, true);
+    route_read_loop(&mut reader, &shared, id, &handle, &tx).await;
+    close_route(&shared, id);
+}
+
+fn peer_listen_addr(shared: &Arc<Shared>, id: u64) -> String {
+    shared
+        .routes
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|r| r.peer_listen_addr.lock().unwrap().clone())
+        .unwrap_or_default()
+}
+
+/// Register a route connection, resolving duplicates by keeping the
+/// connection initiated by the smaller server id. Returns false when this
+/// connection lost the duplicate race and must be closed.
+fn register_route(
+    shared: &Arc<Shared>,
+    id: u64,
+    peer_id: String,
+    peer_listen: Option<String>,
+    initiator: String,
+    handle: Arc<ConnHandle>,
+) -> bool {
+    let mut routes = shared.routes.lock().unwrap();
+    let mut losers: Vec<u64> = Vec::new();
+    for (eid, r) in routes.iter() {
+        let same = r.peer_id.lock().unwrap().as_deref() == Some(peer_id.as_str());
+        if same {
+            if initiator < r.initiator {
+                losers.push(*eid);
+            } else {
+                return false;
+            }
+        }
+    }
+    for eid in losers {
+        if let Some(r) = routes.remove(&eid) {
+            r.handle.mark_closed();
+        }
+        shared.route_subs.lock().unwrap().remove(&eid);
+        shared.conn_info.lock().unwrap().remove(&eid);
+    }
+    routes.insert(
+        id,
+        Arc::new(RouteConn {
+            peer_id: Mutex::new(Some(peer_id)),
+            peer_listen_addr: Mutex::new(peer_listen),
+            initiator,
+            handle,
+        }),
+    );
+    shared.route_subs.lock().unwrap().insert(id, HashMap::new());
+    true
+}
+
+async fn solicit_route_loop(url: String, shared: Arc<Shared>) {
+    let Ok((host, port)) = parse_route_url(&url) else {
+        eprintln!("rust-natsd: invalid route url: {url}");
+        return;
+    };
+    let target = format!("{host}:{port}");
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if shared.shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        // Skip dialing when we already have a route to this peer.
+        let already = {
+            let routes = shared.routes.lock().unwrap();
+            routes
+                .values()
+                .any(|r| r.peer_listen_addr.lock().unwrap().as_deref() == Some(target.as_str()))
+        };
+        if already {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        match TcpStream::connect((host.as_str(), port)).await {
+            Ok(stream) => {
+                backoff = Duration::from_secs(1);
+                let _ = stream.set_nodelay(true);
+                handle_route_solicited(stream, shared.clone(), target.clone()).await;
+            }
+            Err(_) => {
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, Duration::from_secs(5));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn handle_route_solicited(stream: TcpStream, shared: Arc<Shared>, target: String) {
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let (handle, tx) = spawn_writer(writer, shared.clone());
+    // Dialer sends CONNECT first, then reads peer INFO, then sends INFO.
+    let connect = route_connect_json(&shared.server_id, &shared.config.effective_cluster_name());
+    if tx
+        .send(Bytes::from(format!("CONNECT {connect}\r\n")))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let info_line = match read_line(&mut reader).await {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let Some(info_json) = info_line.strip_prefix("INFO ") else {
+        return;
+    };
+    let Some(peer_id) = json_str(info_json, "server_id") else {
+        return;
+    };
+    if let Some(cluster) = json_str(info_json, "cluster") {
+        if cluster != shared.config.effective_cluster_name() {
+            let _ = tx.send(encode_err("Cluster Name Mismatch")).await;
+            return;
+        }
+    }
+    if tx
+        .send(Bytes::from(format!(
+            "INFO {}\r\n",
+            route_info_text(&shared)
+        )))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
+    shared
+        .stats
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    // Solicited connection: the initiator is us.
+    if !register_route(
+        &shared,
+        id,
+        peer_id.clone(),
+        Some(target),
+        shared.server_id.clone(),
+        handle.clone(),
+    ) {
+        handle.mark_closed();
+        return;
+    }
+    shared.conn_info.lock().unwrap().insert(
+        id,
+        ConnInfo {
+            id,
+            kind: "route",
+            addr: peer_listen_addr(&shared, id),
+            peer_id: Some(peer_id),
+            started: Instant::now(),
+        },
+    );
+    send_local_interest(&shared, &handle, true);
+    route_read_loop(&mut reader, &shared, id, &handle, &tx).await;
+    close_route(&shared, id);
+}
+
+async fn route_read_loop(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    shared: &Arc<Shared>,
+    id: u64,
+    handle: &Arc<ConnHandle>,
+    tx: &mpsc::Sender<Bytes>,
+) {
+    let mut parser = RouteParser::new(shared.config.max_payload);
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        if handle.is_closed() {
+            break;
+        }
+        let n = tokio::select! {
+            _ = handle.close.notified() => break,
+            _ = shared.shutdown.notified() => break,
+            r = reader.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            },
+        };
+        parser.feed(&buf[..n]);
+        let mut close = false;
+        loop {
+            match parser.next_op() {
+                Ok(Some(op)) => {
+                    if !process_route_op(op, shared, id, handle, tx).await {
+                        close = true;
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(encode_err(&e.to_string())).await;
+                    close = true;
+                    break;
+                }
+            }
+        }
+        if close {
+            break;
+        }
+    }
+}
+
+/// Process one route operation. Returns false when the connection must close.
+async fn process_route_op(
+    op: RouteOp,
+    shared: &Arc<Shared>,
+    id: u64,
+    handle: &Arc<ConnHandle>,
+    tx: &mpsc::Sender<Bytes>,
+) -> bool {
+    match op {
+        RouteOp::Info(_) | RouteOp::Connect(_) | RouteOp::Pong => true,
+        RouteOp::Ping => {
+            let _ = tx.send(Bytes::from("PONG\r\n")).await;
+            true
+        }
+        RouteOp::RsPlus { subject, queue, .. } => {
+            let mut subs = shared.route_subs.lock().unwrap();
+            if let Some(m) = subs.get_mut(&id) {
+                bump_interest(m, &subject, queue.as_deref(), 1);
+            }
+            true
+        }
+        RouteOp::RsMinus { subject, queue, .. } => {
+            let mut subs = shared.route_subs.lock().unwrap();
+            if let Some(m) = subs.get_mut(&id) {
+                bump_interest(m, &subject, queue.as_deref(), -1);
+            }
+            true
+        }
+        RouteOp::RMsg {
+            subject,
+            reply_to,
+            headers,
+            payload,
+            ..
+        } => {
+            handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared.stats.in_bytes.fetch_add(
+                (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
+                Ordering::Relaxed,
+            );
+            deliver(
+                shared,
+                &Message::new(&subject, reply_to, headers, payload),
+                Origin::Route(id),
+            );
+            true
+        }
+        RouteOp::Err(e) => {
+            eprintln!("rust-natsd: route {id} error: {e}");
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf nodes
+// ---------------------------------------------------------------------------
+
+fn leaf_info_text(shared: &Arc<Shared>) -> String {
+    let (host, port) = match shared.leaf_addr {
+        Some(a) => (a.ip().to_string(), a.port()),
+        None => (shared.config.host.clone(), shared.config.leaf_port),
+    };
+    leaf_info_json(
+        &shared.server_id,
+        &shared.config.name,
+        &host,
+        port,
+        shared.config.max_payload,
+        shared.config.jetstream,
+        &shared.config.effective_cluster_name(),
+    )
+}
+
+async fn handle_leaf_accepted(stream: TcpStream, shared: Arc<Shared>) {
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let (handle, tx) = spawn_writer(writer, shared.clone());
+    // Hub sends INFO first.
+    if tx
+        .send(Bytes::from(format!("INFO {}\r\n", leaf_info_text(&shared))))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Then expects leaf INFO, then leaf CONNECT.
+    let info_line = match read_line(&mut reader).await {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let Some(info_json) = info_line.strip_prefix("INFO ") else {
+        return;
+    };
+    let Some(peer_id) = json_str(info_json, "server_id") else {
+        return;
+    };
+    let connect_line = match read_line(&mut reader).await {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let Some(connect_json) = connect_line.strip_prefix("CONNECT ") else {
+        return;
+    };
+    if !leaf_connect_authorized(&shared, connect_json) {
+        let _ = tx.send(encode_err("Authorization Violation")).await;
+        return;
+    }
+    let id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
+    shared
+        .stats
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    shared.leafs.lock().unwrap().insert(
+        id,
+        Arc::new(LeafConn {
+            handle: handle.clone(),
+        }),
+    );
+    shared.leaf_subs.lock().unwrap().insert(id, HashMap::new());
+    shared.conn_info.lock().unwrap().insert(
+        id,
+        ConnInfo {
+            id,
+            kind: "leaf",
+            addr: String::new(),
+            peer_id: Some(peer_id),
+            started: Instant::now(),
+        },
+    );
+    send_local_interest(&shared, &handle, false);
+    leaf_read_loop(&mut reader, &shared, id, &handle, &tx).await;
+    close_leaf(&shared, id);
+}
+
+/// Hub-side leaf auth: explicit --leaf-user/--leaf-pass win; otherwise the
+/// server's client auth (if any) applies; otherwise open.
+fn leaf_connect_authorized(shared: &Arc<Shared>, connect_json: &str) -> bool {
+    if let Some(user) = &shared.config.leaf_user {
+        let ok_user = json_str(connect_json, "user").as_deref() == Some(user.as_str());
+        let ok_pass =
+            json_str(connect_json, "pass").as_deref() == shared.config.leaf_pass.as_deref();
+        return ok_user && ok_pass;
+    }
+    if shared.config.user.is_some() {
+        let ok_user = json_str(connect_json, "user").as_deref() == shared.config.user.as_deref();
+        let ok_pass = json_str(connect_json, "pass").as_deref() == shared.config.pass.as_deref();
+        return ok_user && ok_pass;
+    }
+    true
+}
+
+async fn solicit_leaf_loop(url: String, shared: Arc<Shared>) {
+    let Ok((host, port)) = parse_route_url(&url) else {
+        eprintln!("rust-natsd: invalid leaf url: {url}");
+        return;
+    };
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if shared.shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        match TcpStream::connect((host.as_str(), port)).await {
+            Ok(stream) => {
+                backoff = Duration::from_secs(1);
+                let _ = stream.set_nodelay(true);
+                handle_leaf_solicited(stream, shared.clone()).await;
+            }
+            Err(_) => {
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, Duration::from_secs(5));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn handle_leaf_solicited(stream: TcpStream, shared: Arc<Shared>) {
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let (handle, tx) = spawn_writer(writer, shared.clone());
+    // Hub INFO first, then leaf sends INFO + CONNECT.
+    let info_line = match read_line(&mut reader).await {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let Some(_hub_info) = info_line.strip_prefix("INFO ") else {
+        return;
+    };
+    if tx
+        .send(Bytes::from(format!("INFO {}\r\n", leaf_info_text(&shared))))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let connect = leaf_connect_json(
+        &shared.server_id,
+        &shared.config.name,
+        &shared.config.effective_cluster_name(),
+        shared.config.jetstream,
+        shared.config.leaf_user.as_deref(),
+        shared.config.leaf_pass.as_deref(),
+    );
+    if tx
+        .send(Bytes::from(format!("CONNECT {connect}\r\n")))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // The hub identifies us by our INFO server_id; we don't learn a peer id
+    // until the hub sends something addressed to us, so track it as the hub
+    // address. (Peer id is informational only for leafs.)
+    let id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
+    shared
+        .stats
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    shared.leafs.lock().unwrap().insert(
+        id,
+        Arc::new(LeafConn {
+            handle: handle.clone(),
+        }),
+    );
+    shared.leaf_subs.lock().unwrap().insert(id, HashMap::new());
+    shared.conn_info.lock().unwrap().insert(
+        id,
+        ConnInfo {
+            id,
+            kind: "leaf",
+            addr: String::new(),
+            peer_id: None,
+            started: Instant::now(),
+        },
+    );
+    send_local_interest(&shared, &handle, false);
+    leaf_read_loop(&mut reader, &shared, id, &handle, &tx).await;
+    close_leaf(&shared, id);
+}
+
+async fn leaf_read_loop(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    shared: &Arc<Shared>,
+    id: u64,
+    handle: &Arc<ConnHandle>,
+    tx: &mpsc::Sender<Bytes>,
+) {
+    let mut parser = LeafParser::new(shared.config.max_payload);
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        if handle.is_closed() {
+            break;
+        }
+        let n = tokio::select! {
+            _ = handle.close.notified() => break,
+            _ = shared.shutdown.notified() => break,
+            r = reader.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            },
+        };
+        parser.feed(&buf[..n]);
+        let mut close = false;
+        loop {
+            match parser.next_op() {
+                Ok(Some(op)) => {
+                    if !process_leaf_op(op, shared, id, handle, tx).await {
+                        close = true;
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(encode_err(&e.to_string())).await;
+                    close = true;
+                    break;
+                }
+            }
+        }
+        if close {
+            break;
+        }
+    }
+}
+
+async fn process_leaf_op(
+    op: LeafOp,
+    shared: &Arc<Shared>,
+    id: u64,
+    handle: &Arc<ConnHandle>,
+    tx: &mpsc::Sender<Bytes>,
+) -> bool {
+    match op {
+        LeafOp::Info(_) | LeafOp::Connect(_) | LeafOp::Pong => true,
+        LeafOp::Ping => {
+            let _ = tx.send(Bytes::from("PONG\r\n")).await;
+            true
+        }
+        LeafOp::LsPlus { subject, queue } => {
+            let mut subs = shared.leaf_subs.lock().unwrap();
+            if let Some(m) = subs.get_mut(&id) {
+                bump_interest(m, &subject, queue.as_deref(), 1);
+            }
+            true
+        }
+        LeafOp::LsMinus { subject, queue } => {
+            let mut subs = shared.leaf_subs.lock().unwrap();
+            if let Some(m) = subs.get_mut(&id) {
+                bump_interest(m, &subject, queue.as_deref(), -1);
+            }
+            true
+        }
+        LeafOp::LMsg {
+            subject,
+            reply_to,
+            headers,
+            payload,
+            ..
+        } => {
+            handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared.stats.in_bytes.fetch_add(
+                (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
+                Ordering::Relaxed,
+            );
+            deliver(
+                shared,
+                &Message::new(&subject, reply_to, headers, payload),
+                Origin::Leaf(id),
+            );
+            true
+        }
+        LeafOp::Err(e) => {
+            eprintln!("rust-natsd: leaf {id} error: {e}");
+            false
         }
     }
 }

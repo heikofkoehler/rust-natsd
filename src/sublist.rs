@@ -82,6 +82,48 @@ impl Sublist {
         self.subs.retain(|s| s.conn_id != conn_id);
     }
 
+    /// Pattern+queue of one subscription, if it exists.
+    pub fn pattern_of(&self, conn_id: u64, sid: &str) -> Option<(String, Option<String>)> {
+        self.subs
+            .iter()
+            .find(|s| s.conn_id == conn_id && s.sid == sid)
+            .map(|s| (s.subject.clone(), s.queue.clone()))
+    }
+
+    /// True when any subscription uses this exact pattern+queue.
+    pub fn has_pattern(&self, subject: &str, queue: Option<&str>) -> bool {
+        self.subs
+            .iter()
+            .any(|s| s.subject == subject && s.queue.as_deref() == queue)
+    }
+
+    /// Distinct (pattern, queue) pairs for one connection.
+    pub fn patterns_for_conn(&self, conn_id: u64) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        for s in &self.subs {
+            if s.conn_id == conn_id {
+                let key = (s.subject.clone(), s.queue.clone());
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+        out
+    }
+
+    /// Distinct (pattern, queue) pairs currently subscribed, for
+    /// RS+/LS+ interest sync to a newly connected route or leaf.
+    pub fn patterns(&self) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        for s in &self.subs {
+            let key = (s.subject.clone(), s.queue.clone());
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        out
+    }
+
     /// Set the auto-unsubscribe max for a subscription. If the subscription
     /// has already delivered at least `max` messages it is removed
     /// immediately and `true` is returned.
