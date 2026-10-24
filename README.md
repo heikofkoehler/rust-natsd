@@ -104,6 +104,45 @@ Test layers, by design:
    string fields, which the parser originally rejected; Go's leaf protocol
    differs from the docs in several places (see below).
 
+## Parity suite
+
+```sh
+bash scripts/parity.sh                 # full run (raw probes + JS/KV + persistence + cluster/leaf smoke)
+bash scripts/parity.sh --skip-cluster  # skip the cluster/leaf smoke scripts
+bash scripts/parity.sh --strict        # also fail on known diffs
+PARITY_KEEP_TMP=1 bash scripts/parity.sh  # keep configs/logs/results under /tmp for debugging
+```
+
+The suite builds rust-natsd (release), locates Go nats-server v2.15.1
+(`GO_NATS_SERVER`, the `~/workspace/tools/` copy, or a download of the
+`nats-server-v2.15.1-linux-amd64.tar.gz` release asset), starts both
+servers side by side on free ports with matching configs, runs the same
+probes against both, and compares semantic outcomes — delivered
+subjects/payloads, counts, `-ERR` class, connection alive/closed, and
+monitoring field values for supported fields. Per-run random values
+(server_id, client_id, ports, timestamps, version, git_commit, …) are
+stripped, never compared.
+
+Reading the table: each case is `pass` (identical semantics), `known`
+(diverges exactly as recorded in `parity/KNOWN_DIFFS.md`), `fail` (a new
+divergence), or `harness_error` (the probe itself broke). Default mode
+is green with only known diffs; strict mode fails on known diffs too.
+Exit codes: 0 green, 1 divergence, 2 setup failure.
+
+Layout: `scripts/parity.sh` (orchestration, servers, certs, JS/KV,
+persistence, smoke), `parity/probes.py` (raw-wire probes + comparison),
+`parity/go_client/` (nats.go probe client: JetStream + KV, and the
+nkeytool signer), `parity/KNOWN_DIFFS.md` (every accepted divergence,
+classified intentional vs accepted gap, with fix sketches).
+
+Adding a case: write a probe function in `parity/probes.py` returning
+`{"go": …, "rust": …}` semantic outcomes, register it in `CASES`, and
+run the suite. If it finds a real server bug, record it as a candidate
+fix in `parity/KNOWN_DIFFS.md` — do not change `src/` to make the
+suite pass. Updating KNOWN_DIFFS: add the entry (class, severity,
+reason or fix sketch) and a shape check in `known_shape_ok` so the case
+only counts as known when it diverges in the recorded shape.
+
 ## Interop notes (Go behavior that differs from the docs)
 
 These were all found empirically against `nats-server` v2.15.1 and are

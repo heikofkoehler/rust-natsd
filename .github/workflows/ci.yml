@@ -31,3 +31,20 @@ jobs:
           go-version: "1.23"
       - name: Go client (nats.go) e2e against rust-natsd
         run: bash scripts/e2e-go.sh
+
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Go-vs-Rust parity suite
+        # parity.sh downloads the Go nats-server v2.15.1 release asset
+        # itself when GO_NATS_SERVER is unset; openssl/python3/curl are
+        # preinstalled on ubuntu-latest. The parity servers use free
+        # ports; only the cluster/leaf smoke scripts it invokes use
+        # fixed high ports (14240/14241, 16222/16223), which do not
+        # collide with anything on a stock runner.
+        run: bash scripts/parity.sh

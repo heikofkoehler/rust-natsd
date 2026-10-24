@@ -175,6 +175,23 @@ KV/object-store client helpers (their server-side primitives exist).
   `/subz` and `/leafz` report the real account per entry.
 - Verified: `tests/e2e_monitor.rs`.
 
+### Phase 17 — Go-vs-Rust parity suite (test-only, no `src/` changes)
+- `scripts/parity.sh` + `parity/probes.py` + `parity/go_client/`:
+  repeatable side-by-side run of Go nats-server v2.15.1 and rust-natsd
+  on free ports with matching configs. Raw-wire probes (core, auth,
+  token, limits, subject validation, reply, TLS, nkey, accounts,
+  monitoring) plus a nats.go probe client (JetStream pull/push, acks/
+  redelivery, MSG.GET, purge/delete, workqueue, persistence across
+  restart, KV basics) and the existing cluster/leaf smoke scripts.
+- Normalisation: strip server_id, client_id, ports, timestamps,
+  version, git_commit and other per-run values; compare semantic
+  outcomes. `parity/KNOWN_DIFFS.md` records every divergence found,
+  classified intentional vs accepted gap with fix sketches; the
+  default run is green with only known diffs, `--strict` fails on
+  them too. `cargo test` unchanged and green.
+- Verified: suite green in default mode twice in a row against HEAD;
+  see `parity/KNOWN_DIFFS.md` for the per-area results.
+
 ## Future work (not in this plan)
 - Gateways, JetStream clustering/replication, mirroring/sourcing,
   MQTT/WebSocket gateways, JWT operator mode, route/leaf TLS,
