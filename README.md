@@ -149,4 +149,6 @@ handled in the implementation:
 
 ## License
 
-Apache-2.0. Not affiliated with the NATS project, CNCF, or Synadia.
+Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).
+Copyright 2026 Heiko Koehler. Not affiliated with the NATS project, CNCF,
+or Synadia.
