@@ -1,8 +1,9 @@
 # rust-natsd
 
 A NATS server implemented in Rust, from scratch — Core NATS pub-sub,
-clustering/routes, leaf nodes, JetStream (in-memory), a monitoring
-endpoint, and `.conf` file support.
+clustering/routes, leaf nodes, JetStream (in-memory or file-persisted),
+TLS client connections, NKey authentication, multi-account scoping, a
+monitoring endpoint, and `.conf` file support.
 
 Unmodified official clients work against it:
 
@@ -20,6 +21,8 @@ cargo run --release -- -p 4223 --name edge-1
 cargo run --release -- --user derek --pass s3cret
 cargo run --release -- --auth-token mytoken
 cargo run --release -- --jetstream --http-port 8222
+cargo run --release -- --jetstream --js-store-dir /var/lib/rust-natsd/js
+cargo run --release -- --tls --tlscert server.crt --tlskey server.key
 cargo run --release -- -c server.conf   # nats-server .conf subset
 ```
 
@@ -56,18 +59,24 @@ cargo run --release -- -p 4224 --cluster-port 0 --leaf-urls nats://127.0.0.1:742
 | `verbose` mode (`+OK`) | ✅ |
 | `echo: false` (no self-delivery) | ✅ |
 | Auth: `--user/--pass`, `--auth-token` (token in `auth_token` or as password) | ✅ |
+| TLS client connections: `--tls/--tlscert/--tlskey/--tlsverify/--tlscacert`, `tls {}` in `.conf`, `tls_required` in `INFO` | ✅ (client port only; route/leaf TLS is a non-goal) |
+| NKey auth: per-connection `nonce` in `INFO`, `nkey`/`sig` in `CONNECT` verified with the `nkeys` crate | ✅ (standalone nkey users; JWT operator mode is a non-goal) |
+| Multi-account: `accounts {}` in `.conf` (per-user `permissions` or account-level `authorization`), `system_account`, `no_auth_user`; subscriptions/deliveries/routes/leafs/JetStream scoped per account; Go's exact permission-violation `-ERR` text, connection stays alive | ✅ |
+| JetStream: streams, pull + push consumers, acks (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | ✅ (in-memory, or file-persisted with `--js-store-dir`) |
+| JetStream persistence: whole-engine JSON snapshot after every mutation, reloaded on startup | ✅ (pending ack state is NOT persisted; see jetstream.rs scope notes) |
+| JetStream workqueue retention, `max_msgs_per_subject`, deliver_policy `all`/`last` (filter-aware)/`new`/`by_start_sequence` | ✅ |
+| Monitoring HTTP: `/varz`, `/connz`, `/subz`, `/routez`, `/leafz`, `/jsz`, `/healthz` | ✅ |
+| Monitoring HTTP: `/accounz`, `/gatewayz` (empty); `/connz` `acc`/`state`/`limit`/`offset` filters and `account`/`user`/`tls` per connection; `/varz` real `http_port`, `mem`, `slow_consumers` | ✅ |
+| Config files: nats-server `.conf` subset via `-c` (CLI wins over file) | ✅ |
+| Gateways, JetStream clustering/replication | ❌ non-goals |
+| MQTT / WebSocket gateways | ❌ non-goals |
 | Max payload enforcement (`-ERR 'Maximum Payload Violation'`) | ✅ |
 | Protocol errors → `-ERR` + connection close | ✅ |
 | Slow-consumer detection (bounded outbound queue → disconnect) | ✅ |
 | Graceful shutdown on SIGINT/SIGTERM | ✅ |
 | Routes: full mesh, solicitation with retry, RS+/RS-, RMSG/HMSG, duplicate resolution | ✅ |
 | Leaf nodes: hub accept + solicited leaf, LS+/LS-, LMSG/HMSG, reconnect | ✅ |
-| JetStream: streams, pull + push consumers, acks (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | ✅ (in-memory only) |
 | JetStream `$JS.API` routing across routes/leafs (`$JS.API.>` interest) | ✅ |
-| Monitoring HTTP: `/varz`, `/connz`, `/subz`, `/routez`, `/leafz`, `/jsz`, `/healthz` | ✅ |
-| Config files: nats-server `.conf` subset via `-c` (CLI wins over file) | ✅ |
-| Gateways, JetStream clustering/replication, file persistence | ❌ non-goals |
-| MQTT / WebSocket gateways | ❌ non-goals |
 | KV / object store as client helpers | ❌ (primitives exist: `KV_<bucket>` streams, `last_by_subj`; the nats.go/async-nats KV helpers are not verified) |
 
 See [PLAN.md](PLAN.md) for the phased plan and design notes.
@@ -134,11 +143,12 @@ handled in the implementation:
   selection across local members, routes, and leafs lives in `deliver()`.
 - `src/route.rs` / `src/leaf.rs` — route and leaf protocols, parsers and
   encoders.
-- `src/jetstream.rs` — in-memory JetStream engine. API/ack handling runs
+- `src/jetstream.rs` — JetStream engine (in-memory, or file-persisted with `--js-store-dir`). API/ack handling runs
   under one lock; deliveries are collected as actions and sent after the
   lock is released (delivery re-enters the engine, so holding the lock
   across it would deadlock). Streams capture only messages published on
   the hosting node; `$JS.API` requests and acks route cluster-wide.
+- `src/tls.rs` — rustls (ring) TLS server config for client connections.
 - `src/monitor.rs` — hand-rolled HTTP/1.1 monitoring server (one request
   per connection, then close). Only tracked fields are filled in;
   untracked ones (memory, RTT, pending bytes) report 0.

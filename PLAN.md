@@ -13,16 +13,18 @@ clustering/replication and file persistence, MQTT/WebSocket gateways.
 
 ## Status (2026-10-24)
 
-Phases 0–11 **complete**: Core NATS pub-sub, routes/clustering, leaf
-nodes, JetStream (in-memory), the monitoring endpoint, and `.conf` file
-support are implemented and verified against the unmodified official Go
-(`nats.go` v1.55.0) and Rust (`async-nats` 0.38) clients, plus raw-wire
-protocol tests. 85 Rust tests green; Go interop scripts green in both
-directions (routes, leafs, JetStream).
+Phases 0–16 **complete**: Core NATS pub-sub, routes/clustering, leaf
+nodes, JetStream (in-memory or file-persisted), TLS client connections,
+NKey authentication, multi-account scoping, the monitoring endpoint,
+and `.conf` file support are implemented and verified against the
+unmodified official Go (`nats.go` v1.55.0) and Rust (`async-nats` 0.38)
+clients, plus raw-wire protocol tests. 97 Rust tests green; Go interop
+scripts green in both directions (routes, leafs, JetStream).
 
-Remaining non-goals: gateways, JetStream clustering/replication, file
-persistence, MQTT/WebSocket gateways, and the KV/object-store client
-helpers (their server-side primitives exist).
+Remaining non-goals: gateways, JetStream clustering/replication,
+mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
+route/leaf TLS, TLS client-certificate-to-user mapping, and the
+KV/object-store client helpers (their server-side primitives exist).
 
 ## Phases
 
@@ -123,9 +125,61 @@ helpers (their server-side primitives exist).
 - `-c` / `--config` flag; file loads first, explicit CLI flags win.
 - Verified: conf unit tests + `tests/e2e_conf.rs`.
 
+### Phase 12 — TLS (client connections)
+- rustls (ring provider; aws-lc-rs is not in the offline crate cache)
+  + tokio-rustls + rustls-pemfile. `--tls/--tlscert/--tlskey/
+  --tlsverify/--tlscacert` flags and a `tls {}` block in `.conf`;
+  `tls_required` in `INFO`. The TLS handshake runs before INFO, so a
+  plain-text client to a TLS-required port never sees INFO. Route/leaf
+  paths stay plain TCP.
+- Verified: `tests/e2e_tls.rs` (openssl-generated CA/certs; TLS 1.3
+  note: a no-cert client `connect()` can succeed while the server's
+  certificate-required alert surfaces on first read — the test
+  asserts on first read, not on connect).
+
+### Phase 13 — NKey authentication
+- `nkey`/`sig`/`jwt` fields in `ConnectInfo`; per-connection `nonce`
+  always sent in INFO; signatures verified with the `nkeys` crate
+  (base64 via the `base64` crate). JWT operator mode is out of scope.
+- Verified: `tests/e2e_nkey.rs` (in-memory throwaway keypair).
+
+### Phase 14 — Multi-account
+- `Account`/`AccountUser`/`Permissions` model; `.conf` `accounts {}`
+  (both Go's per-user `permissions` and account-level `authorization`
+  shapes), `system_account`, `no_auth_user`. Legacy
+  `--user/--pass/--auth-token` is the `$G` account.
+- Subscriptions, deliveries, route frames (account token, no longer
+  hardcoded `$G`) and leaf connections are account-scoped;
+  publish/subscribe violations send Go's exact `-ERR` text and keep
+  the connection alive (verified against nats-server v2.15.1).
+  JetStream streams are account-scoped; stream names stay node-global.
+- Verified: `tests/e2e_accounts.rs` (cross-account isolation both
+  ways, violation text, conf shape).
+
+### Phase 15 — JetStream upgrades
+- File persistence behind `--jetstream` + `--js-store-dir` /
+  `jetstream.store_dir`: whole-engine JSON snapshot (base64 payloads)
+  written atomically after every mutation, reloaded on startup;
+  pending ack state is NOT persisted. Workqueue retention, 
+  `max_msgs_per_subject`, deliver_policy `last` (filter-aware) and
+  `by_start_sequence`. Filtered consumer creates
+  (`CREATE.<stream>.<consumer>.<filter…>`) fixed.
+- Verified: `tests/e2e_js_persistence.rs`.
+
+### Phase 16 — Monitoring upgrades
+- `/varz`: real `http_port`, `auth_required`/`tls_required` from
+  config, `mem` from `/proc/self/statm` on Linux, `slow_consumers`
+  from a real counter. New `/accounz` (connection/subscription counts
+  per account) and `/gatewayz` (empty list). `/connz` gains
+  `acc`/`state`/`limit`/`offset` and `account`/`user`/`tls` fields.
+  `/subz` and `/leafz` report the real account per entry.
+- Verified: `tests/e2e_monitor.rs`.
+
 ## Future work (not in this plan)
-- Gateways, JetStream clustering/replication, file persistence,
-  MQTT/WebSocket gateways, KV/object-store client-helper verification.
+- Gateways, JetStream clustering/replication, mirroring/sourcing,
+  MQTT/WebSocket gateways, JWT operator mode, route/leaf TLS,
+  TLS client-certificate-to-user mapping,
+  KV/object-store client-helper verification.
 
 ## Design notes
 - Single shared subscription registry behind a lock; delivery resolves the
