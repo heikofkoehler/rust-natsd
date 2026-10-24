@@ -367,7 +367,7 @@ func cluster(url1, url2 string) {
 func main() {
 	addr := flag.String("addr", "nats://127.0.0.1:4222", "server URL")
 	addr2 := flag.String("addr2", "", "second server URL (cluster mode)")
-	mode := flag.String("mode", "basic", "basic|auth|cluster")
+	mode := flag.String("mode", "basic", "basic|auth|cluster|js")
 	flag.Parse()
 	switch *mode {
 	case "basic":
@@ -376,6 +376,8 @@ func main() {
 		auth(*addr)
 	case "cluster":
 		cluster(*addr, *addr2)
+	case "js":
+		jsMode(*addr)
 	default:
 		fmt.Println("unknown mode:", *mode)
 		os.Exit(2)
