@@ -206,6 +206,8 @@ pub struct Stats {
     pub in_bytes: AtomicU64,
     pub out_bytes: AtomicU64,
     pub total_connections: AtomicU64,
+    /// Connections dropped as slow consumers (queue-full on delivery).
+    pub slow_consumers: AtomicU64,
 }
 
 pub struct Shared {
@@ -213,8 +215,6 @@ pub struct Shared {
     pub(crate) listen_addr: SocketAddr,
     pub(crate) cluster_addr: Option<SocketAddr>,
     pub(crate) leaf_addr: Option<SocketAddr>,
-    // Consumed by the monitoring endpoint (Phase 5: /varz http_port).
-    #[allow(dead_code)]
     pub(crate) http_addr: Option<SocketAddr>,
     /// TLS acceptor for client connections; None means plain text.
     pub(crate) tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
@@ -754,6 +754,7 @@ fn send_local_frames(shared: &Arc<Shared>, msg: &Message, deliveries: &[crate::s
             _ => encode_msg(&msg.subject, &d.sid, msg.reply_to.as_deref(), &msg.payload),
         };
         if !try_send(&target, frame) {
+            shared.stats.slow_consumers.fetch_add(1, Ordering::Relaxed);
             eprintln!(
                 "rust-natsd: slow consumer, dropping connection {}",
                 d.conn_id

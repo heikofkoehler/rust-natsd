@@ -130,3 +130,112 @@ async fn monitor_jsz_with_stream() {
     assert_eq!(jsz["total_streams"], 1);
     assert_eq!(jsz["streams"][0]["name"], "MON");
 }
+
+#[tokio::test]
+async fn monitor_phase16_varz_accounz_gatewayz_connz_filters() {
+    let srv = server::start(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        cluster_port: 0,
+        http_port: free_port(),
+        accounts: vec![
+            rust_natsd::config::Account {
+                name: "A".into(),
+                users: vec![rust_natsd::config::AccountUser {
+                    name: "alice".into(),
+                    pass: Some("alicepw".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            rust_natsd::config::Account {
+                name: "B".into(),
+                users: vec![rust_natsd::config::AccountUser {
+                    name: "bob".into(),
+                    pass: Some("bobpw".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    })
+    .await
+    .expect("server starts");
+    let alice = async_nats::ConnectOptions::with_user_and_password(
+        "alice".to_string(),
+        "alicepw".to_string(),
+    )
+    .connect(format!("nats://{}", srv.addr))
+    .await
+    .expect("alice connects");
+    let bob =
+        async_nats::ConnectOptions::with_user_and_password("bob".to_string(), "bobpw".to_string())
+            .connect(format!("nats://{}", srv.addr))
+            .await
+            .expect("bob connects");
+
+    // varz: http_port is the HTTP port (not the client port),
+    // auth_required reflects the accounts, mem is real on Linux.
+    let (status, varz) = get(&srv, "/varz").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        varz["http_port"].as_u64().unwrap() as u16,
+        srv.http_addr.unwrap().port()
+    );
+    assert_ne!(
+        varz["http_port"], varz["port"],
+        "http_port must not echo the client port"
+    );
+    assert_eq!(varz["auth_required"], true);
+    assert_eq!(varz["tls_required"], false);
+    assert!(
+        varz["mem"].as_u64().unwrap() > 0,
+        "mem from /proc/self/statm"
+    );
+    assert_eq!(varz["slow_consumers"], 0);
+
+    // accounz: per-account connection counts.
+    let (status, accounz) = get(&srv, "/accounz").await;
+    assert_eq!(status, 200);
+    let by_name = |name: &str| {
+        accounz["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == name)
+            .unwrap_or_else(|| panic!("account {name} in accounz"))
+            .clone()
+    };
+    assert_eq!(by_name("A")["connections"], 1);
+    assert_eq!(by_name("B")["connections"], 1);
+    assert_eq!(by_name("$G")["connections"], 0);
+
+    // gatewayz: no gateways, empty list.
+    let (status, gatewayz) = get(&srv, "/gatewayz").await;
+    assert_eq!(status, 200);
+    assert_eq!(gatewayz["gateways"], serde_json::json!([]));
+
+    // connz filters: acc, limit/offset, state, and per-connection fields.
+    let (status, connz) = get(&srv, "/connz?acc=A").await;
+    assert_eq!(status, 200);
+    assert_eq!(connz["total"], 1);
+    assert_eq!(connz["connections"][0]["account"], "A");
+    assert_eq!(connz["connections"][0]["user"], "alice");
+    assert_eq!(connz["connections"][0]["tls"], false);
+    let (status, connz) = get(&srv, "/connz?acc=B").await;
+    assert_eq!(status, 200);
+    assert_eq!(connz["connections"][0]["user"], "bob");
+    let (status, connz) = get(&srv, "/connz?limit=1&offset=0").await;
+    assert_eq!(status, 200);
+    assert_eq!(connz["total"], 2);
+    assert_eq!(connz["num_connections"], 1);
+    let (status, connz) = get(&srv, "/connz?state=closed").await;
+    assert_eq!(status, 200);
+    assert_eq!(connz["total"], 0);
+    assert_eq!(connz["connections"], serde_json::json!([]));
+
+    drop(alice);
+    drop(bob);
+    srv.shutdown().await.expect("shutdown");
+}

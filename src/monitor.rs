@@ -1,10 +1,12 @@
-//! Monitoring HTTP endpoint (Phase 10): a minimal hand-rolled HTTP/1.1
-//! server answering nats-server-style JSON on `/varz`, `/connz`,
-//! `/subz`, `/routez`, `/leafz`, `/jsz` and `/healthz`.
+//! Monitoring HTTP endpoint (Phase 10, upgraded in Phase 16): a minimal
+//! hand-rolled HTTP/1.1 server answering nats-server-style JSON on
+//! `/varz`, `/connz`, `/subz`, `/routez`, `/leafz`, `/jsz`,
+//! `/accounz`, `/gatewayz` and `/healthz`.
 //!
 //! Only fields the server actually tracks are filled in; counts it does
-//! not maintain (memory use, slow consumers, RTT, pending bytes) are
-//! reported as 0 rather than invented. Query parameters are ignored.
+//! not maintain (RTT, pending bytes) are reported as 0 rather than
+//! invented. `/connz` honours `acc`, `state`, `limit` and `offset`
+//! query parameters; other endpoints ignore the query string.
 //! One request per connection; the connection is closed afterwards.
 
 use std::sync::atomic::Ordering;
@@ -62,9 +64,12 @@ async fn handle_conn(mut stream: TcpStream, shared: &std::sync::Arc<Shared>) {
         return;
     }
     let path = target.split('?').next().unwrap_or("");
+    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
     let (status, body) = match path {
         "/varz" => (200, varz(shared)),
-        "/connz" => (200, connz(shared)),
+        "/connz" => (200, connz(shared, query)),
+        "/accounz" => (200, accounz(shared)),
+        "/gatewayz" => (200, gatewayz(shared)),
         "/subz" => (200, subz(shared)),
         "/routez" => (200, routez(shared)),
         "/leafz" => (200, leafz(shared)),
@@ -112,6 +117,40 @@ fn uptime(shared: &Shared) -> Duration {
     shared.started.elapsed()
 }
 
+/// Resident memory in bytes, from /proc/self/statm on Linux (second
+/// field = resident pages, times the 4096-byte page size); 0 elsewhere.
+/// Only the process's own memory is reported, never invented.
+#[cfg(target_os = "linux")]
+fn resident_memory_bytes() -> u64 {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|pages| pages.parse::<u64>().ok())
+        .map(|pages| pages * 4096)
+        .unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident_memory_bytes() -> u64 {
+    0
+}
+
+/// Parse a `k=v&k=v` query string into a lookup (no URL-decoding:
+/// account names and the supported values need none).
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k == key {
+            Some(v)
+        } else {
+            None
+        }
+    })
+}
+
 fn varz(shared: &Shared) -> Value {
     let cfg = &shared.config;
     let stats = &shared.stats;
@@ -127,9 +166,9 @@ fn varz(shared: &Shared) -> Value {
         "go": "rust",
         "host": cfg.host,
         "port": shared.listen_addr.port(),
-        "http_port": shared.listen_addr.port(),
-        "auth_required": cfg.user.is_some(),
-        "tls_required": false,
+        "http_port": shared.http_addr.map(|a| a.port()).unwrap_or(0),
+        "auth_required": cfg.auth_required(),
+        "tls_required": cfg.tls_required(),
         "max_payload": cfg.max_payload,
         "max_connections": 0,
         "ping_interval": 120000000000i64,
@@ -143,7 +182,7 @@ fn varz(shared: &Shared) -> Value {
                 .unwrap_or(0),
         ),
         "uptime": go_duration(uptime(shared)),
-        "mem": 0,
+        "mem": resident_memory_bytes(),
         "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         "connections": conns,
         "total_connections": stats.total_connections.load(Ordering::Relaxed),
@@ -154,7 +193,7 @@ fn varz(shared: &Shared) -> Value {
         "in_bytes": stats.in_bytes.load(Ordering::Relaxed),
         "out_bytes": stats.out_bytes.load(Ordering::Relaxed),
         "subscriptions": subs,
-        "slow_consumers": 0,
+        "slow_consumers": stats.slow_consumers.load(Ordering::Relaxed),
     });
     if let Some(js) = &shared.jetstream {
         body["jetstream"] = json!({
@@ -169,17 +208,27 @@ fn varz(shared: &Shared) -> Value {
     body
 }
 
-fn connz(shared: &Shared) -> Value {
-    let infos: Vec<_> = shared.conn_info.lock().unwrap().values().cloned().collect();
-    let mut infos = infos;
+fn connz(shared: &Shared, query: &str) -> Value {
+    let acc = query_param(query, "acc");
+    let state = query_param(query, "state");
+    let limit = query_param(query, "limit").and_then(|v| v.parse::<usize>().ok());
+    let offset = query_param(query, "offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut infos: Vec<_> = shared.conn_info.lock().unwrap().values().cloned().collect();
     infos.sort_by_key(|i| i.id);
+    // Filters: only client connections are listed; `acc` restricts to
+    // one account; `state=closed` matches nothing (only open
+    // connections are tracked), `state=open` matches everything.
+    if state == Some("closed") {
+        infos.clear();
+    }
+    infos.retain(|i| i.kind == "client" && acc.map(|a| i.account == a).unwrap_or(true));
     let subs = shared.sublist.lock().unwrap();
     let handles = shared.conns.lock().unwrap();
+    let total = infos.len();
     let mut connections = Vec::new();
-    for info in &infos {
-        if info.kind != "client" {
-            continue;
-        }
+    for info in infos.iter().skip(offset).take(limit.unwrap_or(usize::MAX)) {
         let (ip, port) = match info.addr.rsplit_once(':') {
             Some((ip, port)) => (ip.to_string(), port.parse::<u16>().unwrap_or(0)),
             None => (info.addr.clone(), 0),
@@ -222,9 +271,11 @@ fn connz(shared: &Shared) -> Value {
             "out_bytes": out_bytes,
             "subscriptions": sub_list,
             "subscriptions_count": subs.patterns_for_conn(info.id).len(),
+            "account": info.account,
+            "user": info.user,
+            "tls": info.tls,
         }));
     }
-    let total = connections.len();
     json!({
         "now": rfc3339(
             SystemTime::now()
@@ -232,10 +283,50 @@ fn connz(shared: &Shared) -> Value {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0),
         ),
-        "num_connections": total,
+        "num_connections": connections.len(),
         "total": total,
         "connections": connections,
     })
+}
+
+/// Accounts with live connection and subscription counts. `$G` is
+/// always listed (it is the legacy account when no accounts are
+/// configured); configured accounts follow in config order.
+fn accounz(shared: &Shared) -> Value {
+    let mut names: Vec<String> = vec!["$G".to_string()];
+    for a in &shared.config.accounts {
+        if !names.contains(&a.name) {
+            names.push(a.name.clone());
+        }
+    }
+    let infos = shared.conn_info.lock().unwrap();
+    let subs = shared.sublist.lock().unwrap();
+    let accounts: Vec<Value> = names
+        .iter()
+        .map(|name| {
+            let connections = infos
+                .values()
+                .filter(|i| i.kind == "client" && &i.account == name)
+                .count();
+            let subscriptions = subs
+                .subscriptions()
+                .iter()
+                .filter(|s| &s.account == name)
+                .count();
+            json!({
+                "name": name,
+                "connections": connections,
+                "subscriptions": subscriptions,
+            })
+        })
+        .collect();
+    let total = accounts.len();
+    json!({ "total": total, "accounts": accounts })
+}
+
+/// No gateways are implemented, so the list is always empty.
+fn gatewayz(shared: &Shared) -> Value {
+    json!({ "name": shared.config.name, "gateways": [] })
 }
 
 fn subz(shared: &Shared) -> Value {
@@ -249,26 +340,29 @@ fn subz(shared: &Shared) -> Value {
                 "queue": s.queue,
                 "sid": s.sid,
                 "cid": s.conn_id,
+                "account": s.account,
             })
         })
         .collect();
     for (rid, interests) in shared.route_subs.lock().unwrap().iter() {
-        for (_account, subject, queue) in interests.keys() {
+        for (account, subject, queue) in interests.keys() {
             subscriptions.push(json!({
                 "subject": subject,
                 "queue": queue,
                 "sid": Value::Null,
                 "cid": rid,
+                "account": account,
             }));
         }
     }
     for (lid, interests) in shared.leaf_subs.lock().unwrap().iter() {
-        for (_account, subject, queue) in interests.keys() {
+        for (account, subject, queue) in interests.keys() {
             subscriptions.push(json!({
                 "subject": subject,
                 "queue": queue,
                 "sid": Value::Null,
                 "cid": lid,
+                "account": account,
             }));
         }
     }
@@ -349,7 +443,7 @@ fn leafz(shared: &Shared) -> Value {
             })
             .unwrap_or_default();
         out.push(json!({
-            "account": "$G",
+            "account": leaf.account,
             "ip": ip,
             "port": port,
             "in_msgs": leaf.handle.in_msgs.load(Ordering::Relaxed),
