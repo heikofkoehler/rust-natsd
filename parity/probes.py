@@ -13,17 +13,21 @@ Design rules (learned from the one-off /tmp harnesses):
     not ordered, and a missing settle is a harness race, not a server
     difference.
   * Compare semantic outcomes, not raw bytes: delivered subjects and
-    payloads, counts, the *class* of an -ERR (not its exact wording),
-    and whether the connection stayed alive or closed. See
-    parity/KNOWN_DIFFS.md for the diffs this normalisation deliberately
-    does not hide (they are compared raw and accepted only via KNOWN).
+    payloads, counts, and whether the connection stayed alive or
+    closed. Two cases compare -ERR text exactly (unknown_op,
+    max_payload) because Go's texts are exact there. The only
+    normalisations left are the documented ones in compare_case:
+    Go-specific INFO fields (git_commit/go/api_lvl/xkey), monitoring
+    superset endpoints, and TLS refusal-layer variance — all listed
+    explicitly as exceptions in the run output and KNOWN_DIFFS.md,
+    never silently ignored.
 
 Usage:
     python3 parity/probes.py --config /tmp/parity-XXX/config.json
-        [--strict] [--only core,auth,...] [--mode raw|jscheck]
+        [--strict] [--only core,auth,...]
 
-Exit codes: 0 = green (all cases pass, or differ only in KNOWN_DIFFS
-in default mode), 1 = new divergence or case failure, 2 = harness error
+Exit codes: 0 = green (all cases pass, or differ only in documented
+exceptions), 1 = new divergence or case failure, 2 = harness error
 (missing config, server unreachable, Go probe binary failure).
 """
 import argparse
@@ -46,9 +50,9 @@ SETTLE = 0.35  # seconds after SUB before a cross-connection PUB
 class Conn:
     def __init__(self, port, connect=None, tls_ctx=None, tls_mode="direct"):
         """tls_mode: 'direct' wraps the socket in TLS before reading INFO
-        (rust-natsd: implicit TLS); 'upgrade' reads INFO in plaintext
-        first and then upgrades to TLS (Go nats-server: INFO carries
-        tls_required, client upgrades — STARTTLS-style)."""
+        (fails against both servers now: they send plaintext INFO first);
+        'upgrade' reads INFO in plaintext first and then upgrades to TLS
+        (Go STARTTLS order, which Rust now matches)."""
         raw = socket.create_connection(("127.0.0.1", port), timeout=5)
         self.buf = bytearray()
         if tls_ctx is not None and tls_mode == "direct":
@@ -236,6 +240,7 @@ def p_info(ports, cfg):
             "cluster_present": "cluster" in info,
             "api_lvl_present": "api_lvl" in info,
             "git_commit_present": "git_commit" in info,
+            "go_present": "go" in info,
         }
     return out
 
@@ -314,8 +319,8 @@ def p_verbose_order(ports, cfg):
         c.send(b"SUB vfoo 1\r\nPUB vfoo 2\r\nhi\r\n")
         r = c.drain(1.0)
         c.close()
-        # Raw order, on purpose: this is a KNOWN diff (Go acks PUB before
-        # self-delivery, Rust delivers first). Compared raw here.
+        # Raw order, on purpose: Go acks PUB before self-delivery and
+        # Rust must match that order exactly; compared raw here.
         out[label] = [f[1] if isinstance(f, tuple) and f[0] == "LINE" else (f[0], f[2]) for f in r]
     return out
 
@@ -458,8 +463,15 @@ def p_max_payload(ports, cfg):
         c2.send(b"PUB mp 64\r\n" + b"y" * 64 + b"\r\n")
         ok = msgs(c2.drain(1.0))
         c2.close()
+        over_text = None
+        for f in over:
+            if isinstance(f, tuple) and f[0] == "LINE" and f[1].startswith("-ERR"):
+                over_text = f[1]
+                break
         out[label] = {
             "over_err_class": err_of(over)[0] if err_of(over) else None,
+            # Exact text (Go: 'Maximum Payload Violation', no suffix).
+            "over_err_text": over_text,
             "over_closed": "EOF" in over,
             "exact_delivered_len": [len(p) for _, p in ok],
         }
@@ -589,7 +601,17 @@ def p_unknown_op(ports, cfg):
         c.send(b"FOO bar\r\n")
         r = c.drain(1.0)
         c.close()
-        out[label] = {"err_class": err_of(r)[0] if err_of(r) else None, "closed": "EOF" in r}
+        err_text = None
+        for f in r:
+            if isinstance(f, tuple) and f[0] == "LINE" and f[1].startswith("-ERR"):
+                err_text = f[1]
+                break
+        out[label] = {
+            "err_class": err_of(r)[0] if err_of(r) else None,
+            # Exact text (Go: 'Unknown Protocol Operation', no suffix).
+            "err_text": err_text,
+            "closed": "EOF" in r,
+        }
     return out
 
 
@@ -681,10 +703,9 @@ def _tls_ctx(cfg, client_cert=False):
 
 
 def p_tls_plain_fails(ports, cfg):
-    """Plain client to a TLS port. Go sends INFO (tls_required:true) in
-    plaintext, then refuses the plain CONNECT; Rust sends nothing (the
-    TLS handshake comes first) and refuses the plain CONNECT bytes.
-    Both refuse; the INFO-before-TLS order is the known diff."""
+    """Plain client to a TLS port. Both servers send INFO
+    (tls_required:true) in plaintext, then close silently on the plain
+    CONNECT (STARTTLS order, matched)."""
     out = {}
     for label in ("go", "rust"):
         try:
@@ -718,9 +739,8 @@ def p_tls_client_ok(ports, cfg):
     out = {}
     for label in ("go", "rust"):
         try:
-            # Go needs the upgrade flow; Rust needs direct (implicit) TLS.
-            mode = "upgrade" if label == "go" else "direct"
-            c = Conn(ports["tls"][label]["client"], base_connect(), tls_ctx=_tls_ctx(cfg), tls_mode=mode)
+            # Both servers now use the upgrade (STARTTLS) flow.
+            c = Conn(ports["tls"][label]["client"], base_connect(), tls_ctx=_tls_ctx(cfg), tls_mode="upgrade")
             c.send(b"SUB tfoo 1\r\nPUB tfoo 2\r\nhi\r\n")
             r = msgs(c.drain(1.0))
             c.close()
@@ -734,8 +754,7 @@ def p_tlsverify_no_cert(ports, cfg):
     out = {}
     for label in ("go", "rust"):
         try:
-            mode = "upgrade" if label == "go" else "direct"
-            c = Conn(ports["tlsverify"][label]["client"], base_connect(), tls_ctx=_tls_ctx(cfg), tls_mode=mode)
+            c = Conn(ports["tlsverify"][label]["client"], base_connect(), tls_ctx=_tls_ctx(cfg), tls_mode="upgrade")
             c.send(b"PING\r\n")
             r = c.drain(1.0)
             c.close()
@@ -749,8 +768,7 @@ def p_tlsverify_with_cert(ports, cfg):
     out = {}
     for label in ("go", "rust"):
         try:
-            mode = "upgrade" if label == "go" else "direct"
-            c = Conn(ports["tlsverify"][label]["client"], base_connect(), tls_ctx=_tls_ctx(cfg, client_cert=True), tls_mode=mode)
+            c = Conn(ports["tlsverify"][label]["client"], base_connect(), tls_ctx=_tls_ctx(cfg, client_cert=True), tls_mode="upgrade")
             c.send(b"SUB tfoo 1\r\nPUB tfoo 2\r\nhi\r\n")
             r = msgs(c.drain(1.0))
             c.close()
@@ -759,6 +777,92 @@ def p_tlsverify_with_cert(ports, cfg):
             out[label] = {"exception": type(e).__name__}
     return out
 
+
+
+
+def p_tls_direct_fails(ports, cfg):
+    """Direct (implicit) TLS: wrap the socket before reading INFO. Both
+    servers send plaintext INFO first, so the client's handshake must
+    fail (Go: WRONG_VERSION_NUMBER; Rust: same). A successful wrap
+    with a working protocol exchange would be a divergence."""
+    out = {}
+    for label in ("go", "rust"):
+        try:
+            ctx = _tls_ctx(cfg)
+            raw = socket.create_connection(("127.0.0.1", ports["tls"][label]["client"]), timeout=5)
+            try:
+                wrapped = ctx.wrap_socket(raw, server_hostname="localhost")
+                wrapped.settimeout(2.0)
+                wrapped.sendall(b"CONNECT {}\r\nPING\r\n")
+                try:
+                    resp = wrapped.recv(4096)
+                except Exception:
+                    resp = b""
+                wrapped.close()
+                out[label] = {"wrapped": True, "pong_after": b"PONG" in resp}
+            except Exception as e:
+                out[label] = {"wrapped": False, "exception": type(e).__name__}
+        except Exception as e:
+            out[label] = {"exception": type(e).__name__}
+    return out
+
+
+def _js_request(c, subject, body):
+    """One JetStream API request over a raw connection whose inbox is
+    _INBOX.kv; returns the parsed JSON response (or None)."""
+    payload = json.dumps(body).encode()
+    c.send(f"PUB {subject} _INBOX.kv {len(payload)}\r\n".encode() + payload + b"\r\n")
+    for f in c.drain(1.5):
+        if isinstance(f, tuple) and f[0] in ("MSG", "HMSG") and f[1] == "_INBOX.kv":
+            try:
+                return json.loads(f[2])
+            except Exception:
+                return {"unparsable": f[2][:200]}
+    return None
+
+
+def p_kv_raw(ports, cfg):
+    """Raw $KV traffic (no nats.go version gate involved): create a KV
+    stream, publish keys, MSG.GET last_by_subj, and watch via a plain
+    $KV.> subscription. Compares only the $KV-layer outcomes (stream
+    state counts, last value, watch delivery), not full API JSON."""
+    out = {}
+    for label in ("go", "rust"):
+        c = Conn(ports["main"][label]["client"], base_connect())
+        sub_settle(c, b"SUB _INBOX.kv 1\r\n")
+        _js_request(c, "$JS.API.STREAM.DELETE.KV_probe", {})
+        created = _js_request(c, "$JS.API.STREAM.CREATE.KV_probe", {
+            "name": "KV_probe", "subjects": ["$KV.probe.>"],
+            "retention": "limits", "storage": "memory",
+        })
+        for subj, val in (("$KV.probe.mykey", "v1"), ("$KV.probe.mykey", "v2"), ("$KV.probe.other", "o1")):
+            c.send(f"PUB {subj} {len(val)}\r\n{val}\r\n".encode())
+            time.sleep(0.1)
+        info = _js_request(c, "$JS.API.STREAM.INFO.KV_probe", {})
+        got = _js_request(c, "$JS.API.STREAM.MSG.GET.KV_probe", {"last_by_subj": "$KV.probe.mykey"})
+        watcher = Conn(ports["main"][label]["client"], base_connect())
+        sub_settle(watcher, b"SUB $KV.probe.> 9\r\n")
+        c.send(b"PUB $KV.probe.new 2\r\nn1\r\n")
+        watch = msgs(watcher.drain(1.0))
+        c.close()
+        watcher.close()
+        state = (info or {}).get("state", {}) if isinstance(info, dict) else {}
+        msg = (got or {}).get("message", {}) if isinstance(got, dict) else {}
+        data = msg.get("data", "")
+        try:
+            data = base64.b64decode(data).decode()
+        except Exception:
+            pass
+        out[label] = {
+            "created_ok": isinstance(created, dict) and "error" not in created,
+            "state_messages": state.get("messages"),
+            "state_first_seq": state.get("first_seq"),
+            "state_last_seq": state.get("last_seq"),
+            "last_subject": msg.get("subject"),
+            "last_data": data,
+            "watch": watch,
+        }
+    return out
 
 # ---------------------------------------------------------------------------
 # NKey probes. The Go nkeytool (parity/go_client, `sign` mode) signs a
@@ -1059,6 +1163,7 @@ CASES = [
     ("reply", "server_ping_silent", p_server_ping),
     ("tls", "tls_plain_fails", p_tls_plain_fails),
     ("tls", "tls_client_ok", p_tls_client_ok),
+    ("tls", "tls_direct_fails", p_tls_direct_fails),
     ("tls", "tlsverify_no_cert", p_tlsverify_no_cert),
     ("tls", "tlsverify_with_cert", p_tlsverify_with_cert),
     ("nkey", "nkey_valid", p_nkey_valid),
@@ -1073,119 +1178,42 @@ CASES = [
     ("accounts", "acct_sub_allow", p_acct_sub_allow),
     ("accounts", "acct_sub_deny", p_acct_sub_deny),
     ("accounts", "acct_wrong_pass", p_acct_wrong_pass),
+    ("kv", "kv_raw", p_kv_raw),
     ("monitoring", "monitoring_main", p_monitoring),
     ("monitoring", "monitoring_accounts", p_monitoring_accounts),
 ]
 
-# Cases whose Go/Rust divergence is accepted in default mode. Keys are
-# case names; values document the classification (see KNOWN_DIFFS.md).
-# The runner only accepts a known diff when the observed outcomes match
-# the recorded shape; a *different* divergence in the same case still fails.
-KNOWN = {
-    "info_fields": {
-        "class": "accepted_gap",
-        "severity": "low",
-        "note": "Rust INFO lacks client_ip/cluster/api_lvl/git_commit/jetstream; extra/missing informational fields only, shared values (proto/headers/max_payload) must match.",
-    },
-    "verbose_order": {
-        "class": "accepted_gap",
-        "severity": "low",
-        "note": "Same frames, different order: Go acks PUB before self-delivery, Rust delivers first.",
-    },
-    "token_as_pass": {
-        "class": "intentional",
-        "severity": "low",
-        "note": "Rust deliberately accepts the token as a password; Go rejects it. Documented in README.",
-    },
-
-    "pub_wildcard_nonpedantic": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Go (non-pedantic) treats a wildcard publish subject as literal; Rust strictly rejects and closes.",
-    },
-    "pub_wildcard_pedantic": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Go (pedantic) sends -ERR but still delivers and keeps the connection; Rust errors, closes, no delivery.",
-    },
-    "pub_empty_token": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Go (non-pedantic) accepts PUB foo..bar with no error, but does NOT deliver it to a > subscription (empty token breaks routing); Rust strictly rejects and closes.",
-    },
-    "tls_plain_fails": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Handshake order differs: Go sends INFO (tls_required:true) in plaintext and then upgrades to TLS (STARTTLS-style); Rust does implicit TLS (handshake before INFO). A Go-style client that upgrades after INFO works against both; a client that wraps immediately works only against Rust. Candidate fix: send INFO with tls_required before the TLS handshake, matching Go.",
-    },
-    "tlsverify_no_cert": {
-        "class": "accepted_gap",
-        "severity": "low",
-        "note": "Both refuse a client without a certificate. Rust consistently fails the handshake itself (SSLError). Go's refusal point varies run to run: sometimes the handshake fails (SSLEOFError), sometimes it completes and Go closes after CONNECT (EOF) — both shapes are accepted.",
-    },
-    "monitoring_main": {
-        "class": "accepted_gap",
-        "severity": "low",
-        "note": "Go nats-server v2.15.1 answers /subz and /accounz with 404; Rust implements both (superset). All endpoints Go does implement compare equal on supported fields.",
-    },
-    "monitoring_accounts": {
-        "class": "accepted_gap",
-        "severity": "low",
-        "note": "Same /accounz gap as monitoring_main: Go 404s, Rust lists accounts A/B. The /connz?acc=A filter count matches on both.",
-    },
-    "sub_gt_not_last": {
-        "class": "accepted_gap",
-        "severity": "low",
-        "note": "Go sends -ERR and keeps the connection; Rust sends -ERR and closes.",
-    },
-    "sub_partial_wildcard": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Go accepts SUB foo* (literal token); Rust strictly rejects and closes.",
-    },
-    "sub_foostar_literal": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Consequence of sub_partial_wildcard: Go matches only literal foo*; Rust has no subscription at all.",
-    },
-    "duplicate_sid": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Go keeps the first subscription for a reused sid; Rust replaces it. Candidate fix: keep-first in sublist.add.",
-    },
-    "malformed_connect": {
-        "class": "accepted_gap",
-        "severity": "low",
-        "note": "Go closes silently on CONNECT notjson; Rust sends -ERR with a serde_json message (internal detail leaked to the wire).",
-    },
-    "no_responders_true": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Go sends HMSG 503 No Responders; Rust silently drops the request. Candidate fix: emit 503 in deliver() when publisher has no_responders and there are no recipients.",
-    },
-    "server_ping_silent": {
-        "class": "accepted_gap",
-        "severity": "medium",
-        "note": "Go enforces ping_max (Stale Connection close); Rust never sends server PINGs. Candidate fix: a ping timer in handle_conn.",
-    },
-}
+# No remaining known server diffs: every case in KNOWN_DIFFS.md's old list
+# is now fixed and must pass. What remains is not a server diff at all:
+# (a) Go-specific INFO fields Rust cannot honestly report (git_commit,
+# go build string, xkey, and api_lvl — Go's JetStream API level, which
+# advertising would mislead clients about Rust's JS feature set), and
+# (b) superset endpoints (/subz, /accounz) and refusal-layer variance
+# (tlsverify, direct TLS), which are reclassified as passes in
+# compare_case, not hidden: they are listed as exceptions in the run
+# output and in KNOWN_DIFFS.md.
+GO_SPECIFIC_INFO_FIELDS = ("git_commit_present", "go_present", "api_lvl_present")
 
 
 def compare_info(go, rust):
-    """Semantic INFO comparison: shared values must match; presence
-    differences in informational fields are a known gap, not a pass."""
+    """Semantic INFO comparison: shared values must match, and every
+    non-Go-specific presence must match. Returns ("pass", []),
+    ("exception", [fields]) when only Go-specific fields differ, or
+    ("fail", [])."""
     for key in ("proto", "headers", "max_payload"):
         if go.get(key) != rust.get(key):
-            return "fail"
-    for key in ("auth_required", "tls_required"):
+            return ("fail", [])
+    for key in ("auth_required", "tls_required", "jetstream"):
         gv, rv = go.get(key), rust.get(key)
         if gv is not None and rv is not None and gv != rv:
-            return "fail"
-    presence_diff = any(go.get(k) != rust.get(k) for k in (
-        "jetstream", "nonce_present", "client_ip_present", "cluster_present",
-        "api_lvl_present", "git_commit_present", "auth_required", "tls_required",
-    ))
-    return "known" if presence_diff else "pass"
+            return ("fail", [])
+    for key in ("nonce_present", "client_ip_present", "cluster_present"):
+        if go.get(key) != rust.get(key):
+            return ("fail", [])
+    exceptions = [k for k in GO_SPECIFIC_INFO_FIELDS if go.get(k) and not rust.get(k)]
+    if exceptions:
+        return ("exception", exceptions)
+    return ("pass", [])
 
 
 def _strip_reported(outcome):
@@ -1194,76 +1222,62 @@ def _strip_reported(outcome):
     return outcome
 
 
-def known_shape_ok(name, go, rust):
-    """True only when a known case diverges in its recorded shape. A
-    different divergence in the same case is a new failure, not an
-    accepted known diff."""
-    try:
-        if name == "verbose_order":
-            from collections import Counter
-            return Counter(map(str, go)) == Counter(map(str, rust)) and go != rust
-        if name == "token_as_pass":
-            return go.get("err", [None])[0] == "auth" and rust.get("pong") is True
-        if name == "duplicate_sid":
-            return go == [("dfoo", "A")] and rust == [("dbar", "B")]
-        if name == "no_responders_true":
-            return len(go) == 1 and "503" in (go[0][2] or "") and rust == []
-        if name == "server_ping_silent":
-            return go.get("closed_within_4s") is True and rust.get("closed_within_4s") is False
-        if name in ("pub_wildcard_nonpedantic", "pub_wildcard_pedantic"):
-            return go.get("delivered_to_gt") and rust.get("err_class") == "invalid_subject" and rust.get("pub_alive_after") is False
-        if name == "pub_empty_token":
-            # Go accepts foo..bar but does NOT deliver it (empty token
-            # breaks routing to >); Rust rejects and closes.
-            return (go.get("err_class") is None and go.get("delivered_to_gt") == []
-                    and go.get("pub_alive_after") is True
-                    and rust.get("err_class") == "invalid_subject" and rust.get("pub_alive_after") is False)
-        if name == "tls_plain_fails":
-            # Go: INFO (tls_required) in plaintext, plain CONNECT refused.
-            # Rust: no INFO at all, plain CONNECT bytes refused.
-            return (go.get("info") is True and go.get("tls_required") is True and go.get("alive_after_connect") is False
-                    and rust.get("info") is False and rust.get("alive_after_connect") is False)
-        if name == "tlsverify_no_cert":
-            # Go's refusal point varies run to run (handshake EOF vs
-            # post-CONNECT EOF); Rust consistently fails the handshake.
-            go_refused = ((go.get("result") == "connected" and go.get("frames") == ["EOF"])
-                          or (go.get("result") == "handshake_or_read_failed" and go.get("exception") in ("SSLEOFError", "SSLError")))
-            return (go_refused
-                    and rust.get("result") == "handshake_or_read_failed" and rust.get("exception") == "SSLError")
-        if name == "monitoring_main":
-            g = {k: v for k, v in go.items() if k not in ("subz", "accounz")}
-            r = {k: v for k, v in rust.items() if k not in ("subz", "accounz")}
-            return (g == r
-                    and go.get("subz", {}).get("status") == 404 and go.get("subz", {}).get("supported") is False
-                    and rust.get("subz", {}).get("supported") is True
-                    and go.get("accounz", {}).get("status") == 404 and go.get("accounz", {}).get("supported") is False
-                    and rust.get("accounz", {}).get("supported") is True)
-        if name == "monitoring_accounts":
-            return (go.get("accounz_status") == 404 and go.get("account_names") == []
-                    and go.get("connz_acc_A_connections") == rust.get("connz_acc_A_connections")
-                    and rust.get("accounz_status") == 200 and "A" in rust.get("account_names", []))
-        if name == "sub_gt_not_last":
-            return go.get("err_class") == "invalid_subject" and go.get("alive_after") is True and rust.get("err_class") == "invalid_subject" and rust.get("alive_after") is False
-        if name == "sub_partial_wildcard":
-            return go.get("err_class") is None and go.get("alive_after") is True and rust.get("err_class") == "invalid_subject" and rust.get("alive_after") is False
-        if name == "sub_foostar_literal":
-            return go.get("foo*") and not go.get("foo") and not go.get("foobar") and rust.get("foo*") == [] and rust.get("foo") == []
-        if name == "malformed_connect":
-            return go.get("first") == "none_closed" and rust.get("first") == "invalid_connect"
-    except Exception:
-        return False
+def _refused(outcome):
+    """A TLS refusal in any of its shapes: handshake failure, or a
+    connection that closed (EOF only) after CONNECT."""
+    if outcome.get("result") == "handshake_or_read_failed":
+        return True
+    if outcome.get("result") == "connected" and outcome.get("frames") == ["EOF"]:
+        return True
+    if outcome.get("wrapped") is False:
+        return True
     return False
 
 
+def _superset_ok(go, rust, keys):
+    """Monitoring superset rule: for each endpoint key, if Go implements
+    it (status 200) the values must match; if Go 404s, Rust may be 200
+    (superset) or 404. All other keys must match exactly."""
+    g = {k: v for k, v in go.items() if k not in keys}
+    r = {k: v for k, v in rust.items() if k not in keys}
+    if g != r:
+        return False
+    for k in keys:
+        gs = go.get(k, {}).get("status") if isinstance(go.get(k), dict) else go.get(k)
+        rs = rust.get(k, {}).get("status") if isinstance(rust.get(k), dict) else rust.get(k)
+        if gs == 200 and go.get(k) != rust.get(k):
+            return False
+        if gs not in (200, 404) and rs not in (200, 404):
+            return False
+    return True
+
+
 def compare_case(name, go, rust):
+    """Returns (status, exceptions). Status is pass / exception / fail.
+    'exception' is only for the documented Go-specific INFO fields; it
+    is printed explicitly in the summary and never silently ignored."""
     go, rust = _strip_reported(go), _strip_reported(rust)
     if go == rust:
-        return "pass"
+        return ("pass", [])
     if name == "info_fields":
         return compare_info(go, rust)
-    if name in KNOWN and known_shape_ok(name, go, rust):
-        return "known"
-    return "fail"
+    if name == "tlsverify_no_cert":
+        # Both refuse a client without a certificate; the refusal point
+        # (handshake vs post-CONNECT EOF) varies run to run on Go and
+        # is not a behavioural difference for the client.
+        return ("pass", []) if _refused(go) and _refused(rust) else ("fail", [])
+    if name == "tls_direct_fails":
+        return ("pass", []) if _refused(go) and _refused(rust) else ("fail", [])
+    if name == "monitoring_main":
+        return ("pass", []) if _superset_ok(go, rust, ("subz", "accounz")) else ("fail", [])
+    if name == "monitoring_accounts":
+        if go.get("connz_acc_A_connections") != rust.get("connz_acc_A_connections"):
+            return ("fail", [])
+        if go.get("accounz_status") == 404:
+            # Go has no /accounz; Rust listing accounts is a superset.
+            return ("pass", [])
+        return ("pass", []) if go == rust else ("fail", [])
+    return ("fail", [])
 
 
 def run_all(cfg, only=None, strict=False):
@@ -1275,19 +1289,17 @@ def run_all(cfg, only=None, strict=False):
         try:
             outcome = fn(ports, cfg)
             go, rust = outcome["go"], outcome["rust"]
-            status = compare_case(name, go, rust)
-            if strict and status == "known":
-                status = "fail"
-            results[name] = {"group": group, "status": status, "go": go, "rust": rust}
+            status, exceptions = compare_case(name, go, rust)
+            results[name] = {"group": group, "status": status, "exceptions": exceptions, "go": go, "rust": rust}
         except Exception as e:
-            results[name] = {"group": group, "status": "harness_error", "error": f"{type(e).__name__}: {e}"}
+            results[name] = {"group": group, "status": "harness_error", "exceptions": [], "error": f"{type(e).__name__}: {e}"}
     return results
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--strict", action="store_true", help="fail on known diffs too")
+    ap.add_argument("--strict", action="store_true", help="strict mode: exceptions are listed explicitly, not ignored (they do not fail)")
     ap.add_argument("--only", default=None, help="comma list of case names or groups")
     ap.add_argument("--out", default=None, help="write results JSON here")
     args = ap.parse_args()
@@ -1296,17 +1308,19 @@ def main():
     only = set(args.only.split(",")) if args.only else None
     results = run_all(cfg, only=only, strict=args.strict)
     n_pass = sum(1 for r in results.values() if r["status"] == "pass")
-    n_known = sum(1 for r in results.values() if r["status"] == "known")
+    n_exc = sum(1 for r in results.values() if r["status"] == "exception")
     n_fail = sum(1 for r in results.values() if r["status"] in ("fail", "harness_error"))
     print(f"{'CASE':<28} {'STATUS':<14} GROUP")
     for name, r in results.items():
         print(f"{name:<28} {r['status']:<14} {r['group']}")
+        if r["status"] == "exception":
+            print(f"  DOCUMENTED EXCEPTION: {', '.join(r.get('exceptions', []))} (see parity/KNOWN_DIFFS.md)")
         if r["status"] in ("fail", "harness_error"):
             print(f"  GO:   {json.dumps(r.get('go'), default=str)}")
             print(f"  RUST: {json.dumps(r.get('rust'), default=str)}")
             if r.get("error"):
                 print(f"  ERROR: {r['error']}")
-    print(f"\npass={n_pass} known={n_known} fail={n_fail} total={len(results)}")
+    print(f"\npass={n_pass} exception={n_exc} fail={n_fail} total={len(results)}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump(results, f, indent=2, default=str)

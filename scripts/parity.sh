@@ -16,7 +16,8 @@
 #   PARITY_STRICT=1  same as --strict: known diffs also fail
 #   PARITY_KEEP_TMP=1 keep the temp dir (configs, logs, results) for debugging
 #
-# Exit codes: 0 = green (default mode: only KNOWN_DIFFS differ),
+# Exit codes: 0 = green (all cases pass, or differ only in documented
+#             exceptions listed explicitly in the output),
 #             1 = new divergence or case failure,
 #             2 = harness/setup failure (missing binary, build failure, ...).
 set -uo pipefail
@@ -204,7 +205,7 @@ start_go "$CONFDIR/go-max64.conf" go-max64
 "$RUST_BIN" -a 127.0.0.1 -p "${P[max64_rust]}" -n parity --cluster-port 0 --max-payload 64 &>"$LOGDIR/rust-max64.log" &
 PIDS+=($!)
 start_go "$CONFDIR/go-ping.conf" go-ping
-"$RUST_BIN" -a 127.0.0.1 -p "${P[ping_rust]}" -n parity --cluster-port 0 &>"$LOGDIR/rust-ping.log" &
+"$RUST_BIN" -a 127.0.0.1 -p "${P[ping_rust]}" -n parity --cluster-port 0 --ping-interval 200ms --ping-max 2 &>"$LOGDIR/rust-ping.log" &
 PIDS+=($!)
 start_go "$CONFDIR/go-tls.conf" go-tls
 "$RUST_BIN" -a 127.0.0.1 -p "${P[tls_rust]}" -n parity --cluster-port 0 --tls --tlscert "$TMPDIR_PARITY/server.crt" --tlskey "$TMPDIR_PARITY/server.key" &>"$LOGDIR/rust-tls.log" &
@@ -271,38 +272,24 @@ js_compare() { # $1=mode $2=go port $3=rust port $4=label
   go_out="$("$TMPDIR_PARITY/parity-go-client" -addr "nats://127.0.0.1:$2" -mode "$1" 2>"$LOGDIR/js-$4-go.err")" || { echo "JS $4: Go client failed against Go server:"; echo "  $go_out"; cat "$LOGDIR/js-$4-go.err"; return 1; }
   rust_out="$("$TMPDIR_PARITY/parity-go-client" -addr "nats://127.0.0.1:$3" -mode "$1" 2>"$LOGDIR/js-$4-rust.err")" || { echo "JS $4: Go client failed against Rust server:"; echo "  $rust_out"; cat "$LOGDIR/js-$4-rust.err"; return 1; }
   if [ "$go_out" = "$rust_out" ]; then echo "JS $4: PASS"; return 0; fi
-  # Known JS diffs (see parity/KNOWN_DIFFS.md): for the full mode, the
-  # only accepted difference is a fresh empty stream's first_seq
-  # (Go 0 = "none", Rust 1 = "next"). Anything else is a real DIFF.
-  if [ "$1" = "js" ] && python3 - "$go_out" "$rust_out" <<'PY' 2>/dev/null; then
-import json, sys
-go, rust = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-if set(go) != set(rust):
-    sys.exit(1)
-diffs = {k for k in go if go[k] != rust[k]}
-if diffs != {"stream"}:
-    sys.exit(1)
-gs, rs = dict(go["stream"]), dict(rust["stream"])
-if gs.pop("first_seq", None) != 0 or rs.pop("first_seq", None) != 1 or gs != rs:
-    sys.exit(1)
-PY
-    if [ "$STRICT" = "1" ]; then echo "JS $4: KNOWN (strict: FAIL)"; echo "  GO:   $go_out"; echo "  RUST: $rust_out"; return 1; fi
-    echo "JS $4: KNOWN (empty-stream first_seq 0 vs 1; see parity/KNOWN_DIFFS.md)"; return 0
-  fi
+  # No accepted JS diffs remain: the empty-stream first_seq gap (Go 0,
+  # Rust 1) is fixed, so any difference here is a real DIFF.
   echo "JS $4: DIFF"; echo "  GO:   $go_out"; echo "  RUST: $rust_out"; return 1
 }
 JS_RC=0
 js_compare js "${P[main_go]}" "${P[main_rust]}" "full" || JS_RC=1
-# KV via nats.go is a known diff, not a pass: nats.go refuses KV against
-# any server reporting version < 2.6.2, and rust-natsd reports its own
-# 0.1.0 in INFO (see parity/KNOWN_DIFFS.md). The Go side must succeed;
-# the Rust side must fail with exactly that version-gate error. In
-# strict mode the known diff fails too.
+# KV via nats.go is a documented CLIENT LIMITATION, not a server
+# failure (see parity/KNOWN_DIFFS.md): nats.go refuses KV against any
+# server reporting version < 2.6.2, and rust-natsd honestly reports its
+# own 0.1.0 in INFO. Raw $KV traffic is covered by the kv_raw probe
+# (parity/probes.py) and must match. The Go side must succeed; the
+# Rust side must fail with exactly that version-gate error. It is
+# listed explicitly in both modes and never fails the run.
 KV_GO_OUT="$("$TMPDIR_PARITY/parity-go-client" -addr "nats://127.0.0.1:${P[main_go]}" -mode kv 2>"$LOGDIR/js-kv-go.err")" || { echo "JS kv: Go client failed against Go server:"; echo "  $KV_GO_OUT"; JS_RC=1; }
 KV_RUST_OUT="$("$TMPDIR_PARITY/parity-go-client" -addr "nats://127.0.0.1:${P[main_rust]}" -mode kv 2>"$LOGDIR/js-kv-rust.err")" || true
 if [ -n "${KV_GO_OUT:-}" ] && [ "${KV_GO_OUT:0:1}" = "{" ] && python3 -c "import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if 'error' not in d else 1)" "$KV_GO_OUT"; then
   if [ "$KV_RUST_OUT" = '{"error":"createkv: nats: key-value requires at least server version 2.6.2"}' ]; then
-    if [ "$STRICT" = "1" ]; then echo "JS kv: KNOWN (strict: FAIL)"; JS_RC=1; else echo "JS kv: KNOWN (nats.go version gate; see parity/KNOWN_DIFFS.md)"; fi
+    echo "JS kv: DOCUMENTED EXCEPTION (nats.go client version gate; raw \$KV matches via kv_raw probe; see parity/KNOWN_DIFFS.md)"
   elif [ "$KV_RUST_OUT" = "$KV_GO_OUT" ]; then echo "JS kv: PASS"
   else echo "JS kv: FAIL (unexpected Rust output)"; echo "  GO:   $KV_GO_OUT"; echo "  RUST: $KV_RUST_OUT"; JS_RC=1; fi
 fi

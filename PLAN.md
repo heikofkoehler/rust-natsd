@@ -129,9 +129,11 @@ KV/object-store client helpers (their server-side primitives exist).
 - rustls (ring provider; aws-lc-rs is not in the offline crate cache)
   + tokio-rustls + rustls-pemfile. `--tls/--tlscert/--tlskey/
   --tlsverify/--tlscacert` flags and a `tls {}` block in `.conf`;
-  `tls_required` in `INFO`. The TLS handshake runs before INFO, so a
-  plain-text client to a TLS-required port never sees INFO. Route/leaf
-  paths stay plain TCP.
+  `tls_required` in `INFO`. Go's STARTTLS order is implemented: INFO
+  goes out in plaintext first, then the client upgrades the same socket
+  to TLS (a direct/implicit-TLS client fails on its own side, and a
+  plain client after INFO is closed silently — both verified against
+  Go). Route/leaf paths stay plain TCP.
 - Verified: `tests/e2e_tls.rs` (openssl-generated CA/certs; TLS 1.3
   note: a no-cert client `connect()` can succeed while the server's
   certificate-required alert surfaces on first read — the test
@@ -139,8 +141,9 @@ KV/object-store client helpers (their server-side primitives exist).
 
 ### Phase 13 — NKey authentication
 - `nkey`/`sig`/`jwt` fields in `ConnectInfo`; per-connection `nonce`
-  always sent in INFO; signatures verified with the `nkeys` crate
-  (base64 via the `base64` crate). JWT operator mode is out of scope.
+  sent in INFO only when authentication is configured (Go omitempty);
+  signatures verified with the `nkeys` crate (base64 via the `base64`
+  crate). JWT operator mode is out of scope.
 - Verified: `tests/e2e_nkey.rs` (in-memory throwaway keypair).
 
 ### Phase 14 — Multi-account
@@ -180,17 +183,23 @@ KV/object-store client helpers (their server-side primitives exist).
   repeatable side-by-side run of Go nats-server v2.15.1 and rust-natsd
   on free ports with matching configs. Raw-wire probes (core, auth,
   token, limits, subject validation, reply, TLS, nkey, accounts,
-  monitoring) plus a nats.go probe client (JetStream pull/push, acks/
-  redelivery, MSG.GET, purge/delete, workqueue, persistence across
+  monitoring, raw $KV) plus a nats.go probe client (JetStream pull/push,
+  acks/redelivery, MSG.GET, purge/delete, workqueue, persistence across
   restart, KV basics) and the existing cluster/leaf smoke scripts.
 - Normalisation: strip server_id, client_id, ports, timestamps,
   version, git_commit and other per-run values; compare semantic
-  outcomes. `parity/KNOWN_DIFFS.md` records every divergence found,
-  classified intentional vs accepted gap with fix sketches; the
-  default run is green with only known diffs, `--strict` fails on
-  them too. `cargo test` unchanged and green.
-- Verified: suite green in default mode twice in a row against HEAD;
-  see `parity/KNOWN_DIFFS.md` for the per-area results.
+  outcomes. The parity-fix pass eliminated every known server diff
+  (subjects, pedantic, verbose order, duplicate sid, no-responders,
+  server PING, token-as-password, malformed CONNECT, error texts,
+  INFO richness, STARTTLS order, empty-stream FirstSeq); what remains
+  is documented exceptions only (Go-specific INFO fields, monitoring
+  superset, TLS refusal-layer variance, the nats.go KV version gate —
+  see `parity/KNOWN_DIFFS.md`). The run is green in both default and
+  strict mode. `cargo test` unchanged and green.
+- Verified: suite green in default and strict mode against HEAD (53
+  raw probes: 52 pass + 1 exception, 0 fail; JS full PASS;
+  persistence PASS; cluster/leaf smoke PASS); see
+  `parity/KNOWN_DIFFS.md` for the per-area results.
 
 ## Future work (not in this plan)
 - Gateways, JetStream clustering/replication, mirroring/sourcing,

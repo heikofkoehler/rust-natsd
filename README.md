@@ -58,7 +58,7 @@ cargo run --release -- -p 4224 --cluster-port 0 --leaf-urls nats://127.0.0.1:742
 | Auto-unsubscribe (`UNSUB sid <max>`) | ✅ |
 | `verbose` mode (`+OK`) | ✅ |
 | `echo: false` (no self-delivery) | ✅ |
-| Auth: `--user/--pass`, `--auth-token` (token in `auth_token` or as password) | ✅ |
+| Auth: `--user/--pass`, `--auth-token` (token only via `auth_token`, matching Go) | ✅ |
 | TLS client connections: `--tls/--tlscert/--tlskey/--tlsverify/--tlscacert`, `tls {}` in `.conf`, `tls_required` in `INFO` | ✅ (client port only; route/leaf TLS is a non-goal) |
 | NKey auth: per-connection `nonce` in `INFO`, `nkey`/`sig` in `CONNECT` verified with the `nkeys` crate | ✅ (standalone nkey users; JWT operator mode is a non-goal) |
 | Multi-account: `accounts {}` in `.conf` (per-user `permissions` or account-level `authorization`), `system_account`, `no_auth_user`; subscriptions/deliveries/routes/leafs/JetStream scoped per account; Go's exact permission-violation `-ERR` text, connection stays alive | ✅ |
@@ -123,25 +123,26 @@ monitoring field values for supported fields. Per-run random values
 (server_id, client_id, ports, timestamps, version, git_commit, …) are
 stripped, never compared.
 
-Reading the table: each case is `pass` (identical semantics), `known`
-(diverges exactly as recorded in `parity/KNOWN_DIFFS.md`), `fail` (a new
-divergence), or `harness_error` (the probe itself broke). Default mode
-is green with only known diffs; strict mode fails on known diffs too.
-Exit codes: 0 green, 1 divergence, 2 setup failure.
+Reading the table: each case is `pass` (identical semantics),
+`exception` (a documented non-failure listed explicitly — Go-specific
+INFO fields, the nats.go KV version gate — see below), `fail` (a new
+divergence), or `harness_error` (the probe itself broke). The suite is
+green in both default and strict mode: there are no remaining known
+server diffs. Exit codes: 0 green, 1 divergence, 2 setup failure.
 
 Layout: `scripts/parity.sh` (orchestration, servers, certs, JS/KV,
 persistence, smoke), `parity/probes.py` (raw-wire probes + comparison),
 `parity/go_client/` (nats.go probe client: JetStream + KV, and the
-nkeytool signer), `parity/KNOWN_DIFFS.md` (every accepted divergence,
-classified intentional vs accepted gap, with fix sketches).
+nkeytool signer), `parity/KNOWN_DIFFS.md` (the documented exceptions
+and the fixed-diff history).
 
 Adding a case: write a probe function in `parity/probes.py` returning
 `{"go": …, "rust": …}` semantic outcomes, register it in `CASES`, and
-run the suite. If it finds a real server bug, record it as a candidate
-fix in `parity/KNOWN_DIFFS.md` — do not change `src/` to make the
-suite pass. Updating KNOWN_DIFFS: add the entry (class, severity,
-reason or fix sketch) and a shape check in `known_shape_ok` so the case
-only counts as known when it diverges in the recorded shape.
+run the suite. If it finds a real server bug, fix the server — do not
+change the suite to hide the diff (no normalising away a real
+behavioural difference, no weakening a probe to make it pass). A probe
+that was wrong about Go's behaviour may only be changed after a fresh
+probe against real Go proves it.
 
 ## Interop notes (Go behavior that differs from the docs)
 
