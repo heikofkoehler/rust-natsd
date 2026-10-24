@@ -26,9 +26,9 @@ const OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
 
 struct ConnHandle {
     tx: mpsc::Sender<Bytes>,
-    headers: AtomicBool,
-    closed: AtomicBool,
-    close: Notify,
+    headers: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+    close: Arc<Notify>,
 }
 
 impl ConnHandle {
@@ -134,9 +134,9 @@ async fn handle_conn(stream: TcpStream, shared: Arc<Shared>) {
     let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOUND_CHANNEL_CAPACITY);
     let handle = Arc::new(ConnHandle {
         tx: tx.clone(),
-        headers: AtomicBool::new(false),
-        closed: AtomicBool::new(false),
-        close: Notify::new(),
+        headers: Arc::new(AtomicBool::new(false)),
+        closed: Arc::new(AtomicBool::new(false)),
+        close: Arc::new(Notify::new()),
     });
     shared
         .conns
@@ -144,14 +144,18 @@ async fn handle_conn(stream: TcpStream, shared: Arc<Shared>) {
         .unwrap()
         .insert(client_id, handle.clone());
 
-    // Writer task: drain the outbound queue to the socket.
-    let writer_handle = handle.clone();
+    // Writer task: drain the outbound queue to the socket. It holds no
+    // channel sender, so when the reader side drops every sender the queue
+    // closes and the writer flushes what remains (e.g. a final -ERR) before
+    // exiting.
+    let writer_closed = handle.closed.clone();
+    let writer_close = handle.close.clone();
     let writer_shutdown = shared.shutdown.clone();
     tokio::spawn(async move {
         let writer_shutdown = writer_shutdown.notified();
         tokio::pin!(writer_shutdown);
         loop {
-            if writer_handle.is_closed() {
+            if writer_closed.load(Ordering::SeqCst) {
                 break;
             }
             tokio::select! {
@@ -165,7 +169,7 @@ async fn handle_conn(stream: TcpStream, shared: Arc<Shared>) {
                         None => break,
                     }
                 }
-                _ = writer_handle.close.notified() => break,
+                _ = writer_close.notified() => break,
                 _ = &mut writer_shutdown => break,
             }
         }
@@ -222,11 +226,11 @@ async fn handle_conn(stream: TcpStream, shared: Arc<Shared>) {
         }
     }
 
-    // Cleanup: subscriptions and connection registry. Marking the handle
-    // closed also releases the writer task (it holds a handle clone).
+    // Cleanup: subscriptions and connection registry. Dropping the last
+    // channel senders closes the writer queue, so the writer flushes any
+    // pending frames (e.g. a final -ERR) and then exits on its own.
     shared.sublist.lock().unwrap().remove_conn(client_id);
     shared.conns.lock().unwrap().remove(&client_id);
-    handle.mark_closed();
     drop(tx);
     drop(handle);
 }

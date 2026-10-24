@@ -29,11 +29,11 @@ pub struct ConnectInfo {
     pub user: Option<String>,
     #[serde(default)]
     pub pass: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string_null_as_empty")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string_null_as_empty")]
     pub lang: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string_null_as_empty")]
     pub version: String,
     #[serde(default)]
     pub protocol: i32,
@@ -47,6 +47,15 @@ pub struct ConnectInfo {
 
 fn default_true() -> bool {
     true
+}
+
+/// Some clients (e.g. async-nats) send explicit `null` for string fields
+/// instead of omitting them; treat null as the empty default.
+fn de_string_null_as_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|o| o.unwrap_or_default())
 }
 
 /// Server `INFO` sent on connect.
@@ -206,8 +215,10 @@ impl Parser {
         };
         match verb.to_ascii_uppercase().as_str() {
             "CONNECT" => {
-                let info: ConnectInfo = serde_json::from_str(rest)
-                    .map_err(|e| ParseError::InvalidConnect(e.to_string()))?;
+                let info: ConnectInfo = serde_json::from_str(rest).map_err(|e| {
+                    eprintln!("rust-natsd: bad CONNECT ({e}): {rest}");
+                    ParseError::InvalidConnect(e.to_string())
+                })?;
                 Ok(Some(ClientOp::Connect(Box::new(info))))
             }
             "PING" => Ok(Some(ClientOp::Ping)),
@@ -460,6 +471,26 @@ mod tests {
             other => panic!("expected CONNECT, got {other:?}"),
         }
         assert_eq!(ops[1], ClientOp::Ping);
+    }
+
+    #[test]
+    fn connect_with_explicit_nulls_like_async_nats() {
+        // Real CONNECT line captured from async-nats 0.38: string fields are
+        // sent as explicit null and must not fail parsing.
+        let ops = parse_all(
+            b"CONNECT {\"verbose\":false,\"pedantic\":false,\"jwt\":null,\"nkey\":null,\"sig\":null,\"name\":null,\"echo\":true,\"lang\":\"rust\",\"version\":\"0.38.0\",\"protocol\":1,\"tls_required\":false,\"user\":null,\"pass\":null,\"auth_token\":null,\"headers\":true,\"no_responders\":true}\r\n",
+        )
+        .unwrap();
+        match &ops[0] {
+            ClientOp::Connect(c) => {
+                assert_eq!(c.name, "");
+                assert_eq!(c.lang, "rust");
+                assert!(c.headers);
+                assert!(c.no_responders);
+                assert_eq!(c.user, None);
+            }
+            other => panic!("expected CONNECT, got {other:?}"),
+        }
     }
 
     #[test]
