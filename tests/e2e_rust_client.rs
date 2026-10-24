@@ -52,7 +52,10 @@ async fn rust_client_wildcard() {
     let mut sub = client.subscribe("events.*").await.unwrap();
     client.flush().await.unwrap();
     client.publish("events.click", "1".into()).await.unwrap();
-    client.publish("events.user.click", "2".into()).await.unwrap();
+    client
+        .publish("events.user.click", "2".into())
+        .await
+        .unwrap();
     let msg = timeout(T, sub.next()).await.unwrap().unwrap();
     assert_eq!(msg.payload.as_ref(), b"1");
     // Deeper subject must not match `events.*`: nothing more arrives.
@@ -160,21 +163,15 @@ async fn rust_client_auth() {
     let srv = start_server(cfg).await;
     let url = format!("nats://{}", srv.addr);
 
-    let bad = async_nats::ConnectOptions::with_user_and_password(
-        "derek".into(),
-        "wrong".into(),
-    )
-    .connect(&url)
-    .await;
+    let bad = async_nats::ConnectOptions::with_user_and_password("derek".into(), "wrong".into())
+        .connect(&url)
+        .await;
     assert!(bad.is_err(), "bad password must be rejected");
 
-    let good = async_nats::ConnectOptions::with_user_and_password(
-        "derek".into(),
-        "s3cret".into(),
-    )
-    .connect(&url)
-    .await
-    .expect("good credentials connect");
+    let good = async_nats::ConnectOptions::with_user_and_password("derek".into(), "s3cret".into())
+        .connect(&url)
+        .await
+        .expect("good credentials connect");
     let mut sub = good.subscribe("secure").await.unwrap();
     good.publish("secure", "ok".into()).await.unwrap();
     let msg = timeout(T, sub.next()).await.unwrap().unwrap();
@@ -189,7 +186,10 @@ async fn rust_client_many_messages_in_order() {
     let mut sub = client.subscribe("seq").await.unwrap();
     client.flush().await.unwrap();
     for i in 0..100u32 {
-        client.publish("seq", i.to_be_bytes().to_vec().into()).await.unwrap();
+        client
+            .publish("seq", i.to_be_bytes().to_vec().into())
+            .await
+            .unwrap();
     }
     client.flush().await.unwrap();
     for i in 0..100u32 {

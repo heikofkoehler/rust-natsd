@@ -35,7 +35,10 @@ impl RawClient {
         let (read, mut writer) = stream.into_split();
         let mut reader = BufReader::new(read);
         let mut info = String::new();
-        timeout(T, reader.read_line(&mut info)).await.unwrap().unwrap();
+        timeout(T, reader.read_line(&mut info))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(info.starts_with("INFO "), "unexpected first line: {info}");
         writer
             .write_all(format!("CONNECT {connect_json}\r\nPING\r\n").as_bytes())
@@ -190,9 +193,9 @@ async fn queue_group_delivery() {
         pubc.send("PUB jobs 1\r\nx\r\n").await;
     }
     pubc.send_sync("").await; // flush all publishes through the server
-    // Collect via dedicated tasks (read_msg is not cancel-safe, so no
-    // select-ing over two clients): exactly 10 queue deliveries in total,
-    // split across both workers.
+                              // Collect via dedicated tasks (read_msg is not cancel-safe, so no
+                              // select-ing over two clients): exactly 10 queue deliveries in total,
+                              // split across both workers.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(32);
     for (idx, mut w) in [w1, w2].into_iter().enumerate() {
         let tx = tx.clone();
@@ -216,7 +219,10 @@ async fn queue_group_delivery() {
         counts[idx as usize] += 1;
     }
     assert_eq!(counts[0] + counts[1], 10);
-    assert!(counts[0] > 0 && counts[1] > 0, "load should spread: {counts:?}");
+    assert!(
+        counts[0] > 0 && counts[1] > 0,
+        "load should spread: {counts:?}"
+    );
     srv.shutdown().await.unwrap();
 }
 
@@ -291,11 +297,7 @@ async fn auth_user_pass_enforced() {
     );
 
     // Correct credentials work.
-    let mut good = RawClient::connect(
-        srv.addr,
-        "{\"user\":\"derek\",\"pass\":\"s3cret\"}",
-    )
-    .await;
+    let mut good = RawClient::connect(srv.addr, "{\"user\":\"derek\",\"pass\":\"s3cret\"}").await;
     good.send_sync("SUB ok 1\r\n").await;
     srv.shutdown().await.unwrap();
 }
