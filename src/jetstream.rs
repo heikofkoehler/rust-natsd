@@ -37,6 +37,63 @@ pub struct JetStream {
 }
 
 impl JetStream {
+    /// Totals for /varz's jetstream block.
+    pub(crate) fn snapshot_totals(&self) -> Value {
+        let engine = self.engine.lock().unwrap();
+        let mut messages = 0u64;
+        let mut bytes = 0u64;
+        let mut consumers = 0usize;
+        for s in engine.streams.values() {
+            messages += s.messages.len() as u64;
+            bytes += s.bytes();
+            consumers += s.consumers.len();
+        }
+        json!({
+            "memory": 0,
+            "storage": 0,
+            "reserved_memory": 0,
+            "reserved_storage": 0,
+            "accounts": 1,
+            "ha_assets": 0,
+            "api": {"total": 0, "errors": 0},
+            "streams": engine.streams.len(),
+            "consumers": consumers,
+            "messages": messages,
+            "bytes": bytes,
+        })
+    }
+
+    /// Full snapshot for /jsz.
+    pub(crate) fn snapshot(&self) -> Value {
+        let engine = self.engine.lock().unwrap();
+        let mut streams = Vec::new();
+        let mut total_messages = 0u64;
+        let mut total_bytes = 0u64;
+        let mut total_consumers = 0usize;
+        for s in engine.streams.values() {
+            total_messages += s.messages.len() as u64;
+            total_bytes += s.bytes();
+            total_consumers += s.consumers.len();
+            streams.push(json!({
+                "name": s.name,
+                "messages": s.messages.len(),
+                "bytes": s.bytes(),
+                "first_seq": s.first_seq(),
+                "last_seq": s.last_seq(),
+                "consumer_count": s.consumers.len(),
+                "consumers": s.consumers.keys().cloned().collect::<Vec<_>>(),
+            }));
+        }
+        json!({
+            "config": {"max_memory": 0, "max_file": 0, "store_dir": ""},
+            "streams": streams,
+            "total_streams": engine.streams.len(),
+            "total_messages": total_messages,
+            "total_bytes": total_bytes,
+            "total_consumers": total_consumers,
+        })
+    }
+
     pub fn new() -> Self {
         JetStream {
             engine: Mutex::new(Engine {
@@ -162,7 +219,7 @@ fn base64_encode(data: &[u8]) -> String {
 /// Format unix nanos as RFC3339 (UTC), e.g. `2026-10-24T01:23:45.123456789Z`.
 /// Implemented by hand (civil-from-days) so MSG.GET responses carry the
 /// `time` field async-nats requires, without a date dependency.
-fn rfc3339(time_ns: u64) -> String {
+pub(crate) fn rfc3339(time_ns: u64) -> String {
     let secs = (time_ns / 1_000_000_000) as i64;
     let nanos = time_ns % 1_000_000_000;
     let days = secs.div_euclid(86_400);

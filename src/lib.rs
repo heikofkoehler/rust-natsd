@@ -6,6 +6,7 @@
 pub mod config;
 pub mod jetstream;
 pub mod leaf;
+pub mod monitor;
 pub mod protocol;
 pub mod route;
 pub mod server;

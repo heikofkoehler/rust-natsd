@@ -105,9 +105,10 @@ pub(crate) struct ConnHandle {
     headers: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     close: Arc<Notify>,
-    in_msgs: AtomicU64,
-    out_msgs: AtomicU64,
-    out_bytes: AtomicU64,
+    pub(crate) in_msgs: AtomicU64,
+    pub(crate) in_bytes: AtomicU64,
+    pub(crate) out_msgs: AtomicU64,
+    pub(crate) out_bytes: AtomicU64,
 }
 
 impl ConnHandle {
@@ -118,6 +119,7 @@ impl ConnHandle {
             closed: Arc::new(AtomicBool::new(false)),
             close: Arc::new(Notify::new()),
             in_msgs: AtomicU64::new(0),
+            in_bytes: AtomicU64::new(0),
             out_msgs: AtomicU64::new(0),
             out_bytes: AtomicU64::new(0),
         })
@@ -136,20 +138,20 @@ type InterestMap = HashMap<(String, Option<String>), u32>;
 
 /// A route peer connection.
 pub(crate) struct RouteConn {
-    peer_id: Mutex<Option<String>>,
+    pub(crate) peer_id: Mutex<Option<String>>,
     /// The peer's cluster listen address (host:port from its INFO), used to
     /// avoid dialing a peer we already have a connection to.
-    peer_listen_addr: Mutex<Option<String>>,
+    pub(crate) peer_listen_addr: Mutex<Option<String>>,
     /// Server id of the connection's initiator (for duplicate resolution:
     /// the connection initiated by the smaller server id wins).
-    initiator: String,
-    handle: Arc<ConnHandle>,
+    pub(crate) initiator: String,
+    pub(crate) handle: Arc<ConnHandle>,
 }
 
 /// A leaf connection (either side of it: hub-side accepted, or leaf-side
 /// solicited — the protocol is symmetric after the handshake).
 pub(crate) struct LeafConn {
-    handle: Arc<ConnHandle>,
+    pub(crate) handle: Arc<ConnHandle>,
 }
 
 /// Connection metadata for the monitoring endpoint.
@@ -178,9 +180,9 @@ pub struct Shared {
     pub(crate) cluster_addr: Option<SocketAddr>,
     pub(crate) leaf_addr: Option<SocketAddr>,
     pub(crate) server_id: String,
-    /// Read by the monitoring endpoint (Phase 10) for uptime.
-    #[allow(dead_code)]
     pub(crate) started: Instant,
+    /// Wall-clock start time, for the monitoring endpoint's `start` field.
+    pub(crate) started_wall: std::time::SystemTime,
     pub(crate) sublist: Mutex<Sublist>,
     pub(crate) conns: Mutex<HashMap<u64, Arc<ConnHandle>>>,
     pub(crate) conn_info: Mutex<HashMap<u64, ConnInfo>>,
@@ -243,6 +245,12 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         None
     };
     let leaf_addr = leaf_listener.as_ref().map(|l| l.local_addr()).transpose()?;
+    let http_listener = if config.http_port != 0 {
+        Some(TcpListener::bind((config.host.as_str(), config.http_port)).await?)
+    } else {
+        None
+    };
+    let http_addr = http_listener.as_ref().map(|l| l.local_addr()).transpose()?;
     let jetstream = if config.jetstream {
         Some(Arc::new(crate::jetstream::JetStream::new()))
     } else {
@@ -255,6 +263,7 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         leaf_addr,
         server_id: gen_server_id(),
         started: Instant::now(),
+        started_wall: std::time::SystemTime::now(),
         sublist: Mutex::new(Sublist::new()),
         conns: Mutex::new(HashMap::new()),
         conn_info: Mutex::new(HashMap::new()),
@@ -277,6 +286,7 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         listener,
         cluster_listener,
         leaf_listener,
+        http_listener,
         shared,
         shutdown_rx,
     ));
@@ -284,7 +294,7 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         addr,
         cluster_addr,
         leaf_addr,
-        http_addr: None,
+        http_addr,
         shutdown_tx,
         task,
     })
@@ -294,6 +304,7 @@ async fn supervisor(
     listener: TcpListener,
     cluster_listener: Option<TcpListener>,
     leaf_listener: Option<TcpListener>,
+    http_listener: Option<TcpListener>,
     shared: Arc<Shared>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
@@ -304,6 +315,9 @@ async fn supervisor(
     }
     if let Some(l) = leaf_listener {
         tasks.spawn(leaf_accept_loop(l, shared.clone()));
+    }
+    if let Some(l) = http_listener {
+        tasks.spawn(crate::monitor::accept_loop(l, shared.clone()));
     }
     // Solicited routes and leafs, each with its own retry loop.
     for url in shared.config.routes.clone() {
@@ -929,6 +943,9 @@ async fn process_op(
             payload,
         } => {
             handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            handle
+                .in_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
             shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
             shared
                 .stats
@@ -952,6 +969,9 @@ async fn process_op(
             payload,
         } => {
             handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            handle
+                .in_bytes
+                .fetch_add((headers.len() + payload.len()) as u64, Ordering::Relaxed);
             shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
             shared
                 .stats
@@ -1391,6 +1411,10 @@ async fn process_route_op(
             ..
         } => {
             handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            handle.in_bytes.fetch_add(
+                (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
+                Ordering::Relaxed,
+            );
             shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
             shared.stats.in_bytes.fetch_add(
                 (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
@@ -1705,6 +1729,10 @@ async fn process_leaf_op(
             ..
         } => {
             handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            handle.in_bytes.fetch_add(
+                (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
+                Ordering::Relaxed,
+            );
             shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
             shared.stats.in_bytes.fetch_add(
                 (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,

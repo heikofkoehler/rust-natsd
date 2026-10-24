@@ -120,6 +120,11 @@ impl Sublist {
 
     /// Distinct (pattern, queue) pairs currently subscribed, for
     /// RS+/LS+ interest sync to a newly connected route or leaf.
+    /// All subscriptions (for /subz).
+    pub fn subscriptions(&self) -> Vec<Subscription> {
+        self.subs.clone()
+    }
+
     pub fn patterns(&self) -> Vec<(String, Option<String>)> {
         let mut out: Vec<(String, Option<String>)> = Vec::new();
         for s in &self.subs {
