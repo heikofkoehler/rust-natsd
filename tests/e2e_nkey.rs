@@ -89,6 +89,35 @@ async fn nkey_sign_nonce_authenticates_and_publishes() {
 }
 
 #[tokio::test]
+async fn nkey_raw_url_safe_signature_authenticates() {
+    // nats.go encodes the signature with base64.RawURLEncoding (no
+    // padding, URL-safe alphabet); the server must accept that as well
+    // as standard padded base64 (regression test: a Go nats.go nkey
+    // client was rejected before this was handled).
+    let kp = nkeys::KeyPair::new_user();
+    let pubkey = kp.public_key();
+    let srv = server::start(nkey_config(&pubkey))
+        .await
+        .expect("server starts");
+    let mut client = Raw::connect(srv.addr).await;
+    let info = client.info().await;
+    let nonce = info["nonce"].as_str().expect("INFO nonce").to_string();
+    let sig = kp.sign(nonce.as_bytes()).unwrap();
+    use base64::Engine;
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
+    client
+        .send(&format!(
+            "CONNECT {{\"nkey\":\"{pubkey}\",\"sig\":\"{sig_b64}\",\"verbose\":false,\"headers\":true}}\r\n"
+        ))
+        .await;
+    client.send("SUB nkey.url 1\r\n").await;
+    client.send("PUB nkey.url 2\r\nhi\r\n").await;
+    let line = client.read_line().await;
+    assert!(line.starts_with("MSG nkey.url 1 2"), "delivery: {line}");
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn nkey_bad_signature_is_rejected() {
     let kp = nkeys::KeyPair::new_user();
     let pubkey = kp.public_key();

@@ -108,9 +108,18 @@ pub struct AuthOutcome {
 /// Verify an nkey signature: base64-decode `sig_b64` and check it
 /// against `nonce` with the public key `nkey` (Ed25519, via the `nkeys`
 /// crate). Returns false on any decode/parse/verify failure.
+/// Both encodings are accepted: standard padded base64 (as the Rust
+/// `nkeys` test client sends) and raw URL-safe base64 without padding
+/// (as nats.go sends — `base64.RawURLEncoding`), since a 64-byte
+/// signature encodes to 86 unpadded chars that standard decoding
+/// rejects.
 pub fn verify_nkey_sig(nkey: &str, nonce: &[u8], sig_b64: &str) -> bool {
     use base64::Engine;
-    let Ok(sig) = base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()) else {
+    let trimmed = sig_b64.trim();
+    let sig = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed));
+    let Ok(sig) = sig else {
         return false;
     };
     let Ok(kp) = nkeys::KeyPair::from_public_key(nkey) else {
