@@ -211,11 +211,20 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Raw<S> {
     }
 }
 
+/// STARTTLS upgrade (Go's order): read the plaintext INFO first, then
+/// wrap the same socket in TLS. Returns the TLS client plus the INFO
+/// that was already consumed in plaintext.
 async fn tls_connect(
     srv_addr: std::net::SocketAddr,
     certs: &Certs,
     client_auth: bool,
-) -> Result<Raw<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, std::io::Error> {
+) -> Result<
+    (
+        Raw<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        serde_json::Value,
+    ),
+    std::io::Error,
+> {
     let config = client_config(
         &certs.ca,
         if client_auth {
@@ -226,12 +235,23 @@ async fn tls_connect(
     );
     let connector = tokio_rustls::TlsConnector::from(config);
     let tcp = tokio::net::TcpStream::connect(srv_addr).await?;
-    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let stream = connector.connect(name, tcp).await?;
-    Ok(Raw {
-        stream,
+    let mut plain = Raw {
+        stream: tcp,
         buf: Vec::new(),
-    })
+    };
+    let info = plain.info().await;
+    // The server sends nothing after INFO before the upgrade, so the
+    // read buffer must be empty here; anything else would be lost.
+    assert!(plain.buf.is_empty(), "no bytes may follow plaintext INFO");
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let stream = connector.connect(name, plain.stream).await?;
+    Ok((
+        Raw {
+            stream,
+            buf: Vec::new(),
+        },
+        info,
+    ))
 }
 
 #[tokio::test]
@@ -240,36 +260,33 @@ async fn tls_roundtrip_and_plain_client_fails() {
     let srv = server::start(tls_config(&certs, false))
         .await
         .expect("server starts");
-    // Plain-text client: no INFO, connection fails at handshake. The
-    // server answers with a TLS alert (a few bytes) and then closes, so
-    // accept alert bytes or EOF/error — but never an INFO line.
-    let mut plain = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
-    plain.write_all(b"PING\r\n").await.unwrap();
+    // Plain-text client (Go STARTTLS behaviour): it DOES see the
+    // plaintext INFO (tls_required:true), and is then closed silently
+    // when it sends non-TLS bytes — no -ERR, no PONG.
+    let plain = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    let mut plain_raw = Raw {
+        stream: plain,
+        buf: Vec::new(),
+    };
+    let plain_info = plain_raw.info().await;
+    assert_eq!(plain_info["tls_required"], true);
+    plain_raw.send("PING\r\n").await;
     let mut buf = [0u8; 256];
-    let read = tokio::time::timeout(std::time::Duration::from_secs(3), plain.read(&mut buf)).await;
-    match read {
-        Ok(Ok(n)) => {
-            assert!(
-                !buf[..n].starts_with(b"INFO"),
-                "plain client must never see INFO"
-            );
-            // After the alert the server closes the connection.
-            let read2 =
-                tokio::time::timeout(std::time::Duration::from_secs(3), plain.read(&mut buf)).await;
-            assert!(
-                matches!(read2, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
-                "plain connection should close after the alert, got {read2:?}"
-            );
-        }
-        Ok(Err(_)) => {}
-        Err(_) => {}
-    }
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        plain_raw.stream.read(&mut buf),
+    )
+    .await;
+    assert!(
+        matches!(read, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
+        "plain connection should close silently, got {read:?}"
+    );
 
-    // TLS client: INFO reports tls_required, then pub/sub works.
-    let mut client = tls_connect(srv.addr, &certs, false)
+    // TLS client: plaintext INFO reports tls_required, then pub/sub
+    // works inside TLS.
+    let (mut client, info) = tls_connect(srv.addr, &certs, false)
         .await
         .expect("TLS handshake");
-    let info = client.info().await;
     assert_eq!(info["tls_required"], true);
     client
         .send("CONNECT {\"verbose\":false,\"headers\":true}\r\n")
@@ -293,41 +310,28 @@ async fn tls_verify_requires_client_certificate() {
     // Without a client cert the server must reject the client. Note this
     // surfaces on first read, not on connect(): in TLS 1.3 the client's
     // connect() can return Ok before the server's post-Finished
-    // certificate-required alert arrives (verified against the release
-    // binary with an OpenSSL/Python client: alert certificate required).
-    // What must never happen is receiving INFO or any protocol data.
+    // certificate-required alert arrives. The plaintext INFO is expected
+    // (STARTTLS); what must never happen is any protocol data after the
+    // upgrade — the TLS read must fail or close.
     match tls_connect(srv.addr, &certs, false).await {
         Err(_) => {}
-        Ok(mut client) => {
+        Ok((mut client, _info)) => {
             let mut buf = [0u8; 256];
             let read = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 client.stream.read(&mut buf),
             )
             .await;
-            if let Ok(Ok(n)) = read {
-                assert!(
-                    !buf[..n].starts_with(b"INFO"),
-                    "client without a certificate must never see INFO"
-                );
-                // Alert bytes are fine; the connection must then close.
-                let read2 = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    client.stream.read(&mut buf),
-                )
-                .await;
-                assert!(
-                    matches!(read2, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
-                    "connection should close after rejection, got {read2:?}"
-                );
-            }
+            assert!(
+                matches!(read, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
+                "connection should close after rejection, got {read:?}"
+            );
         }
     }
     // With a CA-signed client cert it succeeds and can publish.
-    let mut client = tls_connect(srv.addr, &certs, true)
+    let (mut client, info) = tls_connect(srv.addr, &certs, true)
         .await
         .expect("TLS handshake with client cert");
-    let info = client.info().await;
     assert_eq!(info["tls_required"], true);
     client
         .send("CONNECT {\"verbose\":false,\"headers\":true}\r\n")

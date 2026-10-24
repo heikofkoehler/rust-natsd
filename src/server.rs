@@ -427,14 +427,59 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     tokio::spawn(async move {
                         match &shared.tls_acceptor {
                             Some(acceptor) => {
-                                // Handshake first, INFO only inside TLS:
-                                // a plain-text client fails here and
-                                // never sees protocol bytes.
+                                // Go's STARTTLS order (verified against
+                                // nats-server v2.15.1): INFO (with
+                                // tls_required:true) goes out in plaintext
+                                // first; the client then upgrades the same
+                                // socket to TLS and sends CONNECT inside
+                                // it. A direct/implicit-TLS client fails
+                                // on its own side (it receives plaintext
+                                // INFO where it expected ServerHello),
+                                // matching Go. A plain client that sends
+                                // non-TLS bytes after INFO is closed
+                                // silently, also matching Go. Peek does
+                                // not consume, so the handshake still
+                                // sees the full ClientHello.
+                                use tokio::io::AsyncWriteExt;
+                                let nonce = gen_nonce();
+                                let info =
+                                    client_info(&shared, id, &peer.ip().to_string(), &nonce);
+                                let mut stream = stream;
+                                if stream
+                                    .write_all(&encode_info(&info))
+                                    .await
+                                    .is_err()
+                                {
+                                    shared.conn_info.lock().unwrap().remove(&id);
+                                    return;
+                                }
+                                let mut first = [0u8; 1];
+                                match stream.peek(&mut first).await {
+                                    Ok(0) | Err(_) => {
+                                        shared.conn_info.lock().unwrap().remove(&id);
+                                        return;
+                                    }
+                                    Ok(_) => {}
+                                }
+                                if first[0] != 0x16 {
+                                    // Plain client after a TLS INFO:
+                                    // Go closes silently, no -ERR.
+                                    shared.conn_info.lock().unwrap().remove(&id);
+                                    return;
+                                }
                                 match acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
                                         let (reader, writer) = tokio::io::split(tls_stream);
-                                        handle_conn(reader, writer, shared, id, peer.ip().to_string())
-                                            .await;
+                                        handle_conn(
+                                            reader,
+                                            writer,
+                                            shared,
+                                            id,
+                                            peer.ip().to_string(),
+                                            nonce,
+                                            true,
+                                        )
+                                        .await;
                                     }
                                     Err(e) => {
                                         eprintln!("rust-natsd: TLS handshake failed: {e}");
@@ -444,7 +489,16 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                             }
                             None => {
                                 let (reader, writer) = stream.into_split();
-                                handle_conn(reader, writer, shared, id, peer.ip().to_string()).await;
+                                handle_conn(
+                                    reader,
+                                    writer,
+                                    shared,
+                                    id,
+                                    peer.ip().to_string(),
+                                    gen_nonce(),
+                                    false,
+                                )
+                                .await;
                             }
                         }
                     });
@@ -1072,12 +1126,42 @@ struct ConnState {
     nonce: String,
 }
 
+/// Build the client INFO for one connection. The nonce is a per-connection
+/// challenge string (what an nkey client signs in CONNECT); it is only
+/// advertised when authentication is configured (Go omitempty).
+fn client_info(shared: &Shared, client_id: u64, peer_ip: &str, nonce: &str) -> ServerInfo {
+    let auth_required = shared.config.auth_required();
+    ServerInfo {
+        server_id: shared.server_id.clone(),
+        server_name: shared.config.name.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        proto: 1,
+        headers: true,
+        max_payload: shared.config.max_payload,
+        host: shared.listen_addr.ip().to_string(),
+        port: shared.listen_addr.port(),
+        client_id,
+        nonce: if auth_required {
+            nonce.to_string()
+        } else {
+            String::new()
+        },
+        auth_required,
+        tls_required: shared.config.tls_required(),
+        jetstream: shared.config.jetstream,
+        client_ip: peer_ip.to_string(),
+        cluster: shared.config.cluster_name.clone(),
+    }
+}
+
 async fn handle_conn<R, W>(
     mut reader: R,
     writer: W,
     shared: Arc<Shared>,
     client_id: u64,
     peer_ip: String,
+    nonce: String,
+    info_sent: bool,
 ) where
     R: AsyncReadExt + Unpin + Send,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -1089,33 +1173,12 @@ async fn handle_conn<R, W>(
         .unwrap()
         .insert(client_id, handle.clone());
 
-    // Send INFO first, per protocol. The nonce is generated per
-    // connection and is what an nkey client signs in CONNECT; it is
-    // only advertised when authentication is configured (Go omitempty).
-    let nonce = gen_nonce();
-    let auth_required = shared.config.auth_required();
-    let info = ServerInfo {
-        server_id: shared.server_id.clone(),
-        server_name: shared.config.name.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        proto: 1,
-        headers: true,
-        max_payload: shared.config.max_payload,
-        host: shared.listen_addr.ip().to_string(),
-        port: shared.listen_addr.port(),
-        client_id,
-        nonce: if auth_required {
-            nonce.clone()
-        } else {
-            String::new()
-        },
-        auth_required,
-        tls_required: shared.config.tls_required(),
-        jetstream: shared.config.jetstream,
-        client_ip: peer_ip,
-        cluster: shared.config.cluster_name.clone(),
-    };
-    let _ = tx.send(encode_info(&info)).await;
+    // Send INFO first, per protocol, unless the accept loop already sent
+    // it in plaintext for a STARTTLS upgrade (see client_accept_loop).
+    if !info_sent {
+        let info = client_info(&shared, client_id, &peer_ip, &nonce);
+        let _ = tx.send(encode_info(&info)).await;
+    }
 
     // Server-initiated PING (Go behaviour): every ping_interval, send
     // PING; after ping_max missed PONGs, close with -ERR 'Stale
