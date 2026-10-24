@@ -44,6 +44,13 @@ pub struct MatchResult {
     pub expired: Vec<(u64, String)>,
 }
 
+/// Unselected match: plain deliveries plus queue groups with all members.
+#[derive(Debug, Default)]
+pub struct GroupMatch {
+    pub plain: Vec<Delivery>,
+    pub groups: BTreeMap<String, Vec<Delivery>>,
+}
+
 #[derive(Debug, Default)]
 pub struct Sublist {
     subs: Vec<Subscription>,
@@ -152,46 +159,71 @@ impl Sublist {
         publisher_conn: u64,
         publisher_echo: bool,
     ) -> MatchResult {
-        let mut result = MatchResult::default();
-        // Queue groups: queue name -> indices of matching member subs.
-        let mut queue_groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        let mut plain: Vec<usize> = Vec::new();
+        let gm = self.match_groups(subject, publisher_conn, publisher_echo);
+        let mut deliveries = gm.plain;
+        for (_q, members) in gm.groups {
+            // Round-robin across the members that matched this message.
+            let pick = members[(self.queue_cursor as usize) % members.len()].clone();
+            self.queue_cursor = self.queue_cursor.wrapping_add(1);
+            deliveries.push(pick);
+        }
+        let expired = self.note_deliveries(&deliveries);
+        MatchResult {
+            deliveries,
+            expired,
+        }
+    }
 
-        for (i, sub) in self.subs.iter().enumerate() {
+    /// Like `match_recipients`, but queue groups are returned unselected
+    /// (group -> all matching members) so the caller can run a global
+    /// queue selection across local members, routes, and leafs. Counters
+    /// are NOT updated here; the caller records actual deliveries with
+    /// `note_deliveries`.
+    pub fn match_groups(
+        &self,
+        subject: &str,
+        publisher_conn: u64,
+        publisher_echo: bool,
+    ) -> GroupMatch {
+        let mut out = GroupMatch::default();
+        for sub in &self.subs {
             if !publisher_echo && sub.conn_id == publisher_conn {
                 continue;
             }
             if !subject_matches(&sub.subject, subject) {
                 continue;
             }
-            match &sub.queue {
-                Some(q) => queue_groups.entry(q.clone()).or_default().push(i),
-                None => plain.push(i),
-            }
-        }
-
-        let mut chosen: Vec<usize> = plain;
-        for (_q, members) in queue_groups {
-            // Round-robin across the members that matched this message.
-            let pick = members[(self.queue_cursor as usize) % members.len()];
-            self.queue_cursor = self.queue_cursor.wrapping_add(1);
-            chosen.push(pick);
-        }
-
-        for i in chosen {
-            let sub = &mut self.subs[i];
-            sub.delivered += 1;
-            result.deliveries.push(Delivery {
+            let d = Delivery {
                 conn_id: sub.conn_id,
                 sid: sub.sid.clone(),
-            });
-            if let Some(max) = sub.max_msgs {
-                if sub.delivered >= max {
-                    result.expired.push((sub.conn_id, sub.sid.clone()));
+            };
+            match &sub.queue {
+                Some(q) => out.groups.entry(q.clone()).or_default().push(d),
+                None => out.plain.push(d),
+            }
+        }
+        out
+    }
+
+    /// Record actual deliveries: bump counters, return subscriptions that
+    /// hit their auto-unsubscribe max with this delivery.
+    pub fn note_deliveries(&mut self, deliveries: &[Delivery]) -> Vec<(u64, String)> {
+        let mut expired = Vec::new();
+        for d in deliveries {
+            if let Some(sub) = self
+                .subs
+                .iter_mut()
+                .find(|s| s.conn_id == d.conn_id && s.sid == d.sid)
+            {
+                sub.delivered += 1;
+                if let Some(max) = sub.max_msgs {
+                    if sub.delivered >= max {
+                        expired.push((sub.conn_id, sub.sid.clone()));
+                    }
                 }
             }
         }
-        result
+        expired
     }
 }
 

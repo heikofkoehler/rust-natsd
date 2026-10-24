@@ -32,7 +32,10 @@ pub enum LeafOp {
     LMsg {
         subject: String,
         reply_to: Option<String>,
-        queues: Vec<String>,
+        /// Queue restriction from an LMSG `|` list. `None` for HMSG/MSG
+        /// frames (Go sends header messages to leafs as HMSG, which
+        /// carries no queue list) — those deliver to all matching groups.
+        queues: Option<Vec<String>>,
         headers: Option<Bytes>,
         payload: Bytes,
     },
@@ -244,12 +247,100 @@ fn parse_leaf_line(
             let op = LeafOp::LMsg {
                 subject,
                 reply_to,
-                queues,
+                queues: Some(queues),
                 headers: None,
                 payload: Bytes::new(),
             };
             *pending = Pending::Msg { op, hdr_len, total };
             Ok(None)
+        }
+        // Go sends header messages to leafs as HMSG (client-style, but
+        // with no subscription id and no account): HMSG subject [reply]
+        // hdr_len total_len. Plain MSG (subject sid [reply] size) is
+        // accepted the same way for robustness.
+        "HMSG" | "MSG" => {
+            let args: Vec<&str> = rest.split_whitespace().collect();
+            if verb_up == "HMSG" {
+                if args.len() < 3 || args.len() > 4 {
+                    return Err(LeafParseError::InvalidArgs(format!("HMSG {rest}")));
+                }
+                let subject = args[0].to_string();
+                if !crate::subject::is_valid_publish_subject(&subject) {
+                    return Err(LeafParseError::InvalidSubject(subject));
+                }
+                let (reply_to, hdr_len, total) = if args.len() == 3 {
+                    (
+                        None,
+                        args[1]
+                            .parse::<usize>()
+                            .map_err(|_| LeafParseError::InvalidSize(args[1].to_string()))?,
+                        args[2]
+                            .parse::<usize>()
+                            .map_err(|_| LeafParseError::InvalidSize(args[2].to_string()))?,
+                    )
+                } else {
+                    (
+                        Some(args[1].to_string()),
+                        args[2]
+                            .parse::<usize>()
+                            .map_err(|_| LeafParseError::InvalidSize(args[2].to_string()))?,
+                        args[3]
+                            .parse::<usize>()
+                            .map_err(|_| LeafParseError::InvalidSize(args[3].to_string()))?,
+                    )
+                };
+                if total > max_payload {
+                    return Err(LeafParseError::PayloadTooLarge(total));
+                }
+                let op = LeafOp::LMsg {
+                    subject,
+                    reply_to,
+                    queues: None,
+                    headers: None,
+                    payload: Bytes::new(),
+                };
+                *pending = Pending::Msg { op, hdr_len, total };
+                Ok(None)
+            } else {
+                if args.len() < 3 || args.len() > 4 {
+                    return Err(LeafParseError::InvalidArgs(format!("MSG {rest}")));
+                }
+                let subject = args[0].to_string();
+                if !crate::subject::is_valid_publish_subject(&subject) {
+                    return Err(LeafParseError::InvalidSubject(subject));
+                }
+                let (reply_to, total) = if args.len() == 3 {
+                    (
+                        None,
+                        args[2]
+                            .parse::<usize>()
+                            .map_err(|_| LeafParseError::InvalidSize(args[2].to_string()))?,
+                    )
+                } else {
+                    (
+                        Some(args[2].to_string()),
+                        args[3]
+                            .parse::<usize>()
+                            .map_err(|_| LeafParseError::InvalidSize(args[3].to_string()))?,
+                    )
+                };
+                if total > max_payload {
+                    return Err(LeafParseError::PayloadTooLarge(total));
+                }
+                let op = LeafOp::LMsg {
+                    subject,
+                    reply_to,
+                    queues: None,
+                    headers: None,
+                    payload: Bytes::new(),
+                };
+                *pending = Pending::Msg {
+                    op,
+                    hdr_len: 0,
+                    total,
+                };
+                Ok(None)
+            }
         }
         "-ERR" => Ok(Some(LeafOp::Err(rest.to_string()))),
         _ => Err(LeafParseError::InvalidArgs(format!(
@@ -259,6 +350,7 @@ fn parse_leaf_line(
 }
 
 /// Leaf INFO JSON for this server.
+#[allow(clippy::too_many_arguments)]
 pub fn leaf_info_json(
     server_id: &str,
     server_name: &str,
@@ -267,6 +359,8 @@ pub fn leaf_info_json(
     max_payload: usize,
     jetstream: bool,
     cluster_name: &str,
+    client_id: u64,
+    leafnode_urls: Option<&str>,
 ) -> String {
     serde_json::json!({
         "server_id": server_id,
@@ -281,6 +375,11 @@ pub fn leaf_info_json(
         "jetstream": jetstream,
         "cluster": cluster_name,
         "domain": "",
+        // Go's soliciting leaf rejects a hub INFO without client_id
+        // ("attempted to connect to wrong port"): it uses the field to
+        // confirm the remote is a leaf listener, not a client port.
+        "client_id": client_id,
+        "leafnode_urls": leafnode_urls.map(|u| vec![u.to_string()]),
     })
     .to_string()
 }
@@ -314,8 +413,11 @@ pub fn leaf_connect_json(
 }
 
 pub fn encode_ls_plus(subject: &str, queue: Option<&str>) -> Bytes {
+    // Go's leaf parser requires the weight for queue subscriptions
+    // (`LS+ subject queue weight`); a 2-arg queue form is a protocol
+    // violation and Go closes the leaf connection.
     match queue {
-        Some(q) => Bytes::from(format!("LS+ {subject} {q}\r\n")),
+        Some(q) => Bytes::from(format!("LS+ {subject} {q} 1\r\n")),
         None => Bytes::from(format!("LS+ {subject}\r\n")),
     }
 }
@@ -325,6 +427,30 @@ pub fn encode_ls_minus(subject: &str, queue: Option<&str>) -> Bytes {
         Some(q) => Bytes::from(format!("LS- {subject} {q}\r\n")),
         None => Bytes::from(format!("LS- {subject}\r\n")),
     }
+}
+
+/// Encode a header message for a leaf connection. Go sends header
+/// messages over leaf connections as HMSG (no subscription id, no
+/// account) — not as LMSG with two sizes, which Go parses as a plain
+/// message with the header block embedded in the payload.
+pub fn encode_leaf_hmsg(
+    subject: &str,
+    reply_to: Option<&str>,
+    headers: &[u8],
+    payload: &[u8],
+) -> Bytes {
+    let total = headers.len() + payload.len();
+    let mut line = format!("HMSG {subject}");
+    if let Some(r) = reply_to {
+        line.push(' ');
+        line.push_str(r);
+    }
+    line.push_str(&format!(" {} {total}\r\n", headers.len()));
+    let mut out = BytesMut::from(line.as_str());
+    out.extend_from_slice(headers);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n");
+    out.freeze()
 }
 
 pub fn encode_lmsg(
@@ -410,7 +536,7 @@ mod tests {
         }
         match &got[5] {
             LeafOp::LMsg { queues, .. } => {
-                assert_eq!(queues, &vec!["workers".to_string()]);
+                assert_eq!(queues, &Some(vec!["workers".to_string()]));
             }
             other => panic!("{other:?}"),
         }

@@ -281,6 +281,16 @@ func cluster(url1, url2 string) {
 		}
 	}
 	expect("cluster queue total == 20", total == 20, fmt.Sprintf("got %d", total))
+	// Exactly-once globally: no 21st delivery.
+	time.Sleep(300 * time.Millisecond)
+	extra := false
+	if _, err := q1.NextMsg(100 * time.Millisecond); err == nil {
+		extra = true
+	}
+	if _, err := q2.NextMsg(100 * time.Millisecond); err == nil {
+		extra = true
+	}
+	expect("cluster queue no extra delivery", !extra, "got a 21st message")
 
 	// Request/reply across nodes.
 	respSub, err := subConn.Subscribe("xsvc", func(m *nats.Msg) {
@@ -289,25 +299,68 @@ func cluster(url1, url2 string) {
 	check("cluster responder", err)
 	defer respSub.Unsubscribe()
 	_ = subConn.Flush()
+	// Let the responder's interest propagate to the other node before
+	// requesting (a request sent too early gets "no responders").
+	time.Sleep(500 * time.Millisecond)
 	resp, err := pubConn.Request("xsvc", []byte("ping"), 5*time.Second)
 	check("cluster request", err)
 	if err == nil {
 		expect("cluster reply", string(resp.Data) == "pong", string(resp.Data))
 	}
 
-	// Headers across nodes.
+	// Headers across nodes (retry the publish: the subscription's
+	// interest may still be propagating when the first publish lands).
 	hsub, err := subConn.SubscribeSync("xhdr")
 	check("cluster header subscribe", err)
 	_ = subConn.Flush()
 	hmsg := nats.NewMsg("xhdr")
 	hmsg.Data = []byte("body")
 	hmsg.Header.Set("X-Cross", "yes")
-	_ = pubConn.PublishMsg(hmsg)
-	msg, err := hsub.NextMsg(5 * time.Second)
-	check("cluster header receive", err)
-	if err == nil {
+	var msg *nats.Msg
+	for i := 0; i < 25; i++ {
+		_ = pubConn.PublishMsg(hmsg)
+		_ = pubConn.Flush()
+		if m, err := hsub.NextMsg(200 * time.Millisecond); err == nil {
+			msg = m
+			break
+		}
+	}
+	check("cluster header receive", func() error {
+		if msg == nil {
+			return fmt.Errorf("timeout")
+		}
+		return nil
+	}())
+	if msg != nil {
 		expect("cluster header value", msg.Header.Get("X-Cross") == "yes",
 			fmt.Sprintf("headers: %v", msg.Header))
+	}
+
+	// Reverse header direction: subscribe on node1, publish from node2.
+	hsub2, err := pubConn.SubscribeSync("xhdr2")
+	check("cluster header subscribe reverse", err)
+	_ = pubConn.Flush()
+	hmsg2 := nats.NewMsg("xhdr2")
+	hmsg2.Data = []byte("body2")
+	hmsg2.Header.Set("X-Cross", "back")
+	var msg2 *nats.Msg
+	for i := 0; i < 25; i++ {
+		_ = subConn.PublishMsg(hmsg2)
+		_ = subConn.Flush()
+		if m, err := hsub2.NextMsg(200 * time.Millisecond); err == nil {
+			msg2 = m
+			break
+		}
+	}
+	check("cluster header receive reverse", func() error {
+		if msg2 == nil {
+			return fmt.Errorf("timeout")
+		}
+		return nil
+	}())
+	if msg2 != nil {
+		expect("cluster header value reverse", msg2.Header.Get("X-Cross") == "back",
+			fmt.Sprintf("headers: %v", msg2.Header))
 	}
 }
 

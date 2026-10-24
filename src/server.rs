@@ -27,8 +27,8 @@ use tokio::task::JoinSet;
 
 use crate::config::{parse_route_url, Config};
 use crate::leaf::{
-    encode_lmsg, encode_ls_minus, encode_ls_plus, leaf_connect_json, leaf_info_json, LeafOp,
-    LeafParser,
+    encode_leaf_hmsg, encode_lmsg, encode_ls_minus, encode_ls_plus, leaf_connect_json,
+    leaf_info_json, LeafOp, LeafParser,
 };
 use crate::protocol::{
     encode_err, encode_hmsg, encode_info, encode_msg, encode_ok, encode_pong, ClientOp, Parser,
@@ -189,12 +189,19 @@ pub struct Shared {
     pub(crate) leafs: Mutex<HashMap<u64, Arc<LeafConn>>>,
     pub(crate) leaf_subs: Mutex<HashMap<u64, InterestMap>>,
     pub(crate) next_conn_id: AtomicU64,
+    /// Rotating cursor for global queue-group selection (local members,
+    /// routes, leafs are weighted by member count).
+    pub(crate) queue_cursor: AtomicU64,
     pub(crate) stats: Stats,
     pub(crate) shutdown: Arc<Notify>,
     pub(crate) shutdown_flag: AtomicBool,
     /// JetStream engine, present when `--jetstream` is set (Phase 9).
     pub(crate) jetstream: Option<Arc<crate::jetstream::JetStream>>,
 }
+
+/// Targets for one cross-node fan-out: (conn id, writer, has plain
+/// interest, queue-group member counts).
+type InterestTargets = Vec<(u64, Arc<ConnHandle>, bool, HashMap<String, u32>)>;
 
 /// A running server instance; used by `main` and by tests.
 pub struct RunningServer {
@@ -256,6 +263,7 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         leafs: Mutex::new(HashMap::new()),
         leaf_subs: Mutex::new(HashMap::new()),
         next_conn_id: AtomicU64::new(1),
+        queue_cursor: AtomicU64::new(0),
         stats: Stats::default(),
         shutdown: Arc::new(Notify::new()),
         shutdown_flag: AtomicBool::new(false),
@@ -434,7 +442,17 @@ fn try_send(handle: &ConnHandle, frame: Bytes) -> bool {
 
 /// Deliver a message: to local subscribers, and (unless it arrived on a
 /// route/leaf) forward it to routes and leafs with matching interest.
-pub fn deliver(shared: &Arc<Shared>, msg: &Message, origin: Origin) {
+///
+/// `queue_filter` restricts queue-group delivery for messages arriving
+/// on a route/leaf: only the listed groups are delivered (the sender
+/// already ran the global queue selection). `None` means all groups
+/// (local publishes and header route frames, which carry no list).
+pub fn deliver(
+    shared: &Arc<Shared>,
+    msg: &Message,
+    origin: Origin,
+    queue_filter: Option<&[String]>,
+) {
     // JetStream capture / API handling happens before core delivery so a
     // stream message is stored even when nobody is subscribed, and API
     // requests are answered by the hosting node.
@@ -450,12 +468,146 @@ pub fn deliver(shared: &Arc<Shared>, msg: &Message, origin: Origin) {
         Origin::Local(id, echo) => (id, echo),
         _ => (u64::MAX, true),
     };
-    let result = {
-        let mut sl = shared.sublist.lock().unwrap();
-        sl.match_recipients(&msg.subject, publisher_conn, publisher_echo)
+
+    // Messages arriving on a route/leaf are delivered locally only
+    // (full mesh / hub-and-spoke loop prevention).
+    if matches!(origin, Origin::Route(_) | Origin::Leaf(_)) {
+        let result = {
+            let mut sl = shared.sublist.lock().unwrap();
+            match origin {
+                Origin::Route(_) | Origin::Leaf(_) => {
+                    // Filtered queue selection for remote-origin messages.
+                    let gm = sl.match_groups(&msg.subject, publisher_conn, publisher_echo);
+                    let mut deliveries = gm.plain;
+                    for (q, members) in &gm.groups {
+                        let wanted = match queue_filter {
+                            Some(list) => list.iter().any(|g| g == q),
+                            None => true,
+                        };
+                        if wanted && !members.is_empty() {
+                            let cursor = shared.queue_cursor.fetch_add(1, Ordering::SeqCst);
+                            deliveries.push(members[(cursor as usize) % members.len()].clone());
+                        }
+                    }
+                    let expired = sl.note_deliveries(&deliveries);
+                    crate::sublist::MatchResult {
+                        deliveries,
+                        expired,
+                    }
+                }
+                _ => unreachable!(),
+            }
+        };
+        send_local_frames(shared, msg, &result.deliveries);
+        cleanup_expired(shared, &result.expired);
+        shared
+            .stats
+            .out_msgs
+            .fetch_add(result.deliveries.len() as u64, Ordering::Relaxed);
+        return;
+    }
+
+    // Local / internal origin: global queue selection across local
+    // members, routes, and leafs (weighted by member count), so a queue
+    // group spanning nodes still delivers exactly once per message.
+    let gm = {
+        let sl = shared.sublist.lock().unwrap();
+        sl.match_groups(&msg.subject, publisher_conn, publisher_echo)
     };
-    let mut expired: Vec<(u64, String)> = Vec::new();
-    for d in &result.deliveries {
+    let route_full = route_interest_full(shared, &msg.subject);
+    let leaf_full = leaf_interest_full(shared, &msg.subject);
+
+    enum Dest {
+        Local(crate::sublist::Delivery),
+        Route(u64),
+        Leaf(u64),
+    }
+    let mut local_deliveries: Vec<crate::sublist::Delivery> = gm.plain;
+    let mut route_selected: HashMap<u64, Vec<String>> = HashMap::new();
+    let mut leaf_selected: HashMap<u64, Vec<String>> = HashMap::new();
+    for (group, members) in &gm.groups {
+        let mut dests: Vec<Dest> = members.iter().map(|m| Dest::Local(m.clone())).collect();
+        for (rid, _, _, counts) in &route_full {
+            for _ in 0..counts.get(group).copied().unwrap_or(0) {
+                dests.push(Dest::Route(*rid));
+            }
+        }
+        for (lid, _, _, counts) in &leaf_full {
+            for _ in 0..counts.get(group).copied().unwrap_or(0) {
+                dests.push(Dest::Leaf(*lid));
+            }
+        }
+        if dests.is_empty() {
+            continue;
+        }
+        let cursor = shared.queue_cursor.fetch_add(1, Ordering::SeqCst);
+        match &dests[(cursor as usize) % dests.len()] {
+            Dest::Local(d) => local_deliveries.push(d.clone()),
+            Dest::Route(rid) => route_selected.entry(*rid).or_default().push(group.clone()),
+            Dest::Leaf(lid) => leaf_selected.entry(*lid).or_default().push(group.clone()),
+        }
+    }
+    let expired = {
+        let mut sl = shared.sublist.lock().unwrap();
+        sl.note_deliveries(&local_deliveries)
+    };
+    send_local_frames(shared, msg, &local_deliveries);
+    cleanup_expired(shared, &expired);
+    shared
+        .stats
+        .out_msgs
+        .fetch_add(local_deliveries.len() as u64, Ordering::Relaxed);
+
+    // Routes: one frame per route with plain interest and/or a selected
+    // queue group. The queues list on the frame is exactly the groups
+    // this route was selected for, so the receiver delivers to plain
+    // subscribers plus one member per listed group — never more.
+    for (rid, handle, plain, _counts) in route_full {
+        let selected = route_selected.get(&rid).cloned().unwrap_or_default();
+        if !plain && selected.is_empty() {
+            continue;
+        }
+        let frame = match &msg.headers {
+            Some(h) => encode_route_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+            None => encode_rmsg(
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                &selected,
+                &msg.payload,
+            ),
+        };
+        if !try_send(&handle, frame) {
+            eprintln!("rust-natsd: slow route {rid}, closing");
+            close_route(shared, rid);
+        }
+    }
+    // Leafs: same shape, via LMSG (which carries queues in both the
+    // plain and header forms).
+    for (lid, handle, plain, _counts) in leaf_full {
+        let selected = leaf_selected.get(&lid).cloned().unwrap_or_default();
+        if !plain && selected.is_empty() {
+            continue;
+        }
+        let frame = match &msg.headers {
+            Some(h) => encode_leaf_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+            None => encode_lmsg(
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                &selected,
+                None,
+                &msg.payload,
+            ),
+        };
+        if !try_send(&handle, frame) {
+            eprintln!("rust-natsd: slow leaf {lid}, closing");
+            close_leaf(shared, lid);
+        }
+    }
+}
+
+/// Send MSG/HMSG frames for local deliveries, dropping slow consumers.
+fn send_local_frames(shared: &Arc<Shared>, msg: &Message, deliveries: &[crate::sublist::Delivery]) {
+    for d in deliveries {
         let target = shared.conns.lock().unwrap().get(&d.conn_id).cloned();
         let Some(target) = target else { continue };
         let frame = match &msg.headers {
@@ -480,47 +632,38 @@ pub fn deliver(shared: &Arc<Shared>, msg: &Message, origin: Origin) {
             shared.conn_info.lock().unwrap().remove(&d.conn_id);
         }
     }
-    expired.extend(result.expired.iter().cloned());
-    if !expired.is_empty() {
-        // Capture patterns before removal for RS-/LS- propagation.
-        let patterns: Vec<(String, Option<String>)> = {
-            let sl = shared.sublist.lock().unwrap();
-            expired
-                .iter()
-                .filter_map(|(cid, sid)| sl.pattern_of(*cid, sid))
-                .collect()
-        };
-        {
-            let mut sl = shared.sublist.lock().unwrap();
-            for (cid, sid) in &expired {
-                sl.remove(*cid, sid);
-            }
-        }
-        for (subject, queue) in patterns {
-            if !local_pattern_in_use(shared, &subject, queue.as_deref()) {
-                propagate_local_sub(shared, &subject, queue.as_deref(), false);
-            }
-        }
-    }
-    shared
-        .stats
-        .out_msgs
-        .fetch_add(result.deliveries.len() as u64, Ordering::Relaxed);
+}
 
-    // Forward to routes (unless it came from a route).
-    if !matches!(origin, Origin::Route(_)) {
-        forward_to_routes(shared, msg);
+/// Remove auto-unsubscribed subscriptions and propagate RS-/LS- for
+/// patterns that lost their last local subscriber.
+fn cleanup_expired(shared: &Arc<Shared>, expired: &[(u64, String)]) {
+    if expired.is_empty() {
+        return;
     }
-    // Forward to leafs (unless it came from a leaf).
-    if !matches!(origin, Origin::Leaf(_)) {
-        forward_to_leafs(shared, msg);
+    let patterns: Vec<(String, Option<String>)> = {
+        let sl = shared.sublist.lock().unwrap();
+        expired
+            .iter()
+            .filter_map(|(cid, sid)| sl.pattern_of(*cid, sid))
+            .collect()
+    };
+    {
+        let mut sl = shared.sublist.lock().unwrap();
+        for (cid, sid) in expired {
+            sl.remove(*cid, sid);
+        }
+    }
+    for (subject, queue) in patterns {
+        if !local_pattern_in_use(shared, &subject, queue.as_deref()) {
+            propagate_local_sub(shared, &subject, queue.as_deref(), false);
+        }
     }
 }
 
-/// Compute (plain_match, queue_groups) for a subject against an interest map.
-fn match_interest(subs: &InterestMap, subject: &str) -> (bool, Vec<String>) {
+/// Snapshot of one connection's interest: (plain_match, queue -> count).
+fn interest_of(subs: &InterestMap, subject: &str) -> (bool, HashMap<String, u32>) {
     let mut plain = false;
-    let mut queues: Vec<String> = Vec::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
     for ((pattern, queue), count) in subs {
         if *count == 0 {
             continue;
@@ -531,82 +674,47 @@ fn match_interest(subs: &InterestMap, subject: &str) -> (bool, Vec<String>) {
         match queue {
             None => plain = true,
             Some(q) => {
-                if !queues.contains(q) {
-                    queues.push(q.clone());
-                }
+                *counts.entry(q.clone()).or_insert(0) += *count;
             }
         }
     }
-    (plain, queues)
+    (plain, counts)
 }
 
-fn forward_to_routes(shared: &Arc<Shared>, msg: &Message) {
-    let routes: Vec<(u64, Arc<ConnHandle>)> = shared
+fn route_interest_full(shared: &Arc<Shared>, subject: &str) -> InterestTargets {
+    let subs = shared.route_subs.lock().unwrap();
+    shared
         .routes
         .lock()
         .unwrap()
         .iter()
-        .map(|(id, r)| (*id, r.handle.clone()))
-        .collect();
-    for (id, handle) in routes {
-        if handle.is_closed() {
-            continue;
-        }
-        let (plain, queues) = {
-            let subs = shared.route_subs.lock().unwrap();
-            match subs.get(&id) {
-                Some(m) => match_interest(m, &msg.subject),
-                None => (false, Vec::new()),
-            }
-        };
-        if !plain && queues.is_empty() {
-            continue;
-        }
-        let frame = match &msg.headers {
-            Some(h) => encode_route_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
-            None => encode_rmsg(&msg.subject, msg.reply_to.as_deref(), &queues, &msg.payload),
-        };
-        if !try_send(&handle, frame) {
-            eprintln!("rust-natsd: slow route {id}, closing");
-            close_route(shared, id);
-        }
-    }
+        .filter(|(_, r)| !r.handle.is_closed())
+        .map(|(id, r)| {
+            let (plain, counts) = subs
+                .get(id)
+                .map(|m| interest_of(m, subject))
+                .unwrap_or((false, HashMap::new()));
+            (*id, r.handle.clone(), plain, counts)
+        })
+        .collect()
 }
 
-fn forward_to_leafs(shared: &Arc<Shared>, msg: &Message) {
-    let leafs: Vec<(u64, Arc<ConnHandle>)> = shared
+fn leaf_interest_full(shared: &Arc<Shared>, subject: &str) -> InterestTargets {
+    let subs = shared.leaf_subs.lock().unwrap();
+    shared
         .leafs
         .lock()
         .unwrap()
         .iter()
-        .map(|(id, l)| (*id, l.handle.clone()))
-        .collect();
-    for (id, handle) in leafs {
-        if handle.is_closed() {
-            continue;
-        }
-        let (plain, queues) = {
-            let subs = shared.leaf_subs.lock().unwrap();
-            match subs.get(&id) {
-                Some(m) => match_interest(m, &msg.subject),
-                None => (false, Vec::new()),
-            }
-        };
-        if !plain && queues.is_empty() {
-            continue;
-        }
-        let frame = encode_lmsg(
-            &msg.subject,
-            msg.reply_to.as_deref(),
-            &queues,
-            msg.headers.as_deref(),
-            &msg.payload,
-        );
-        if !try_send(&handle, frame) {
-            eprintln!("rust-natsd: slow leaf {id}, closing");
-            close_leaf(shared, id);
-        }
-    }
+        .filter(|(_, l)| !l.handle.is_closed())
+        .map(|(id, l)| {
+            let (plain, counts) = subs
+                .get(id)
+                .map(|m| interest_of(m, subject))
+                .unwrap_or((false, HashMap::new()));
+            (*id, l.handle.clone(), plain, counts)
+        })
+        .collect()
 }
 
 /// Broadcast a local subscription change to all routes and leafs.
@@ -830,6 +938,7 @@ async fn process_op(
                 shared,
                 &Message::new(&subject, reply_to, None, payload),
                 Origin::Local(client_id, state.echo),
+                None,
             );
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
@@ -852,6 +961,7 @@ async fn process_op(
                 shared,
                 &Message::new(&subject, reply_to, Some(headers), payload),
                 Origin::Local(client_id, state.echo),
+                None,
             );
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
@@ -1275,6 +1385,7 @@ async fn process_route_op(
         RouteOp::RMsg {
             subject,
             reply_to,
+            queues,
             headers,
             payload,
             ..
@@ -1285,10 +1396,18 @@ async fn process_route_op(
                 (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
                 Ordering::Relaxed,
             );
+            // HMSG frames carry no queue list: deliver to all matching
+            // groups. RMSG frames restrict to the listed groups.
+            let filter = if headers.is_some() {
+                None
+            } else {
+                Some(queues.as_slice())
+            };
             deliver(
                 shared,
                 &Message::new(&subject, reply_to, headers, payload),
                 Origin::Route(id),
+                filter,
             );
             true
         }
@@ -1303,11 +1422,15 @@ async fn process_route_op(
 // Leaf nodes
 // ---------------------------------------------------------------------------
 
-fn leaf_info_text(shared: &Arc<Shared>) -> String {
+fn leaf_info_text(shared: &Arc<Shared>, client_id: u64) -> String {
     let (host, port) = match shared.leaf_addr {
         Some(a) => (a.ip().to_string(), a.port()),
         None => (shared.config.host.clone(), shared.config.leaf_port),
     };
+    // Go's soliciting leaf requires client_id AND a leaf advertisement
+    // (leafnode_urls) in the hub INFO, else it closes with
+    // "attempted to connect to wrong port".
+    let urls = shared.leaf_addr.map(|a| format!("{}:{}", a.ip(), a.port()));
     leaf_info_json(
         &shared.server_id,
         &shared.config.name,
@@ -1316,6 +1439,8 @@ fn leaf_info_text(shared: &Arc<Shared>) -> String {
         shared.config.max_payload,
         shared.config.jetstream,
         &shared.config.effective_cluster_name(),
+        client_id,
+        urls.as_deref(),
     )
 }
 
@@ -1324,32 +1449,41 @@ async fn handle_leaf_accepted(stream: TcpStream, shared: Arc<Shared>) {
     let mut reader = BufReader::new(reader);
     let (handle, tx) = spawn_writer(writer, shared.clone());
     // Hub sends INFO first.
+    let client_id = shared.next_conn_id.fetch_add(1, Ordering::Relaxed);
     if tx
-        .send(Bytes::from(format!("INFO {}\r\n", leaf_info_text(&shared))))
+        .send(Bytes::from(format!(
+            "INFO {}\r\n",
+            leaf_info_text(&shared, client_id)
+        )))
         .await
         .is_err()
     {
         return;
     }
-    // Then expects leaf INFO, then leaf CONNECT.
-    let info_line = match read_line(&mut reader).await {
+    // Then expects leaf CONNECT, optionally preceded by leaf INFO (Go
+    // sends its INFO only when the hub INFO sets info_on_connect; our
+    // INFO does not, so a Go leaf sends CONNECT straight away).
+    let first_line = match read_line(&mut reader).await {
         Ok(l) => l,
         Err(_) => return,
     };
-    let Some(info_json) = info_line.strip_prefix("INFO ") else {
+    let (peer_id, connect_json) = if let Some(info_json) = first_line.strip_prefix("INFO ") {
+        let peer_id = json_str(info_json, "server_id").unwrap_or_default();
+        let connect_line = match read_line(&mut reader).await {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let Some(connect_json) = connect_line.strip_prefix("CONNECT ") else {
+            return;
+        };
+        (peer_id, connect_json.to_string())
+    } else if let Some(connect_json) = first_line.strip_prefix("CONNECT ") {
+        let peer_id = json_str(connect_json, "server_id").unwrap_or_default();
+        (peer_id, connect_json.to_string())
+    } else {
         return;
     };
-    let Some(peer_id) = json_str(info_json, "server_id") else {
-        return;
-    };
-    let connect_line = match read_line(&mut reader).await {
-        Ok(l) => l,
-        Err(_) => return,
-    };
-    let Some(connect_json) = connect_line.strip_prefix("CONNECT ") else {
-        return;
-    };
-    if !leaf_connect_authorized(&shared, connect_json) {
+    if !leaf_connect_authorized(&shared, &connect_json) {
         let _ = tx.send(encode_err("Authorization Violation")).await;
         return;
     }
@@ -1434,8 +1568,12 @@ async fn handle_leaf_solicited(stream: TcpStream, shared: Arc<Shared>) {
     let Some(_hub_info) = info_line.strip_prefix("INFO ") else {
         return;
     };
+    let client_id = shared.next_conn_id.fetch_add(1, Ordering::Relaxed);
     if tx
-        .send(Bytes::from(format!("INFO {}\r\n", leaf_info_text(&shared))))
+        .send(Bytes::from(format!(
+            "INFO {}\r\n",
+            leaf_info_text(&shared, client_id)
+        )))
         .await
         .is_err()
     {
@@ -1561,6 +1699,7 @@ async fn process_leaf_op(
         LeafOp::LMsg {
             subject,
             reply_to,
+            queues,
             headers,
             payload,
             ..
@@ -1575,6 +1714,7 @@ async fn process_leaf_op(
                 shared,
                 &Message::new(&subject, reply_to, headers, payload),
                 Origin::Leaf(id),
+                queues.as_deref(),
             );
             true
         }

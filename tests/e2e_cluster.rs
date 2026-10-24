@@ -169,6 +169,12 @@ async fn cluster_queue_group_across_nodes() {
             m = qb.next() => { assert!(m.is_some()); total += 1; }
         }
     }
+    // Queue groups deliver exactly once globally: no 21st message.
+    tokio::select! {
+        m = qa.next() => panic!("extra delivery on A: {:?}", m.map(|m| m.payload)),
+        m = qb.next() => panic!("extra delivery on B: {:?}", m.map(|m| m.payload)),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
 
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
