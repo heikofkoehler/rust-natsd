@@ -1,1 +1,3 @@
 /target
+/bench/bench-client
+/bench/results/
