@@ -180,6 +180,11 @@ pub struct Config {
     /// Username that credential-less connections map to, if configured
     /// (must name a configured user; otherwise they are rejected).
     pub no_auth_user: Option<String>,
+    /// Server-initiated PING interval (Go default 2m).
+    pub ping_interval: std::time::Duration,
+    /// Missed PONGs before closing with `-ERR 'Stale Connection'`
+    /// (Go default 2).
+    pub ping_max: u32,
 }
 
 impl Default for Config {
@@ -207,8 +212,63 @@ impl Default for Config {
             accounts: Vec::new(),
             system_account: None,
             no_auth_user: None,
+            ping_interval: std::time::Duration::from_secs(120),
+            ping_max: 2,
         }
     }
+}
+
+/// Parse a Go-style duration: `200ms`, `2m`, `120s`, `1m30s`, `500us`,
+/// `100ns`, or a bare number (interpreted as milliseconds, the useful
+/// unit for a ping interval). Used by `--ping-interval` and by .conf
+/// string values; a .conf numeric value is nanoseconds (Go's
+/// time.Duration representation) and is handled in conf.rs.
+pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        if n < 0.0 {
+            return Err(format!("invalid duration: {s}"));
+        }
+        return Ok(std::time::Duration::from_secs_f64(n / 1000.0));
+    }
+    let mut total_nanos: f64 = 0.0;
+    let mut rest = s;
+    let mut seen = false;
+    while !rest.is_empty() {
+        let num_end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        if num_end == 0 {
+            return Err(format!("invalid duration: {s}"));
+        }
+        let num: f64 = rest[..num_end]
+            .parse()
+            .map_err(|_| format!("invalid duration: {s}"))?;
+        rest = &rest[num_end..];
+        let unit_end = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let unit = &rest[..unit_end];
+        rest = &rest[unit_end..];
+        let mult = match unit {
+            "ns" => 1.0,
+            "us" | "µs" | "μs" => 1_000.0,
+            "ms" => 1_000_000.0,
+            "s" => 1_000_000_000.0,
+            "m" => 60_000_000_000.0,
+            "h" => 3_600_000_000_000.0,
+            _ => return Err(format!("invalid duration: {s}")),
+        };
+        total_nanos += num * mult;
+        seen = true;
+    }
+    if !seen {
+        return Err(format!("invalid duration: {s}"));
+    }
+    Ok(std::time::Duration::from_nanos(total_nanos as u64))
 }
 
 /// Split a comma-separated CLI list, dropping empties.
@@ -305,6 +365,12 @@ impl Config {
                 }
                 "-n" | "--name" => cfg.name = next(&mut i)?,
                 "--max-payload" => cfg.max_payload = parse_size(&next(&mut i)?)?,
+                "--ping-interval" => cfg.ping_interval = parse_duration(&next(&mut i)?)?,
+                "--ping-max" => {
+                    cfg.ping_max = next(&mut i)?
+                        .parse()
+                        .map_err(|_| "invalid ping max".to_string())?
+                }
                 "--user" => cfg.user = Some(next(&mut i)?),
                 "--pass" => cfg.pass = Some(next(&mut i)?),
                 "--auth-token" => cfg.auth_token = Some(next(&mut i)?),
@@ -381,6 +447,8 @@ impl Config {
          \x20   -p, --port <PORT>       Client port (default 4222)\n\
          \x20   -n, --name <NAME>       Server name (default rust-natsd)\n\
          \x20   --max-payload <SIZE>    Max payload, e.g. 1048576, 512k, 8mb (default 1mb)\n\
+         \x20   --ping-interval <DUR>   Server PING interval, e.g. 200ms, 2m (default 2m)\n\
+         \x20   --ping-max <N>          Missed PONGs before stale close (default 2)\n\
          \x20   --user <USER>           Require this username for CONNECT\n\
          \x20   --pass <PASS>           Require this password for CONNECT\n\
          \x20   --auth-token <TOKEN>    Require this auth token for CONNECT\n\
@@ -506,12 +574,11 @@ impl Config {
         }
         // Legacy single-account ($G) mode.
         if let Some(token) = &self.auth_token {
-            // Clients may present the token in `auth_token` or as password.
-            // (Token-as-password is a deliberate deviation from
-            // `nats-server`, which rejects it; kept for backward compat.)
-            if info.auth_token.as_deref() == Some(token.as_str())
-                || info.pass.as_deref() == Some(token.as_str())
-            {
+            // Go parity: a token is accepted only via `auth_token`.
+            // Presenting it as `pass` is rejected (verified against
+            // nats-server v2.15.1); an earlier rust-natsd build accepted
+            // it as a deliberate deviation, removed for parity.
+            if info.auth_token.as_deref() == Some(token.as_str()) {
                 return Some(AuthOutcome {
                     account: "$G".to_string(),
                     user: info.user.clone(),
@@ -642,9 +709,10 @@ mod tests {
         assert!(!token_cfg.authorize(&ci));
         ci.auth_token = Some("s3cret".into());
         assert!(token_cfg.authorize(&ci));
+        // Go parity: a token presented as `pass` is rejected.
         ci.auth_token = None;
         ci.pass = Some("s3cret".into());
-        assert!(token_cfg.authorize(&ci), "token as password also accepted");
+        assert!(!token_cfg.authorize(&ci), "token as password rejected");
 
         let user_cfg = Config {
             user: Some("derek".into()),

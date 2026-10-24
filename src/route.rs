@@ -224,10 +224,9 @@ fn parse_route_line(
                 return Err(RouteParseError::InvalidArgs(format!("{verb} {rest}")));
             }
             let account = args[0].to_string();
+            // Route publish subjects are literal (a client may publish
+            // `foo.*` literally); never reject them here.
             let subject = args[1].to_string();
-            if !crate::subject::is_valid_publish_subject(&subject) {
-                return Err(RouteParseError::InvalidSubject(subject));
-            }
             let rest_args = &args[2..];
             // Pull trailing numeric sizes off the end (1 = plain size,
             // 2 = hdr_len + total_len for HMSG).

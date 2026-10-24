@@ -80,10 +80,17 @@ impl Sublist {
         self.subs.is_empty()
     }
 
-    /// Add a subscription; an existing subscription with the same
-    /// (conn_id, sid) is replaced.
+    /// Add a subscription. Go keeps the FIRST subscription with a sid:
+    /// a later SUB with the same (conn_id, sid) is ignored entirely, so
+    /// the original subject, queue, max, and delivery count all survive.
     pub fn add(&mut self, sub: Subscription) {
-        self.remove(sub.conn_id, &sub.sid);
+        if self
+            .subs
+            .iter()
+            .any(|s| s.conn_id == sub.conn_id && s.sid == sub.sid)
+        {
+            return;
+        }
         self.subs.push(sub);
     }
 
@@ -372,15 +379,17 @@ mod tests {
     fn replace_same_sid_and_remove_conn() {
         let mut sl = Sublist::new();
         sl.add(sub(1, "1", "foo", None));
-        sl.add(sub(1, "1", "bar", None)); // replaces
+        // Go keeps the first subscription for a sid: the second SUB is
+        // ignored, so foo still delivers and bar does not.
+        sl.add(sub(1, "1", "bar", None)); // ignored (keep-first)
         assert_eq!(sl.len(), 1);
         assert_eq!(
             sl.match_recipients("foo", 99, true, None).deliveries.len(),
-            0
+            1
         );
         assert_eq!(
             sl.match_recipients("bar", 99, true, None).deliveries.len(),
-            1
+            0
         );
         sl.add(sub(2, "1", "bar", None));
         sl.remove_conn(1);

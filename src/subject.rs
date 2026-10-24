@@ -4,19 +4,38 @@
 //! exactly one token and `>` (only valid as the final token) matches one or
 //! more tokens. Publish subjects may not contain wildcards.
 
-/// Returns true if `subject` is a valid subject to publish to:
-/// non-empty tokens, no wildcards, no whitespace/control characters.
+/// Go's publish-subject rule (nats-server v2.15.1, verified by raw probe):
+/// a publish subject is *pedantically* invalid when it has an empty token
+/// or a whole-token wildcard (`*` or `>`). Partial wildcards (`foo*`,
+/// `f>o`) are literal tokens and are NOT invalid, even in pedantic mode.
+/// In non-pedantic mode an invalid publish subject is still accepted and
+/// delivered literally (except empty-token subjects, which route nowhere);
+/// in pedantic mode Go additionally sends `-ERR 'Invalid Publish Subject'`
+/// but still delivers.
 pub fn is_valid_publish_subject(subject: &str) -> bool {
     !subject.is_empty()
         && subject.split('.').all(|tok| {
             !tok.is_empty()
-                && !tok.contains(['*', '>'])
+                && tok != "*"
+                && tok != ">"
                 && tok.chars().all(|c| !c.is_whitespace() && !c.is_control())
         })
 }
 
-/// Returns true if `subject` is a valid subscription subject: publish rules,
-/// except whole-token `*` anywhere and whole-token `>` as the last token.
+/// True when the subject has an empty token (e.g. `foo..bar`, `foo.`,
+/// `.foo`, `.`). Go accepts such publish subjects without error in
+/// non-pedantic mode but delivers them to no subscription at all, not even
+/// `>`, so the publisher must drop them instead of delivering.
+pub fn has_empty_token(s: &str) -> bool {
+    s.is_empty() || s.split('.').any(|t| t.is_empty())
+}
+
+/// Go's subscription-subject rule (nats-server v2.15.1, verified by raw
+/// probe): a SUB subject is rejected when it has an empty token or when a
+/// whole-token `>` appears anywhere except as the final token. Partial
+/// wildcards (`foo*`, `f>o`) are accepted as literal tokens. A rejected
+/// SUB gets `-ERR 'Invalid Subject'` but the connection stays alive and
+/// no subscription is created.
 pub fn is_valid_subscribe_subject(subject: &str) -> bool {
     if subject.is_empty() {
         return false;
@@ -26,10 +45,7 @@ pub fn is_valid_subscribe_subject(subject: &str) -> bool {
         if tok.is_empty() || tok.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return false;
         }
-        if tok.contains('*') && *tok != "*" {
-            return false;
-        }
-        if tok.contains('>') && (*tok != ">" || i != tokens.len() - 1) {
+        if *tok == ">" && i != tokens.len() - 1 {
             return false;
         }
     }
@@ -70,9 +86,13 @@ mod tests {
 
     #[test]
     fn publish_subject_validation() {
+        // Go behaviour (verified against nats-server v2.15.1): partial
+        // wildcards are literal tokens, not invalid, even in pedantic mode.
         assert!(is_valid_publish_subject("foo"));
         assert!(is_valid_publish_subject("foo.bar.baz"));
         assert!(is_valid_publish_subject("FOO_123.-x-"));
+        assert!(is_valid_publish_subject("foo*"));
+        assert!(is_valid_publish_subject("f>o"));
         assert!(!is_valid_publish_subject(""));
         assert!(!is_valid_publish_subject("foo..bar"));
         assert!(!is_valid_publish_subject(".foo"));
@@ -81,18 +101,27 @@ mod tests {
         assert!(!is_valid_publish_subject("foo.>"));
         assert!(!is_valid_publish_subject("foo bar"));
         assert!(!is_valid_publish_subject("foo\tbar"));
+        // Empty-token subjects route nowhere on Go, even to `>`.
+        assert!(has_empty_token("foo..bar"));
+        assert!(has_empty_token("foo."));
+        assert!(has_empty_token(".foo"));
+        assert!(has_empty_token("."));
+        assert!(!has_empty_token("foo.*"));
+        assert!(!has_empty_token("foo.bar"));
     }
 
     #[test]
     fn subscribe_subject_validation() {
+        // Go behaviour (verified against nats-server v2.15.1): partial
+        // wildcards are accepted as literal tokens.
         assert!(is_valid_subscribe_subject("foo.*"));
         assert!(is_valid_subscribe_subject("*"));
         assert!(is_valid_subscribe_subject(">"));
         assert!(is_valid_subscribe_subject("foo.>"));
         assert!(is_valid_subscribe_subject("foo.*.baz"));
+        assert!(is_valid_subscribe_subject("foo*"));
+        assert!(is_valid_subscribe_subject("f>o"));
         assert!(!is_valid_subscribe_subject("foo.>.bar"));
-        assert!(!is_valid_subscribe_subject("foo*"));
-        assert!(!is_valid_subscribe_subject("f>o"));
         assert!(!is_valid_subscribe_subject("foo..*"));
         assert!(!is_valid_subscribe_subject(""));
     }

@@ -21,7 +21,9 @@
 
 use std::collections::HashMap;
 
-use crate::config::{parse_size, Account, AccountUser, Config, Permissions, TlsSettings};
+use crate::config::{
+    parse_duration, parse_size, Account, AccountUser, Config, Permissions, TlsSettings,
+};
 
 /// A parsed config value.
 #[derive(Debug, Clone, PartialEq)]
@@ -480,6 +482,21 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
             Value::Num(n) if *n >= 0 => *n as usize,
             Value::Str(s) => parse_size(s)?,
             _ => return Err("max_payload must be a number or size".to_string()),
+        };
+    }
+    // Go .conf durations: a string is a Go duration ("200ms"), a number
+    // is nanoseconds (Go's time.Duration representation).
+    if let Some(v) = lookup(&top, "ping_interval") {
+        cfg.ping_interval = match &v {
+            Value::Num(n) if *n >= 0 => std::time::Duration::from_nanos(*n as u64),
+            Value::Str(s) => parse_duration(s)?,
+            _ => return Err("ping_interval must be a duration".to_string()),
+        };
+    }
+    if let Some(v) = lookup(&top, "ping_max") {
+        cfg.ping_max = match &v {
+            Value::Num(n) if *n >= 0 => *n as u32,
+            _ => return Err("ping_max must be a number".to_string()),
         };
     }
     if let Some(v) = lookup(&top, "authorization") {

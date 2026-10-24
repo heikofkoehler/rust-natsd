@@ -76,12 +76,29 @@ where
 
 /// Server `INFO` sent on connect.
 ///
-/// `nonce` is always sent (not only when nkey auth is configured): clients
-/// that do not use nkeys ignore it, and always sending it keeps the INFO
-/// shape stable. It is a per-connection challenge string; the client
-/// signs its bytes for nkey auth. On Linux it is read from /dev/urandom
-/// (see server.rs); elsewhere it falls back to a time/pid/counter mix
-/// and is therefore not a strong nonce on non-Linux builds.
+/// `nonce` is sent only when authentication is configured, matching Go
+/// (Go omits it for open servers). It is a per-connection challenge
+/// string; the client signs its bytes for nkey auth. On Linux it is read
+/// from /dev/urandom (see server.rs); elsewhere it falls back to a
+/// time/pid/counter mix and is therefore not a strong nonce on
+/// non-Linux builds.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn str_is_empty(s: &str) -> bool {
+    s.is_empty()
+}
+
+/// Client INFO, serialized with Go's omitempty semantics: `auth_required`,
+/// `tls_required`, and `jetstream` appear only when true, `nonce` only
+/// when authentication is configured (otherwise Go sends no nonce), and
+/// `cluster` only when a cluster name is explicitly configured. Deliberate
+/// omissions (documented in parity/KNOWN_DIFFS.md): `git_commit` and `go`
+/// are Go-build facts Rust cannot honestly report, `xkey` needs XKey
+/// support Rust does not have, and `api_lvl` is Go's JetStream API level
+/// — advertising Go's 5 would gate clients into JetStream features Rust
+/// does not implement, so it is omitted rather than faked.
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerInfo {
     pub server_id: String,
@@ -93,10 +110,17 @@ pub struct ServerInfo {
     pub host: String,
     pub port: u16,
     pub client_id: u64,
+    #[serde(skip_serializing_if = "str_is_empty")]
     pub nonce: String,
+    #[serde(skip_serializing_if = "is_false")]
     pub auth_required: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub tls_required: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub jetstream: bool,
+    pub client_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
 }
 
 /// A parsed client operation.
@@ -143,14 +167,19 @@ pub enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::UnknownOperation(op) => write!(f, "Unknown Protocol Operation: {op}"),
-            ParseError::InvalidArgs(m) => write!(f, "Invalid Protocol Operation: {m}"),
-            ParseError::InvalidSubject(s) => write!(f, "Invalid Subject: {s}"),
-            ParseError::InvalidSize(m) => write!(f, "Invalid Payload Size: {m}"),
-            ParseError::PayloadTooLarge(n) => write!(f, "Maximum Payload Violation: {n}"),
+            // Wire error texts are Go's generic texts exactly: no op
+            // name, size, subject, or serde detail is ever appended, so no
+            // parser internals leak onto the wire.
+            ParseError::UnknownOperation(_) => write!(f, "Unknown Protocol Operation"),
+            ParseError::InvalidArgs(_) => write!(f, "Invalid Protocol Operation"),
+            ParseError::InvalidSubject(_) => write!(f, "Invalid Subject"),
+            ParseError::InvalidSize(_) => write!(f, "Invalid Payload Size"),
+            ParseError::PayloadTooLarge(_) => write!(f, "Maximum Payload Violation"),
             ParseError::ControlLineTooLong => write!(f, "Control Line Too Long"),
             ParseError::InvalidPayloadTerminator => write!(f, "Invalid Payload Terminator"),
-            ParseError::InvalidConnect(m) => write!(f, "Invalid CONNECT: {m}"),
+            // Never sent to the wire: malformed CONNECT closes silently
+            // (see handle_conn), matching Go.
+            ParseError::InvalidConnect(_) => write!(f, "Invalid CONNECT"),
         }
     }
 }
@@ -265,14 +294,10 @@ impl Parser {
                         )))
                     }
                 };
-                if !crate::subject::is_valid_publish_subject(subject) {
-                    return Err(ParseError::InvalidSubject(subject.to_string()));
-                }
-                if let Some(r) = &reply_to {
-                    if !crate::subject::is_valid_publish_subject(r) {
-                        return Err(ParseError::InvalidSubject(r.clone()));
-                    }
-                }
+                // Go accepts publish subjects at parse time regardless of
+                // validity (including wildcards and empty tokens); pedantic
+                // errors and the empty-token delivery drop are applied in
+                // process_op, never here, and never by closing the conn.
                 let pending = if is_hpub {
                     if sizes.len() != 2 {
                         return Err(ParseError::InvalidArgs(
@@ -327,9 +352,8 @@ impl Parser {
                         ))
                     }
                 };
-                if !crate::subject::is_valid_subscribe_subject(subject) {
-                    return Err(ParseError::InvalidSubject(subject.to_string()));
-                }
+                // Go validates SUB subjects in process_op (non-fatal
+                // -ERR, connection stays alive), not in the parser.
                 Ok(Some(ClientOp::Sub {
                     subject: subject.to_string(),
                     queue,
@@ -622,9 +646,11 @@ mod tests {
             parse_all(b"WAT\r\n"),
             Err(ParseError::UnknownOperation(_))
         ));
+        // Go behaviour: a wildcard publish subject parses fine; it is
+        // delivered literally, with a pedantic -ERR only in process_op.
         assert!(matches!(
             parse_all(b"PUB foo.* 1\r\nx\r\n"),
-            Err(ParseError::InvalidSubject(_))
+            Ok(v) if matches!(v[0], ClientOp::Pub { .. })
         ));
         assert!(matches!(
             parse_all(b"PUB foo abc\r\n"),
@@ -634,9 +660,11 @@ mod tests {
             parse_all(b"CONNECT {nope}\r\n"),
             Err(ParseError::InvalidConnect(_))
         ));
+        // Go behaviour: an invalid SUB subject parses fine; process_op
+        // replies -ERR without creating the subscription or closing.
         assert!(matches!(
             parse_all(b"SUB foo.>.bar 1\r\n"),
-            Err(ParseError::InvalidSubject(_))
+            Ok(v) if matches!(v[0], ClientOp::Sub { .. })
         ));
         // Payload exceeding max.
         let mut p = Parser::new(4);
@@ -681,10 +709,11 @@ mod tests {
             parse_all(b"HPUB foo 10 5\r\n"),
             Err(ParseError::InvalidSize(_))
         ));
-        // PUB with wildcard reply subject.
+        // PUB with wildcard reply subject: Go accepts it at parse time
+        // (reply subjects are carried, not validated, in this probe).
         assert!(matches!(
             parse_all(b"PUB foo a.* 1\r\nx\r\n"),
-            Err(ParseError::InvalidSubject(_))
+            Ok(v) if matches!(v[0], ClientOp::Pub { .. })
         ));
         // Wrong arg counts.
         assert!(matches!(
@@ -738,6 +767,8 @@ mod tests {
             auth_required: false,
             tls_required: false,
             jetstream: false,
+            client_ip: "127.0.0.1".into(),
+            cluster: None,
         };
         let bytes = encode_info(&info);
         let s = String::from_utf8_lossy(&bytes);

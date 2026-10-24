@@ -31,8 +31,8 @@ use crate::leaf::{
     leaf_info_json, LeafOp, LeafParser,
 };
 use crate::protocol::{
-    encode_err, encode_hmsg, encode_info, encode_msg, encode_ok, encode_pong, ClientOp, Parser,
-    ServerInfo,
+    encode_err, encode_hmsg, encode_info, encode_msg, encode_ok, encode_ping, encode_pong,
+    ClientOp, Parser, ServerInfo,
 };
 use crate::route::{
     encode_rmsg, encode_route_hmsg, encode_rs_minus, encode_rs_plus, route_connect_json,
@@ -56,6 +56,10 @@ pub struct Message {
     /// Defaults to `$G` (Message::new); JetStream and route/leaf paths
     /// set it explicitly.
     pub account: String,
+    /// The publishing connection set `no_responders:true` in CONNECT.
+    /// Only meaningful for Local origin; route/leaf/internal messages
+    /// never carry it.
+    pub no_responders: bool,
 }
 
 impl Message {
@@ -71,11 +75,17 @@ impl Message {
             headers,
             payload,
             account: "$G".to_string(),
+            no_responders: false,
         }
     }
 
     pub fn with_account(mut self, account: &str) -> Self {
         self.account = account.to_string();
+        self
+    }
+
+    pub fn with_no_responders(mut self, no_responders: bool) -> Self {
+        self.no_responders = no_responders;
         self
     }
 
@@ -119,6 +129,8 @@ pub(crate) struct ConnHandle {
     pub(crate) in_bytes: AtomicU64,
     pub(crate) out_msgs: AtomicU64,
     pub(crate) out_bytes: AtomicU64,
+    /// PINGs sent by the server ping task without a PONG reply.
+    pub(crate) ping_missed: AtomicU64,
 }
 
 impl ConnHandle {
@@ -132,6 +144,7 @@ impl ConnHandle {
             in_bytes: AtomicU64::new(0),
             out_msgs: AtomicU64::new(0),
             out_bytes: AtomicU64::new(0),
+            ping_missed: AtomicU64::new(0),
         })
     }
     fn mark_closed(&self) {
@@ -420,7 +433,8 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                                 match acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
                                         let (reader, writer) = tokio::io::split(tls_stream);
-                                        handle_conn(reader, writer, shared, id).await;
+                                        handle_conn(reader, writer, shared, id, peer.ip().to_string())
+                                            .await;
                                     }
                                     Err(e) => {
                                         eprintln!("rust-natsd: TLS handshake failed: {e}");
@@ -430,7 +444,7 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                             }
                             None => {
                                 let (reader, writer) = stream.into_split();
-                                handle_conn(reader, writer, shared, id).await;
+                                handle_conn(reader, writer, shared, id, peer.ip().to_string()).await;
                             }
                         }
                     });
@@ -529,8 +543,24 @@ where
                     }
                     None => break,
                 },
-                _ = close.notified() => break,
-                _ = &mut shutdown => break,
+                // On close/shutdown, drain any queued frames first so a
+                // final -ERR (e.g. 'Stale Connection') is not lost.
+                _ = close.notified() => {
+                    while let Ok(bytes) = rx.try_recv() {
+                        if writer.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                _ = &mut shutdown => {
+                    while let Ok(bytes) = rx.try_recv() {
+                        if writer.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    break;
+                }
             }
         }
         let _ = writer.shutdown().await;
@@ -684,6 +714,15 @@ pub fn deliver(
         .out_msgs
         .fetch_add(local_deliveries.len() as u64, Ordering::Relaxed);
 
+    // No-responders accounting is computed before the route/leaf loops
+    // consume route_full/leaf_full: any local delivery, plain route/leaf
+    // interest, or selected queue group counts as a responder.
+    let has_delivery = !local_deliveries.is_empty()
+        || route_selected.values().any(|v| !v.is_empty())
+        || leaf_selected.values().any(|v| !v.is_empty())
+        || route_full.iter().any(|(_, _, plain, _)| *plain)
+        || leaf_full.iter().any(|(_, _, plain, _)| *plain);
+
     // Routes: one frame per route with plain interest and/or a selected
     // queue group. The queues list on the frame is exactly the groups
     // this route was selected for, so the receiver delivers to plain
@@ -734,6 +773,27 @@ pub fn deliver(
         if !try_send(&handle, frame) {
             eprintln!("rust-natsd: slow leaf {lid}, closing");
             close_leaf(shared, lid);
+        }
+    }
+
+    // No-responders (Go behaviour, verified against v2.15.1): a local
+    // publish with a reply subject and no deliveries, from a connection
+    // that set no_responders:true, generates an HMSG to the reply subject
+    // with a 503 header block and an empty payload. JetStream-consumed
+    // messages return early above, so they never generate one.
+    if msg.no_responders && !has_delivery {
+        if let Some(reply_to) = &msg.reply_to {
+            let headers = Bytes::from(format!(
+                "NATS/1.0 503\r\nNats-Subject: {}\r\n\r\n",
+                msg.subject
+            ));
+            deliver(
+                shared,
+                &Message::new(reply_to, None, Some(headers), Bytes::new())
+                    .with_account(&msg.account),
+                Origin::Internal,
+                None,
+            );
         }
     }
 }
@@ -999,6 +1059,11 @@ fn bump_interest(
 struct ConnState {
     verbose: bool,
     echo: bool,
+    /// Pedantic mode from CONNECT: invalid publish subjects get -ERR but
+    /// are still delivered (Go behaviour).
+    pedantic: bool,
+    /// No-responders flag from CONNECT (see deliver()).
+    no_responders: bool,
     /// Account this connection authenticated as ($G by default).
     account: String,
     /// Effective subject permissions for this connection.
@@ -1007,8 +1072,13 @@ struct ConnState {
     nonce: String,
 }
 
-async fn handle_conn<R, W>(mut reader: R, writer: W, shared: Arc<Shared>, client_id: u64)
-where
+async fn handle_conn<R, W>(
+    mut reader: R,
+    writer: W,
+    shared: Arc<Shared>,
+    client_id: u64,
+    peer_ip: String,
+) where
     R: AsyncReadExt + Unpin + Send,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
@@ -1020,8 +1090,10 @@ where
         .insert(client_id, handle.clone());
 
     // Send INFO first, per protocol. The nonce is generated per
-    // connection and is what an nkey client signs in CONNECT.
+    // connection and is what an nkey client signs in CONNECT; it is
+    // only advertised when authentication is configured (Go omitempty).
     let nonce = gen_nonce();
+    let auth_required = shared.config.auth_required();
     let info = ServerInfo {
         server_id: shared.server_id.clone(),
         server_name: shared.config.name.clone(),
@@ -1032,16 +1104,62 @@ where
         host: shared.listen_addr.ip().to_string(),
         port: shared.listen_addr.port(),
         client_id,
-        nonce: nonce.clone(),
-        auth_required: shared.config.auth_required(),
+        nonce: if auth_required {
+            nonce.clone()
+        } else {
+            String::new()
+        },
+        auth_required,
         tls_required: shared.config.tls_required(),
         jetstream: shared.config.jetstream,
+        client_ip: peer_ip,
+        cluster: shared.config.cluster_name.clone(),
     };
     let _ = tx.send(encode_info(&info)).await;
+
+    // Server-initiated PING (Go behaviour): every ping_interval, send
+    // PING; after ping_max missed PONGs, close with -ERR 'Stale
+    // Connection'. With max 2 and interval T the close lands at ~3T
+    // (PING at T, PING at 2T, close at 3T when still unanswered), matching
+    // Go v2.15.1's observed timing. The task holds only a Weak handle,
+    // so it cannot keep the connection alive, and it stops when
+    // handle_conn notifies it at cleanup.
+    let ping_stop = Arc::new(Notify::new());
+    if !shared.config.ping_interval.is_zero() && shared.config.ping_max > 0 {
+        let weak = Arc::downgrade(&handle);
+        let stop = ping_stop.clone();
+        let interval = shared.config.ping_interval;
+        let max = shared.config.ping_max;
+        let shutdown = shared.shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop.notified() => break,
+                    _ = shutdown.notified() => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                let Some(h) = weak.upgrade() else { break };
+                if h.is_closed() {
+                    break;
+                }
+                if h.ping_missed.load(Ordering::SeqCst) >= max as u64 {
+                    let _ = try_send(&h, encode_err("Stale Connection"));
+                    h.mark_closed();
+                    break;
+                }
+                if !try_send(&h, encode_ping()) {
+                    break;
+                }
+                h.ping_missed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+    }
 
     let mut state = ConnState {
         verbose: false,
         echo: true,
+        pedantic: false,
+        no_responders: false,
         account: "$G".to_string(),
         permissions: crate::config::Permissions::default(),
         nonce: nonce.clone(),
@@ -1071,13 +1189,18 @@ where
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    let _ = tx.send(encode_err(&e.to_string())).await;
+                    // Go closes silently on malformed CONNECT: no -ERR,
+                    // and the serde detail must never reach the wire.
+                    if !matches!(e, crate::protocol::ParseError::InvalidConnect(_)) {
+                        let _ = tx.send(encode_err(&e.to_string())).await;
+                    }
                     break 'read_loop;
                 }
             }
         }
     }
 
+    ping_stop.notify_waiters();
     // Cleanup: subscriptions and connection registry. Dropping the last
     // channel senders closes the writer queue, so the writer flushes any
     // pending frames (e.g. a final -ERR) and then exits on its own.
@@ -1116,6 +1239,8 @@ async fn process_op(
             };
             state.verbose = info.verbose;
             state.echo = info.echo;
+            state.pedantic = info.pedantic;
+            state.no_responders = info.no_responders;
             state.account = outcome.account.clone();
             state.permissions = outcome.permissions.clone();
             handle.headers.store(info.headers, Ordering::SeqCst);
@@ -1136,7 +1261,11 @@ async fn process_op(
             let _ = tx.send(encode_pong()).await;
             true
         }
-        ClientOp::Pong => true,
+        ClientOp::Pong => {
+            // A PONG answers every outstanding server PING.
+            handle.ping_missed.store(0, Ordering::SeqCst);
+            true
+        }
         ClientOp::Pub {
             subject,
             reply_to,
@@ -1162,14 +1291,25 @@ async fn process_op(
                     .await;
                 return true;
             }
-            deliver(
-                shared,
-                &Message::new(&subject, reply_to, None, payload).with_account(&state.account),
-                Origin::Local(client_id, state.echo),
-                None,
-            );
+            // Go ordering (verified): pedantic -ERR first, then the
+            // verbose +OK, then delivery to the publisher itself. An
+            // invalid publish subject is still delivered literally,
+            // except empty-token subjects, which Go routes nowhere.
+            if state.pedantic && !crate::subject::is_valid_publish_subject(&subject) {
+                let _ = tx.send(encode_err("Invalid Publish Subject")).await;
+            }
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
+            }
+            if !crate::subject::has_empty_token(&subject) {
+                deliver(
+                    shared,
+                    &Message::new(&subject, reply_to, None, payload)
+                        .with_account(&state.account)
+                        .with_no_responders(state.no_responders),
+                    Origin::Local(client_id, state.echo),
+                    None,
+                );
             }
             true
         }
@@ -1196,15 +1336,21 @@ async fn process_op(
                     .await;
                 return true;
             }
-            deliver(
-                shared,
-                &Message::new(&subject, reply_to, Some(headers), payload)
-                    .with_account(&state.account),
-                Origin::Local(client_id, state.echo),
-                None,
-            );
+            if state.pedantic && !crate::subject::is_valid_publish_subject(&subject) {
+                let _ = tx.send(encode_err("Invalid Publish Subject")).await;
+            }
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
+            }
+            if !crate::subject::has_empty_token(&subject) {
+                deliver(
+                    shared,
+                    &Message::new(&subject, reply_to, Some(headers), payload)
+                        .with_account(&state.account)
+                        .with_no_responders(state.no_responders),
+                    Origin::Local(client_id, state.echo),
+                    None,
+                );
             }
             true
         }
@@ -1223,20 +1369,35 @@ async fn process_op(
                     .await;
                 return true;
             }
-            let is_new = {
-                let mut sl = shared.sublist.lock().unwrap();
-                let is_new = !sl.has_pattern(&subject, queue.as_deref(), &state.account);
-                sl.add(Subscription::new(
-                    client_id,
-                    sid,
-                    subject.clone(),
-                    queue.clone(),
-                    state.account.clone(),
-                ));
-                is_new
+            // Go: an invalid SUB subject gets -ERR, no subscription is
+            // created, no +OK is sent, and the connection stays alive.
+            if !crate::subject::is_valid_subscribe_subject(&subject) {
+                let _ = tx.send(encode_err("Invalid Subject")).await;
+                return true;
+            }
+            // Go keeps the first subscription for a sid: a duplicate SUB
+            // must not replace it and must not propagate its (different)
+            // pattern to routes/leafs. It still gets the verbose +OK.
+            let already = {
+                let sl = shared.sublist.lock().unwrap();
+                sl.pattern_of(client_id, &sid).is_some()
             };
-            if is_new {
-                propagate_local_sub(shared, &state.account, &subject, queue.as_deref(), true);
+            if !already {
+                let is_new = {
+                    let mut sl = shared.sublist.lock().unwrap();
+                    let is_new = !sl.has_pattern(&subject, queue.as_deref(), &state.account);
+                    sl.add(Subscription::new(
+                        client_id,
+                        sid,
+                        subject.clone(),
+                        queue.clone(),
+                        state.account.clone(),
+                    ));
+                    is_new
+                };
+                if is_new {
+                    propagate_local_sub(shared, &state.account, &subject, queue.as_deref(), true);
+                }
             }
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;

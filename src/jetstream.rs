@@ -376,6 +376,10 @@ impl Stream {
     }
 
     fn first_seq(&self) -> u64 {
+        // Go reports FirstSeq 0 for a fresh, empty stream (not 1).
+        if self.messages.is_empty() {
+            return 0;
+        }
         // Skip a deleted prefix (workqueue acks from the front).
         let mut seq = self.base_seq;
         while seq < self.base_seq + self.messages.len() as u64 && self.deleted.contains(&seq) {

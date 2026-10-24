@@ -193,10 +193,8 @@ fn parse_leaf_line(
             if args.len() < 2 {
                 return Err(LeafParseError::InvalidArgs(format!("LMSG {rest}")));
             }
+            // Leaf publish subjects are literal; never reject them here.
             let subject = args[0].to_string();
-            if !crate::subject::is_valid_publish_subject(&subject) {
-                return Err(LeafParseError::InvalidSubject(subject));
-            }
             let mut mid = args[1..].to_vec();
             // Trailing numerics are sizes: 1 = plain, 2 = hdr + total.
             let mut sizes: Vec<usize> = Vec::new();
@@ -264,10 +262,8 @@ fn parse_leaf_line(
                 if args.len() < 3 || args.len() > 4 {
                     return Err(LeafParseError::InvalidArgs(format!("HMSG {rest}")));
                 }
+                // Leaf publish subjects are literal; never reject them here.
                 let subject = args[0].to_string();
-                if !crate::subject::is_valid_publish_subject(&subject) {
-                    return Err(LeafParseError::InvalidSubject(subject));
-                }
                 let (reply_to, hdr_len, total) = if args.len() == 3 {
                     (
                         None,
@@ -305,10 +301,8 @@ fn parse_leaf_line(
                 if args.len() < 3 || args.len() > 4 {
                     return Err(LeafParseError::InvalidArgs(format!("MSG {rest}")));
                 }
+                // Leaf publish subjects are literal; never reject them here.
                 let subject = args[0].to_string();
-                if !crate::subject::is_valid_publish_subject(&subject) {
-                    return Err(LeafParseError::InvalidSubject(subject));
-                }
                 let (reply_to, total) = if args.len() == 3 {
                     (
                         None,

@@ -171,8 +171,8 @@ fn varz(shared: &Shared) -> Value {
         "tls_required": cfg.tls_required(),
         "max_payload": cfg.max_payload,
         "max_connections": 0,
-        "ping_interval": 120000000000i64,
-        "ping_max": 2,
+        "ping_interval": cfg.ping_interval.as_nanos() as i64,
+        "ping_max": cfg.ping_max,
         "http_base_path": "",
         "start": rfc3339(
             shared
