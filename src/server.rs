@@ -52,6 +52,10 @@ pub struct Message {
     pub reply_to: Option<String>,
     pub headers: Option<Bytes>,
     pub payload: Bytes,
+    /// Account the message belongs to; delivery is scoped to it.
+    /// Defaults to `$G` (Message::new); JetStream and route/leaf paths
+    /// set it explicitly.
+    pub account: String,
 }
 
 impl Message {
@@ -66,7 +70,13 @@ impl Message {
             reply_to,
             headers,
             payload,
+            account: "$G".to_string(),
         }
+    }
+
+    pub fn with_account(mut self, account: &str) -> Self {
+        self.account = account.to_string();
+        self
     }
 
     /// Parse the raw header block into (name, value) pairs. Malformed lines
@@ -133,8 +143,10 @@ impl ConnHandle {
     }
 }
 
-/// One inter-server connection's interest: pattern -> queue -> count.
-type InterestMap = HashMap<(String, Option<String>), u32>;
+/// One inter-server connection's interest: (account, pattern, queue)
+/// -> count. Routes are multi-account; leaf interest is stored the
+/// same way but a leaf connection only ever carries its own account.
+type InterestMap = HashMap<(String, String, Option<String>), u32>;
 
 /// A route peer connection.
 pub(crate) struct RouteConn {
@@ -150,8 +162,12 @@ pub(crate) struct RouteConn {
 
 /// A leaf connection (either side of it: hub-side accepted, or leaf-side
 /// solicited — the protocol is symmetric after the handshake).
+/// A leaf connection is account-scoped: it only carries messages for
+/// this account (default `$G`; hub-side, the account of the leaf user
+/// when that user belongs to a configured account).
 pub(crate) struct LeafConn {
     pub(crate) handle: Arc<ConnHandle>,
+    pub(crate) account: String,
 }
 
 /// Connection metadata for the monitoring endpoint.
@@ -162,6 +178,24 @@ pub struct ConnInfo {
     pub addr: String,
     pub peer_id: Option<String>,
     pub started: Instant,
+    pub account: String,
+    pub user: Option<String>,
+    pub tls: bool,
+}
+
+impl ConnInfo {
+    fn client(id: u64, addr: String, tls: bool) -> Self {
+        ConnInfo {
+            id,
+            kind: "client",
+            addr,
+            peer_id: None,
+            started: Instant::now(),
+            account: "$G".to_string(),
+            user: None,
+            tls,
+        }
+    }
 }
 
 /// Server-wide counters for the monitoring endpoint.
@@ -179,6 +213,8 @@ pub struct Shared {
     pub(crate) listen_addr: SocketAddr,
     pub(crate) cluster_addr: Option<SocketAddr>,
     pub(crate) leaf_addr: Option<SocketAddr>,
+    // Consumed by the monitoring endpoint (Phase 5: /varz http_port).
+    #[allow(dead_code)]
     pub(crate) http_addr: Option<SocketAddr>,
     /// TLS acceptor for client connections; None means plain text.
     pub(crate) tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
@@ -263,7 +299,7 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
     // error, not a per-connection failure.
     let tls_acceptor = match &config.tls {
         Some(settings) => Some(Arc::new(tokio_rustls::TlsAcceptor::from(
-            crate::tls::build_server_config(settings).map_err(|e| io::Error::other(e))?,
+            crate::tls::build_server_config(settings).map_err(io::Error::other)?,
         ))),
         None => None,
     };
@@ -370,10 +406,8 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     let _ = stream.set_nodelay(true);
                     let id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
                     shared.stats.total_connections.fetch_add(1, Ordering::Relaxed);
-                    shared.conn_info.lock().unwrap().insert(id, ConnInfo {
-                        id, kind: "client", addr: peer.to_string(),
-                        peer_id: None, started: Instant::now(),
-                    });
+                    let tls = shared.tls_acceptor.is_some();
+                    shared.conn_info.lock().unwrap().insert(id, ConnInfo::client(id, peer.to_string(), tls));
                     let shared = shared.clone();
                     tokio::spawn(async move {
                         match &shared.tls_acceptor {
@@ -557,7 +591,12 @@ pub fn deliver(
             match origin {
                 Origin::Route(_) | Origin::Leaf(_) => {
                     // Filtered queue selection for remote-origin messages.
-                    let gm = sl.match_groups(&msg.subject, publisher_conn, publisher_echo);
+                    let gm = sl.match_groups(
+                        &msg.subject,
+                        publisher_conn,
+                        publisher_echo,
+                        Some(&msg.account),
+                    );
                     let mut deliveries = gm.plain;
                     for (q, members) in &gm.groups {
                         let wanted = match queue_filter {
@@ -592,10 +631,15 @@ pub fn deliver(
     // group spanning nodes still delivers exactly once per message.
     let gm = {
         let sl = shared.sublist.lock().unwrap();
-        sl.match_groups(&msg.subject, publisher_conn, publisher_echo)
+        sl.match_groups(
+            &msg.subject,
+            publisher_conn,
+            publisher_echo,
+            Some(&msg.account),
+        )
     };
-    let route_full = route_interest_full(shared, &msg.subject);
-    let leaf_full = leaf_interest_full(shared, &msg.subject);
+    let route_full = route_interest_full(shared, &msg.subject, &msg.account);
+    let leaf_full = leaf_interest_full(shared, &msg.subject, &msg.account);
 
     enum Dest {
         Local(crate::sublist::Delivery),
@@ -648,8 +692,15 @@ pub fn deliver(
             continue;
         }
         let frame = match &msg.headers {
-            Some(h) => encode_route_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+            Some(h) => encode_route_hmsg(
+                &msg.account,
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                h,
+                &msg.payload,
+            ),
             None => encode_rmsg(
+                &msg.account,
                 &msg.subject,
                 msg.reply_to.as_deref(),
                 &selected,
@@ -720,7 +771,7 @@ fn cleanup_expired(shared: &Arc<Shared>, expired: &[(u64, String)]) {
     if expired.is_empty() {
         return;
     }
-    let patterns: Vec<(String, Option<String>)> = {
+    let patterns: Vec<(String, String, Option<String>)> = {
         let sl = shared.sublist.lock().unwrap();
         expired
             .iter()
@@ -733,18 +784,21 @@ fn cleanup_expired(shared: &Arc<Shared>, expired: &[(u64, String)]) {
             sl.remove(*cid, sid);
         }
     }
-    for (subject, queue) in patterns {
-        if !local_pattern_in_use(shared, &subject, queue.as_deref()) {
-            propagate_local_sub(shared, &subject, queue.as_deref(), false);
+    for (account, subject, queue) in patterns {
+        if !local_pattern_in_use(shared, &account, &subject, queue.as_deref()) {
+            propagate_local_sub(shared, &account, &subject, queue.as_deref(), false);
         }
     }
 }
 
 /// Snapshot of one connection's interest: (plain_match, queue -> count).
-fn interest_of(subs: &InterestMap, subject: &str) -> (bool, HashMap<String, u32>) {
+fn interest_of(subs: &InterestMap, subject: &str, account: &str) -> (bool, HashMap<String, u32>) {
     let mut plain = false;
     let mut counts: HashMap<String, u32> = HashMap::new();
-    for ((pattern, queue), count) in subs {
+    for ((acct, pattern, queue), count) in subs {
+        if acct != account {
+            continue;
+        }
         if *count == 0 {
             continue;
         }
@@ -761,7 +815,7 @@ fn interest_of(subs: &InterestMap, subject: &str) -> (bool, HashMap<String, u32>
     (plain, counts)
 }
 
-fn route_interest_full(shared: &Arc<Shared>, subject: &str) -> InterestTargets {
+fn route_interest_full(shared: &Arc<Shared>, subject: &str, account: &str) -> InterestTargets {
     let subs = shared.route_subs.lock().unwrap();
     shared
         .routes
@@ -772,25 +826,25 @@ fn route_interest_full(shared: &Arc<Shared>, subject: &str) -> InterestTargets {
         .map(|(id, r)| {
             let (plain, counts) = subs
                 .get(id)
-                .map(|m| interest_of(m, subject))
+                .map(|m| interest_of(m, subject, account))
                 .unwrap_or((false, HashMap::new()));
             (*id, r.handle.clone(), plain, counts)
         })
         .collect()
 }
 
-fn leaf_interest_full(shared: &Arc<Shared>, subject: &str) -> InterestTargets {
+fn leaf_interest_full(shared: &Arc<Shared>, subject: &str, account: &str) -> InterestTargets {
     let subs = shared.leaf_subs.lock().unwrap();
     shared
         .leafs
         .lock()
         .unwrap()
         .iter()
-        .filter(|(_, l)| !l.handle.is_closed())
+        .filter(|(_, l)| !l.handle.is_closed() && l.account == account)
         .map(|(id, l)| {
             let (plain, counts) = subs
                 .get(id)
-                .map(|m| interest_of(m, subject))
+                .map(|m| interest_of(m, subject, account))
                 .unwrap_or((false, HashMap::new()));
             (*id, l.handle.clone(), plain, counts)
         })
@@ -798,60 +852,94 @@ fn leaf_interest_full(shared: &Arc<Shared>, subject: &str) -> InterestTargets {
 }
 
 /// Broadcast a local subscription change to all routes and leafs.
-fn propagate_local_sub(shared: &Arc<Shared>, subject: &str, queue: Option<&str>, added: bool) {
+fn propagate_local_sub(
+    shared: &Arc<Shared>,
+    account: &str,
+    subject: &str,
+    queue: Option<&str>,
+    added: bool,
+) {
     let rframe = if added {
-        encode_rs_plus(subject, queue)
+        encode_rs_plus(account, subject, queue)
     } else {
-        encode_rs_minus(subject, queue)
+        encode_rs_minus(account, subject, queue)
     };
     for r in shared.routes.lock().unwrap().values() {
         if !r.handle.is_closed() {
             let _ = try_send(&r.handle, rframe.clone());
         }
     }
+    // Leaf frames carry no account token: a leaf connection only ever
+    // carries its own account, so propagate only to matching leafs.
     let lframe = if added {
         encode_ls_plus(subject, queue)
     } else {
         encode_ls_minus(subject, queue)
     };
     for l in shared.leafs.lock().unwrap().values() {
-        if !l.handle.is_closed() {
+        if !l.handle.is_closed() && l.account == account {
             let _ = try_send(&l.handle, lframe.clone());
         }
     }
 }
 
 /// Does any local subscription (or JetStream internal pattern) still use
-/// this pattern+queue?
-fn local_pattern_in_use(shared: &Arc<Shared>, subject: &str, queue: Option<&str>) -> bool {
+/// this pattern+queue in this account?
+fn local_pattern_in_use(
+    shared: &Arc<Shared>,
+    account: &str,
+    subject: &str,
+    queue: Option<&str>,
+) -> bool {
     if shared.jetstream.is_some() && subject == "$JS.API.>" && queue.is_none() {
         return true;
     }
-    shared.sublist.lock().unwrap().has_pattern(subject, queue)
+    shared
+        .sublist
+        .lock()
+        .unwrap()
+        .has_pattern(subject, queue, account)
 }
 
 /// Send every local subscription (plus JetStream internal patterns) to one
 /// route or leaf connection as RS+/LS+ frames.
-fn send_local_interest(shared: &Arc<Shared>, handle: &ConnHandle, is_route: bool) {
-    let subs: Vec<(String, Option<String>)> = {
+fn send_local_interest(
+    shared: &Arc<Shared>,
+    handle: &ConnHandle,
+    is_route: bool,
+    leaf_account: Option<&str>,
+) {
+    let subs: Vec<(String, String, Option<String>)> = {
         let sl = shared.sublist.lock().unwrap();
         sl.patterns()
     };
-    for (subject, queue) in subs {
-        let frame = if is_route {
-            encode_rs_plus(&subject, queue.as_deref())
-        } else {
-            encode_ls_plus(&subject, queue.as_deref())
-        };
-        let _ = try_send(handle, frame);
+    for (account, subject, queue) in subs {
+        if is_route {
+            let _ = try_send(handle, encode_rs_plus(&account, &subject, queue.as_deref()));
+        } else if leaf_account == Some(account.as_str()) {
+            let _ = try_send(handle, encode_ls_plus(&subject, queue.as_deref()));
+        }
     }
     if shared.jetstream.is_some() {
-        let frame = if is_route {
-            encode_rs_plus("$JS.API.>", None)
-        } else {
-            encode_ls_plus("$JS.API.>", None)
-        };
-        let _ = try_send(handle, frame);
+        if is_route {
+            // Advertise JetStream API interest for every account so
+            // remote nodes can forward $JS.API requests per account.
+            let mut accounts: Vec<String> = shared
+                .config
+                .accounts
+                .iter()
+                .map(|a| a.name.clone())
+                .collect();
+            if !accounts.contains(&"$G".to_string()) {
+                accounts.push("$G".to_string());
+            }
+            for account in accounts {
+                let _ = try_send(handle, encode_rs_plus(&account, "$JS.API.>", None));
+            }
+        } else if let Some(account) = leaf_account {
+            let _ = try_send(handle, encode_ls_plus("$JS.API.>", None));
+            let _ = account;
+        }
     }
 }
 
@@ -874,15 +962,29 @@ fn close_leaf(shared: &Arc<Shared>, id: u64) {
 }
 
 /// Bump a counted interest entry by `delta` (+1 / -1), removing at zero.
-fn bump_interest(map: &mut InterestMap, subject: &str, queue: Option<&str>, delta: i32) {
-    let key = (subject.to_string(), queue.map(|q| q.to_string()));
+fn bump_interest(
+    map: &mut InterestMap,
+    account: &str,
+    subject: &str,
+    queue: Option<&str>,
+    delta: i32,
+) {
+    let key = (
+        account.to_string(),
+        subject.to_string(),
+        queue.map(|q| q.to_string()),
+    );
     let entry = map.entry(key).or_insert(0);
     if delta > 0 {
         *entry = entry.saturating_add(delta as u32);
     } else {
         *entry = entry.saturating_sub((-delta) as u32);
         if *entry == 0 {
-            map.remove(&(subject.to_string(), queue.map(|q| q.to_string())));
+            map.remove(&(
+                account.to_string(),
+                subject.to_string(),
+                queue.map(|q| q.to_string()),
+            ));
         }
     }
 }
@@ -894,6 +996,12 @@ fn bump_interest(map: &mut InterestMap, subject: &str, queue: Option<&str>, delt
 struct ConnState {
     verbose: bool,
     echo: bool,
+    /// Account this connection authenticated as ($G by default).
+    account: String,
+    /// Effective subject permissions for this connection.
+    permissions: crate::config::Permissions,
+    /// Per-connection INFO nonce (nkey clients sign this).
+    nonce: String,
 }
 
 async fn handle_conn<R, W>(mut reader: R, writer: W, shared: Arc<Shared>, client_id: u64)
@@ -921,8 +1029,8 @@ where
         host: shared.listen_addr.ip().to_string(),
         port: shared.listen_addr.port(),
         client_id,
-        nonce,
-        auth_required: shared.config.user.is_some() || shared.config.auth_token.is_some(),
+        nonce: nonce.clone(),
+        auth_required: shared.config.auth_required(),
         tls_required: shared.config.tls_required(),
         jetstream: shared.config.jetstream,
     };
@@ -931,6 +1039,9 @@ where
     let mut state = ConnState {
         verbose: false,
         echo: true,
+        account: "$G".to_string(),
+        permissions: crate::config::Permissions::default(),
+        nonce: nonce.clone(),
     };
     let mut parser = Parser::new(shared.config.max_payload);
     let mut buf = vec![0u8; 16 * 1024];
@@ -973,9 +1084,9 @@ where
         sl.remove_conn(client_id);
         patterns
     };
-    for (subject, queue) in removed {
-        if !local_pattern_in_use(&shared, &subject, queue.as_deref()) {
-            propagate_local_sub(&shared, &subject, queue.as_deref(), false);
+    for (account, subject, queue) in removed {
+        if !local_pattern_in_use(&shared, &account, &subject, queue.as_deref()) {
+            propagate_local_sub(&shared, &account, &subject, queue.as_deref(), false);
         }
     }
     shared.conns.lock().unwrap().remove(&client_id);
@@ -995,13 +1106,24 @@ async fn process_op(
 ) -> bool {
     match op {
         ClientOp::Connect(info) => {
-            if !shared.config.authorize(&info) {
+            let nonce = state.nonce.as_bytes();
+            let Some(outcome) = shared.config.authenticate(&info, Some(nonce)) else {
                 let _ = tx.send(encode_err("Authorization Violation")).await;
                 return false;
-            }
+            };
             state.verbose = info.verbose;
             state.echo = info.echo;
+            state.account = outcome.account.clone();
+            state.permissions = outcome.permissions.clone();
             handle.headers.store(info.headers, Ordering::SeqCst);
+            // Record account/user for monitoring (connz/accounz).
+            {
+                let mut infos = shared.conn_info.lock().unwrap();
+                if let Some(ci) = infos.get_mut(&client_id) {
+                    ci.account = outcome.account;
+                    ci.user = outcome.user;
+                }
+            }
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
             }
@@ -1026,9 +1148,20 @@ async fn process_op(
                 .stats
                 .in_bytes
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            if !state.permissions.can_publish(&subject) {
+                // Go's exact error text; the connection stays alive and
+                // the verbose +OK is replaced by the error (verified
+                // against nats-server v2.15.1).
+                let _ = tx
+                    .send(encode_err(&format!(
+                        "Permissions Violation for Publish to \"{subject}\""
+                    )))
+                    .await;
+                return true;
+            }
             deliver(
                 shared,
-                &Message::new(&subject, reply_to, None, payload),
+                &Message::new(&subject, reply_to, None, payload).with_account(&state.account),
                 Origin::Local(client_id, state.echo),
                 None,
             );
@@ -1052,9 +1185,18 @@ async fn process_op(
                 .stats
                 .in_bytes
                 .fetch_add((headers.len() + payload.len()) as u64, Ordering::Relaxed);
+            if !state.permissions.can_publish(&subject) {
+                let _ = tx
+                    .send(encode_err(&format!(
+                        "Permissions Violation for Publish to \"{subject}\""
+                    )))
+                    .await;
+                return true;
+            }
             deliver(
                 shared,
-                &Message::new(&subject, reply_to, Some(headers), payload),
+                &Message::new(&subject, reply_to, Some(headers), payload)
+                    .with_account(&state.account),
                 Origin::Local(client_id, state.echo),
                 None,
             );
@@ -1068,19 +1210,30 @@ async fn process_op(
             queue,
             sid,
         } => {
+            if !state.permissions.can_subscribe(&subject) {
+                // Go's exact error text; the connection stays alive and
+                // no +OK is sent (verified against nats-server v2.15.1).
+                let _ = tx
+                    .send(encode_err(&format!(
+                        "Permissions Violation for Subscription to \"{subject}\""
+                    )))
+                    .await;
+                return true;
+            }
             let is_new = {
                 let mut sl = shared.sublist.lock().unwrap();
-                let is_new = !sl.has_pattern(&subject, queue.as_deref());
+                let is_new = !sl.has_pattern(&subject, queue.as_deref(), &state.account);
                 sl.add(Subscription::new(
                     client_id,
                     sid,
                     subject.clone(),
                     queue.clone(),
+                    state.account.clone(),
                 ));
                 is_new
             };
             if is_new {
-                propagate_local_sub(shared, &subject, queue.as_deref(), true);
+                propagate_local_sub(shared, &state.account, &subject, queue.as_deref(), true);
             }
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
@@ -1096,9 +1249,15 @@ async fn process_op(
                         sl.remove(client_id, &sid);
                         p
                     };
-                    if let Some((subject, queue)) = pattern {
-                        if !local_pattern_in_use(shared, &subject, queue.as_deref()) {
-                            propagate_local_sub(shared, &subject, queue.as_deref(), false);
+                    if let Some((account, subject, queue)) = pattern {
+                        if !local_pattern_in_use(shared, &account, &subject, queue.as_deref()) {
+                            propagate_local_sub(
+                                shared,
+                                &account,
+                                &subject,
+                                queue.as_deref(),
+                                false,
+                            );
                         }
                     }
                 }
@@ -1236,9 +1395,12 @@ async fn handle_route_accepted(stream: TcpStream, shared: Arc<Shared>) {
             addr: peer_listen_addr(&shared, id),
             peer_id: Some(peer_id),
             started: Instant::now(),
+            account: "$G".to_string(),
+            user: None,
+            tls: false,
         },
     );
-    send_local_interest(&shared, &handle, true);
+    send_local_interest(&shared, &handle, true, None);
     route_read_loop(&mut reader, &shared, id, &handle, &tx).await;
     close_route(&shared, id);
 }
@@ -1397,9 +1559,12 @@ async fn handle_route_solicited(stream: TcpStream, shared: Arc<Shared>, target: 
             addr: peer_listen_addr(&shared, id),
             peer_id: Some(peer_id),
             started: Instant::now(),
+            account: "$G".to_string(),
+            user: None,
+            tls: false,
         },
     );
-    send_local_interest(&shared, &handle, true);
+    send_local_interest(&shared, &handle, true, None);
     route_read_loop(&mut reader, &shared, id, &handle, &tx).await;
     close_route(&shared, id);
 }
@@ -1463,21 +1628,32 @@ async fn process_route_op(
             let _ = tx.send(Bytes::from("PONG\r\n")).await;
             true
         }
-        RouteOp::RsPlus { subject, queue, .. } => {
+        RouteOp::RsPlus {
+            account,
+            subject,
+            queue,
+            ..
+        } => {
             let mut subs = shared.route_subs.lock().unwrap();
             if let Some(m) = subs.get_mut(&id) {
-                bump_interest(m, &subject, queue.as_deref(), 1);
+                bump_interest(m, &account, &subject, queue.as_deref(), 1);
             }
             true
         }
-        RouteOp::RsMinus { subject, queue, .. } => {
+        RouteOp::RsMinus {
+            account,
+            subject,
+            queue,
+            ..
+        } => {
             let mut subs = shared.route_subs.lock().unwrap();
             if let Some(m) = subs.get_mut(&id) {
-                bump_interest(m, &subject, queue.as_deref(), -1);
+                bump_interest(m, &account, &subject, queue.as_deref(), -1);
             }
             true
         }
         RouteOp::RMsg {
+            account,
             subject,
             reply_to,
             queues,
@@ -1504,7 +1680,7 @@ async fn process_route_op(
             };
             deliver(
                 shared,
-                &Message::new(&subject, reply_to, headers, payload),
+                &Message::new(&subject, reply_to, headers, payload).with_account(&account),
                 Origin::Route(id),
                 filter,
             );
@@ -1591,10 +1767,12 @@ async fn handle_leaf_accepted(stream: TcpStream, shared: Arc<Shared>) {
         .stats
         .total_connections
         .fetch_add(1, Ordering::Relaxed);
+    let leaf_account = leaf_account_for(&shared, &connect_json);
     shared.leafs.lock().unwrap().insert(
         id,
         Arc::new(LeafConn {
             handle: handle.clone(),
+            account: leaf_account.clone(),
         }),
     );
     shared.leaf_subs.lock().unwrap().insert(id, HashMap::new());
@@ -1606,11 +1784,36 @@ async fn handle_leaf_accepted(stream: TcpStream, shared: Arc<Shared>) {
             addr: String::new(),
             peer_id: Some(peer_id),
             started: Instant::now(),
+            account: leaf_account.clone(),
+            user: None,
+            tls: false,
         },
     );
-    send_local_interest(&shared, &handle, false);
+    send_local_interest(&shared, &handle, false, Some(&leaf_account));
     leaf_read_loop(&mut reader, &shared, id, &handle, &tx).await;
     close_leaf(&shared, id);
+}
+
+/// Account for an accepted leaf connection: the account of the leaf
+/// user when that user belongs to a configured account, else `$G`.
+/// Matches on user+pass or on token, mirroring `authenticate` minus
+/// nkey (leaf CONNECTs do not carry nkey signatures).
+fn leaf_account_for(shared: &Arc<Shared>, connect_json: &str) -> String {
+    let user = json_str(connect_json, "user");
+    let pass = json_str(connect_json, "pass");
+    let token = json_str(connect_json, "auth_token");
+    for account in &shared.config.accounts {
+        for u in &account.users {
+            let pass_ok = !u.name.is_empty()
+                && user.as_deref() == Some(u.name.as_str())
+                && pass.as_deref() == u.pass.as_deref();
+            let token_ok = u.token.is_some() && token.as_deref() == u.token.as_deref();
+            if pass_ok || token_ok {
+                return account.name.clone();
+            }
+        }
+    }
+    "$G".to_string()
 }
 
 /// Hub-side leaf auth: explicit --leaf-user/--leaf-pass win; otherwise the
@@ -1701,10 +1904,24 @@ async fn handle_leaf_solicited(stream: TcpStream, shared: Arc<Shared>) {
         .stats
         .total_connections
         .fetch_add(1, Ordering::Relaxed);
+    let leaf_account = shared
+        .config
+        .leaf_user
+        .as_ref()
+        .and_then(|u| {
+            shared
+                .config
+                .accounts
+                .iter()
+                .find(|a| a.users.iter().any(|usr| &usr.name == u))
+                .map(|a| a.name.clone())
+        })
+        .unwrap_or_else(|| "$G".to_string());
     shared.leafs.lock().unwrap().insert(
         id,
         Arc::new(LeafConn {
             handle: handle.clone(),
+            account: leaf_account.clone(),
         }),
     );
     shared.leaf_subs.lock().unwrap().insert(id, HashMap::new());
@@ -1716,9 +1933,12 @@ async fn handle_leaf_solicited(stream: TcpStream, shared: Arc<Shared>) {
             addr: String::new(),
             peer_id: None,
             started: Instant::now(),
+            account: leaf_account.clone(),
+            user: None,
+            tls: false,
         },
     );
-    send_local_interest(&shared, &handle, false);
+    send_local_interest(&shared, &handle, false, Some(&leaf_account));
     leaf_read_loop(&mut reader, &shared, id, &handle, &tx).await;
     close_leaf(&shared, id);
 }
@@ -1782,16 +2002,30 @@ async fn process_leaf_op(
             true
         }
         LeafOp::LsPlus { subject, queue } => {
+            let leaf_account = shared
+                .leafs
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|l| l.account.clone())
+                .unwrap_or_else(|| "$G".to_string());
             let mut subs = shared.leaf_subs.lock().unwrap();
             if let Some(m) = subs.get_mut(&id) {
-                bump_interest(m, &subject, queue.as_deref(), 1);
+                bump_interest(m, &leaf_account, &subject, queue.as_deref(), 1);
             }
             true
         }
         LeafOp::LsMinus { subject, queue } => {
+            let leaf_account = shared
+                .leafs
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|l| l.account.clone())
+                .unwrap_or_else(|| "$G".to_string());
             let mut subs = shared.leaf_subs.lock().unwrap();
             if let Some(m) = subs.get_mut(&id) {
-                bump_interest(m, &subject, queue.as_deref(), -1);
+                bump_interest(m, &leaf_account, &subject, queue.as_deref(), -1);
             }
             true
         }
@@ -1813,9 +2047,16 @@ async fn process_leaf_op(
                 (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
                 Ordering::Relaxed,
             );
+            let leaf_account = shared
+                .leafs
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|l| l.account.clone())
+                .unwrap_or_else(|| "$G".to_string());
             deliver(
                 shared,
-                &Message::new(&subject, reply_to, headers, payload),
+                &Message::new(&subject, reply_to, headers, payload).with_account(&leaf_account),
                 Origin::Leaf(id),
                 queues.as_deref(),
             );

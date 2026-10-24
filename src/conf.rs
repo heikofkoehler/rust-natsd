@@ -12,15 +12,16 @@
 //! - `leafnodes { port, remotes, authorization { user, password } }`
 //! - `jetstream` (boolean, or a block with `store_dir`)
 //! - `tls { cert_file, key_file, ca_file, verify }` (client listener only)
+//! - `accounts { NAME { users [...], permissions/authorization {...},
+//!   jetstream: enabled } }`, `system_account`, `no_auth_user`
 //!
 //! Not supported (ignored or, for `include`, rejected): `include`,
-//! `accounts`, `system_account`, `no_auth_user`,
 //! logging, limits, websocket/mqtt/gateway sections. A config using
 //! those will load, but the features stay off — the README says so.
 
 use std::collections::HashMap;
 
-use crate::config::{parse_size, Config, TlsSettings};
+use crate::config::{parse_size, Account, AccountUser, Config, Permissions, TlsSettings};
 
 /// A parsed config value.
 #[derive(Debug, Clone, PartialEq)]
@@ -305,6 +306,131 @@ fn as_u16(v: &Value, what: &str) -> Result<u16, String> {
     }
 }
 
+/// A permissions value: a single subject, a list of subjects (the allow
+/// list), or a `{ allow: [...], deny: [...] }` map.
+fn parse_subject_permission(v: &Value) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    match v {
+        Value::Str(s) => (Some(vec![s.clone()]), None),
+        Value::List(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                if let Value::Str(s) = item {
+                    out.push(s.clone());
+                }
+            }
+            (Some(out), None)
+        }
+        Value::Map(_) => {
+            let map = map_of(v).unwrap_or_default();
+            let allow = map.get("allow").and_then(|a| match a {
+                Value::Str(s) => Some(vec![(*s).clone()]),
+                Value::List(items) => Some(
+                    items
+                        .iter()
+                        .filter_map(|i| i.as_str().map(|s| s.to_string()))
+                        .collect(),
+                ),
+                _ => None,
+            });
+            let deny = map.get("deny").and_then(|a| match a {
+                Value::Str(s) => Some(vec![(*s).clone()]),
+                Value::List(items) => Some(
+                    items
+                        .iter()
+                        .filter_map(|i| i.as_str().map(|s| s.to_string()))
+                        .collect(),
+                ),
+                _ => None,
+            });
+            (allow, deny)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Parse a `permissions` / `authorization` block: `{ publish: ..., subscribe: ... }`.
+fn parse_permissions_block(v: &Value) -> Permissions {
+    let mut perms = Permissions::default();
+    if let Some(map) = map_of(v) {
+        if let Some(p) = map.get("publish") {
+            let (allow, deny) = parse_subject_permission(p);
+            perms.publish_allow = allow;
+            perms.publish_deny = deny;
+        }
+        if let Some(s) = map.get("subscribe") {
+            let (allow, deny) = parse_subject_permission(s);
+            perms.subscribe_allow = allow;
+            perms.subscribe_deny = deny;
+        }
+    }
+    perms
+}
+
+fn parse_account_user(v: &Value) -> Option<AccountUser> {
+    let map = map_of(v)?;
+    let mut user = AccountUser::default();
+    if let Some(u) = map.get("user").and_then(|v| v.as_str()) {
+        user.name = u.to_string();
+    }
+    if let Some(p) = map.get("password").and_then(|v| v.as_str()) {
+        user.pass = Some(p.to_string());
+    }
+    if let Some(t) = map.get("token").and_then(|v| v.as_str()) {
+        user.token = Some(t.to_string());
+    }
+    if let Some(n) = map.get("nkey").and_then(|v| v.as_str()) {
+        user.nkey = Some(n.to_string());
+    }
+    // Real Go shape is `permissions`; accept `authorization` as an alias.
+    if let Some(p) = map.get("permissions") {
+        user.permissions = parse_permissions_block(p);
+    } else if let Some(p) = map.get("authorization") {
+        user.permissions = parse_permissions_block(p);
+    }
+    Some(user)
+}
+
+fn parse_account(name: &str, v: &Value) -> Option<Account> {
+    let map = map_of(v)?;
+    let mut account = Account {
+        name: name.to_string(),
+        ..Default::default()
+    };
+    if let Some(users) = map.get("users") {
+        match users {
+            Value::List(items) => {
+                for item in items {
+                    if let Some(u) = parse_account_user(item) {
+                        account.users.push(u);
+                    }
+                }
+            }
+            Value::Map(_) => {
+                if let Some(u) = parse_account_user(users) {
+                    account.users.push(u);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(p) = map.get("permissions") {
+        account.permissions = parse_permissions_block(p);
+    }
+    // Account-level `authorization` block (used by some configs as the
+    // account default): same publish/subscribe shape as permissions.
+    if let Some(p) = map.get("authorization") {
+        let parsed = parse_permissions_block(p);
+        if parsed.has_any() {
+            account.permissions = parsed;
+        }
+    }
+    if let Some(js) = map.get("jetstream") {
+        account.jetstream_enabled =
+            matches!(js, Value::Bool(true)) || matches!(js.as_str(), Some("enabled"));
+    }
+    Some(account)
+}
+
 fn as_string_list(v: &Value) -> Result<Vec<String>, String> {
     match v {
         Value::List(items) => {
@@ -367,6 +493,42 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
         if let Some(t) = map.get("token").and_then(|v| v.as_str()) {
             cfg.auth_token = Some(t.to_string());
         }
+        // A `users` list in the top-level authorization block becomes
+        // the $G account (the legacy single user above stays as-is for
+        // configs that use it).
+        if let Some(users) = map.get("users") {
+            let mut account = Account {
+                name: "$G".to_string(),
+                ..Default::default()
+            };
+            if let Value::List(items) = users {
+                for item in items {
+                    if let Some(u) = parse_account_user(item) {
+                        account.users.push(u);
+                    }
+                }
+            }
+            if let Some(dp) = map.get("default_permissions") {
+                account.permissions = parse_permissions_block(dp);
+            }
+            if !account.users.is_empty() || account.permissions.has_any() {
+                cfg.accounts.push(account);
+            }
+        }
+    }
+    if let Some(v) = lookup(&top, "accounts") {
+        let entries = v.as_map().ok_or("accounts must be a block")?;
+        for (name, value) in entries {
+            if let Some(account) = parse_account(name, value) {
+                cfg.accounts.push(account);
+            }
+        }
+    }
+    if let Some(v) = lookup(&top, "system_account") {
+        cfg.system_account = v.as_str().map(|s| s.to_string());
+    }
+    if let Some(v) = lookup(&top, "no_auth_user") {
+        cfg.no_auth_user = v.as_str().map(|s| s.to_string());
     }
     if let Some(v) = lookup(&top, "cluster") {
         let map = map_of(&v).ok_or("cluster must be a block")?;

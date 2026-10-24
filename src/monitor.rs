@@ -196,7 +196,7 @@ fn connz(shared: &Shared) -> Value {
         let sub_list: Vec<String> = subs
             .patterns_for_conn(info.id)
             .into_iter()
-            .map(|(subject, queue)| match queue {
+            .map(|(_account, subject, queue)| match queue {
                 Some(q) => format!("{subject} {q}"),
                 None => subject,
             })
@@ -253,7 +253,7 @@ fn subz(shared: &Shared) -> Value {
         })
         .collect();
     for (rid, interests) in shared.route_subs.lock().unwrap().iter() {
-        for (subject, queue) in interests.keys() {
+        for (_account, subject, queue) in interests.keys() {
             subscriptions.push(json!({
                 "subject": subject,
                 "queue": queue,
@@ -263,7 +263,7 @@ fn subz(shared: &Shared) -> Value {
         }
     }
     for (lid, interests) in shared.leaf_subs.lock().unwrap().iter() {
-        for (subject, queue) in interests.keys() {
+        for (_account, subject, queue) in interests.keys() {
             subscriptions.push(json!({
                 "subject": subject,
                 "queue": queue,
@@ -301,7 +301,7 @@ fn routez(shared: &Shared) -> Value {
             .get(rid)
             .map(|m| {
                 m.keys()
-                    .map(|(subject, queue)| match queue {
+                    .map(|(_account, subject, queue)| match queue {
                         Some(q) => format!("{subject} {q}"),
                         None => subject.clone(),
                     })
@@ -341,7 +341,7 @@ fn leafz(shared: &Shared) -> Value {
             .get(lid)
             .map(|m| {
                 m.keys()
-                    .map(|(subject, queue)| match queue {
+                    .map(|(_account, subject, queue)| match queue {
                         Some(q) => format!("{subject} {q}"),
                         None => subject.clone(),
                     })

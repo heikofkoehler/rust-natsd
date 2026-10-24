@@ -1,6 +1,123 @@
 //! Server configuration and CLI parsing.
 
 use crate::protocol::DEFAULT_MAX_PAYLOAD;
+use crate::subject::subject_matches;
+
+/// Subject permissions for one user (or one account, as a default).
+/// Each field is `Option`: absent means "no restriction on this axis"
+/// (allow-all for that axis, except denies, which always win). Present
+/// allow lists close off everything not listed, matching `nats-server`:
+/// deny takes precedence over allow.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Permissions {
+    pub publish_allow: Option<Vec<String>>,
+    pub publish_deny: Option<Vec<String>>,
+    pub subscribe_allow: Option<Vec<String>>,
+    pub subscribe_deny: Option<Vec<String>>,
+}
+
+impl Permissions {
+    fn check(allow: &Option<Vec<String>>, deny: &Option<Vec<String>>, subject: &str) -> bool {
+        if let Some(deny) = deny {
+            if deny.iter().any(|p| subject_matches(p, subject)) {
+                return false;
+            }
+        }
+        if let Some(allow) = allow {
+            return allow.iter().any(|p| subject_matches(p, subject));
+        }
+        true
+    }
+
+    pub fn can_publish(&self, subject: &str) -> bool {
+        Self::check(&self.publish_allow, &self.publish_deny, subject)
+    }
+
+    pub fn can_subscribe(&self, subject: &str) -> bool {
+        Self::check(&self.subscribe_allow, &self.subscribe_deny, subject)
+    }
+
+    /// Fill any absent field from `default` (account-level permissions
+    /// are the fallback for per-user permissions).
+    pub fn fallback(&self, default: &Permissions) -> Permissions {
+        Permissions {
+            publish_allow: self
+                .publish_allow
+                .clone()
+                .or_else(|| default.publish_allow.clone()),
+            publish_deny: self
+                .publish_deny
+                .clone()
+                .or_else(|| default.publish_deny.clone()),
+            subscribe_allow: self
+                .subscribe_allow
+                .clone()
+                .or_else(|| default.subscribe_allow.clone()),
+            subscribe_deny: self
+                .subscribe_deny
+                .clone()
+                .or_else(|| default.subscribe_deny.clone()),
+        }
+    }
+
+    pub fn has_any(&self) -> bool {
+        self.publish_allow.is_some()
+            || self.publish_deny.is_some()
+            || self.subscribe_allow.is_some()
+            || self.subscribe_deny.is_some()
+    }
+}
+
+/// One user inside an account. `name` is empty for nkey-only users
+/// (configured with an `nkey` field and no `user` field, as in
+/// `nats-server`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AccountUser {
+    pub name: String,
+    pub pass: Option<String>,
+    pub token: Option<String>,
+    pub nkey: Option<String>,
+    pub permissions: Permissions,
+}
+
+/// One account (tenant). Users in different accounts share no subject
+/// space: subscriptions and deliveries are filtered by account.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Account {
+    pub name: String,
+    pub users: Vec<AccountUser>,
+    /// Account-level permissions, used when a user has none on that axis.
+    /// Parsed from both the real `nats-server` shape (per-user
+    /// `permissions` blocks) and the account-level `authorization`
+    /// block some configs use.
+    pub permissions: Permissions,
+    /// Parsed from `accounts { NAME { jetstream: enabled } }`; stored
+    /// but not enforced — when `--jetstream` is on, all accounts get
+    /// JetStream (see README non-goals/notes).
+    pub jetstream_enabled: bool,
+}
+
+/// Result of a successful authentication.
+#[derive(Debug, Clone)]
+pub struct AuthOutcome {
+    pub account: String,
+    pub user: Option<String>,
+    pub permissions: Permissions,
+}
+
+/// Verify an nkey signature: base64-decode `sig_b64` and check it
+/// against `nonce` with the public key `nkey` (Ed25519, via the `nkeys`
+/// crate). Returns false on any decode/parse/verify failure.
+pub fn verify_nkey_sig(nkey: &str, nonce: &[u8], sig_b64: &str) -> bool {
+    use base64::Engine;
+    let Ok(sig) = base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()) else {
+        return false;
+    };
+    let Ok(kp) = nkeys::KeyPair::from_public_key(nkey) else {
+        return false;
+    };
+    kp.verify(nonce, &sig).is_ok()
+}
 
 /// TLS settings for the client listener. Presence of this struct (with a
 /// cert and key) means TLS is *required* on the client port: the server
@@ -45,6 +162,15 @@ pub struct Config {
     pub http_port: u16,
     /// TLS for client connections; None means plain text.
     pub tls: Option<TlsSettings>,
+    /// Multi-account model; empty means the legacy single-account mode
+    /// (global --user/--pass/--auth-token as account `$G`).
+    pub accounts: Vec<Account>,
+    /// Name of the system account, if configured (parsed and exposed
+    /// via monitoring; `$SYS` subjects are not special-cased).
+    pub system_account: Option<String>,
+    /// Username that credential-less connections map to, if configured
+    /// (must name a configured user; otherwise they are rejected).
+    pub no_auth_user: Option<String>,
 }
 
 impl Default for Config {
@@ -69,6 +195,9 @@ impl Default for Config {
             js_store_dir: None,
             http_port: 0,
             tls: None,
+            accounts: Vec::new(),
+            system_account: None,
+            no_auth_user: None,
         }
     }
 }
@@ -279,26 +408,145 @@ impl Config {
             .unwrap_or_else(|| self.name.clone())
     }
 
-    /// Check a client's CONNECT credentials against the configured auth.
-    /// Returns true when no auth is configured.
-    pub fn authorize(&self, info: &crate::protocol::ConnectInfo) -> bool {
+    /// True when any authentication is configured (legacy user/token
+    /// or any account with users).
+    pub fn auth_required(&self) -> bool {
+        self.user.is_some()
+            || self.auth_token.is_some()
+            || self.accounts.iter().any(|a| !a.users.is_empty())
+    }
+
+    /// Authenticate a CONNECT. `nonce` is the per-connection INFO nonce
+    /// bytes (required for nkey verification; None means nkey auth
+    /// always fails). Returns the account, user, and effective
+    /// permissions on success, None on failure.
+    pub fn authenticate(
+        &self,
+        info: &crate::protocol::ConnectInfo,
+        nonce: Option<&[u8]>,
+    ) -> Option<AuthOutcome> {
+        if !self.accounts.is_empty() {
+            for account in &self.accounts {
+                for user in &account.users {
+                    // NKey: claimed public key must match, and the
+                    // signature must verify against the INFO nonce.
+                    if let Some(nkey) = &user.nkey {
+                        if info.nkey.as_deref() == Some(nkey.as_str()) {
+                            if let (Some(nonce), Some(sig)) = (nonce, &info.sig) {
+                                if verify_nkey_sig(nkey, nonce, sig) {
+                                    return Some(AuthOutcome {
+                                        account: account.name.clone(),
+                                        user: if user.name.is_empty() {
+                                            None
+                                        } else {
+                                            Some(user.name.clone())
+                                        },
+                                        permissions: user
+                                            .permissions
+                                            .fallback(&account.permissions),
+                                    });
+                                }
+                            }
+                            // Wrong/missing signature for a claimed
+                            // nkey user: do not fall through to other
+                            // credential types for this user.
+                            continue;
+                        }
+                    }
+                    if let Some(token) = &user.token {
+                        if info.auth_token.as_deref() == Some(token.as_str()) {
+                            return Some(AuthOutcome {
+                                account: account.name.clone(),
+                                user: if user.name.is_empty() {
+                                    None
+                                } else {
+                                    Some(user.name.clone())
+                                },
+                                permissions: user.permissions.fallback(&account.permissions),
+                            });
+                        }
+                    }
+                    if !user.name.is_empty()
+                        && info.user.as_deref() == Some(user.name.as_str())
+                        && info.pass.as_deref() == user.pass.as_deref()
+                    {
+                        return Some(AuthOutcome {
+                            account: account.name.clone(),
+                            user: Some(user.name.clone()),
+                            permissions: user.permissions.fallback(&account.permissions),
+                        });
+                    }
+                }
+            }
+            // Credential-less connections map to no_auth_user, if it
+            // names a configured user.
+            if info.user.is_none() && info.nkey.is_none() && info.auth_token.is_none() {
+                if let Some(no_auth) = &self.no_auth_user {
+                    for account in &self.accounts {
+                        if let Some(user) = account.users.iter().find(|u| &u.name == no_auth) {
+                            return Some(AuthOutcome {
+                                account: account.name.clone(),
+                                user: Some(user.name.clone()),
+                                permissions: user.permissions.fallback(&account.permissions),
+                            });
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        // Legacy single-account ($G) mode.
         if let Some(token) = &self.auth_token {
             // Clients may present the token in `auth_token` or as password.
+            // (Token-as-password is a deliberate deviation from
+            // `nats-server`, which rejects it; kept for backward compat.)
             if info.auth_token.as_deref() == Some(token.as_str())
                 || info.pass.as_deref() == Some(token.as_str())
             {
-                return true;
+                return Some(AuthOutcome {
+                    account: "$G".to_string(),
+                    user: info.user.clone(),
+                    permissions: Permissions::default(),
+                });
             }
-            // If user/pass auth is also configured, fall through to it.
-            if self.user.is_none() {
-                return false;
-            }
+            // Token failed and no user auth configured: rejected.
+            self.user.as_ref()?;
         }
         if let Some(user) = &self.user {
-            return info.user.as_deref() == Some(user.as_str())
-                && info.pass.as_deref() == self.pass.as_deref();
+            if info.user.as_deref() == Some(user.as_str())
+                && info.pass.as_deref() == self.pass.as_deref()
+            {
+                return Some(AuthOutcome {
+                    account: "$G".to_string(),
+                    user: Some(user.clone()),
+                    permissions: Permissions::default(),
+                });
+            }
+            // no_auth_user maps credential-less connections onto the
+            // configured user (single-user legacy equivalent of Go's
+            // no_auth_user, which must name a user in the users list).
+            if info.user.is_none() && self.no_auth_user.as_deref() == Some(user.as_str()) {
+                return Some(AuthOutcome {
+                    account: "$G".to_string(),
+                    user: Some(user.clone()),
+                    permissions: Permissions::default(),
+                });
+            }
+            return None;
         }
-        true
+        Some(AuthOutcome {
+            account: "$G".to_string(),
+            user: info.user.clone(),
+            permissions: Permissions::default(),
+        })
+    }
+
+    /// Check a client's CONNECT credentials against the configured auth.
+    /// Returns true when no auth is configured. (Kept for existing
+    /// tests; new code uses `authenticate`, which also returns the
+    /// account and permissions.)
+    pub fn authorize(&self, info: &crate::protocol::ConnectInfo) -> bool {
+        self.authenticate(info, None).is_some()
     }
 }
 

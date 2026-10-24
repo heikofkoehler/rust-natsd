@@ -131,6 +131,11 @@ struct StoredMsg {
 
 struct Stream {
     name: String,
+    /// Account that owns this stream; capture and API lookups are
+    /// scoped to it. Stream names are node-global in this
+    /// implementation (a second account creating a same-named stream
+    /// gets "stream name already in use").
+    account: String,
     created_ns: u64,
     subjects: Vec<String>,
     retention: String,
@@ -422,7 +427,13 @@ impl Consumer {
 
 /// API responses are flat, matching nats-server: the `type` marker plus
 /// the operation's fields at top level (no "response" envelope).
-fn api_response(reply_to: &str, type_name: &str, response: Value, actions: &mut Vec<Action>) {
+fn api_response(
+    account: &str,
+    reply_to: &str,
+    type_name: &str,
+    response: Value,
+    actions: &mut Vec<Action>,
+) {
     let mut body = match response {
         Value::Object(map) => map,
         other => {
@@ -432,15 +443,19 @@ fn api_response(reply_to: &str, type_name: &str, response: Value, actions: &mut 
         }
     };
     body.insert("type".to_string(), Value::String(type_name.to_string()));
-    actions.push(Action::Deliver(Message::new(
-        reply_to,
-        None,
-        None,
-        Bytes::from(Value::Object(body).to_string()),
-    )));
+    actions.push(Action::Deliver(
+        Message::new(
+            reply_to,
+            None,
+            None,
+            Bytes::from(Value::Object(body).to_string()),
+        )
+        .with_account(account),
+    ));
 }
 
 fn api_error_action(
+    account: &str,
     reply_to: &str,
     type_name: &str,
     code: u16,
@@ -452,12 +467,9 @@ fn api_error_action(
         "type": type_name,
         "error": { "code": code, "err_code": err_code, "description": desc },
     });
-    actions.push(Action::Deliver(Message::new(
-        reply_to,
-        None,
-        None,
-        Bytes::from(body.to_string()),
-    )));
+    actions.push(Action::Deliver(
+        Message::new(reply_to, None, None, Bytes::from(body.to_string())).with_account(account),
+    ));
 }
 
 /// nats-server error codes (nats.go maps these to typed errors, so they
@@ -474,30 +486,32 @@ fn err_not_found(what: &str) -> (u16, u32, String) {
 /// (unless ack policy is none).
 fn deliver_to_consumer(
     stream_name: &str,
+    account: &str,
     consumer: &mut Consumer,
     msg: &StoredMsg,
     to_subject: &str,
     actions: &mut Vec<Action>,
 ) {
     if consumer.ack_policy == AckPolicy::None {
-        actions.push(Action::Deliver(Message::new(
-            to_subject,
-            None,
-            msg.headers.clone(),
-            msg.payload.clone(),
-        )));
+        actions.push(Action::Deliver(
+            Message::new(to_subject, None, msg.headers.clone(), msg.payload.clone())
+                .with_account(account),
+        ));
         return;
     }
     consumer.consumer_seq += 1;
     let cseq = consumer.consumer_seq;
     let pending_count = consumer.pending.len() + 1;
     let reply = consumer.ack_subject(stream_name, 1, msg.seq, cseq, pending_count);
-    actions.push(Action::Deliver(Message::new(
-        to_subject,
-        Some(reply),
-        msg.headers.clone(),
-        msg.payload.clone(),
-    )));
+    actions.push(Action::Deliver(
+        Message::new(
+            to_subject,
+            Some(reply),
+            msg.headers.clone(),
+            msg.payload.clone(),
+        )
+        .with_account(account),
+    ));
     consumer.pending.insert(
         cseq,
         Pending {
@@ -554,7 +568,15 @@ fn drain_push(
         if !matches {
             continue;
         }
-        deliver_to_consumer(stream_name, consumer, &msg, &deliver_subject, actions);
+        let account = stream.account.clone();
+        deliver_to_consumer(
+            stream_name,
+            &account,
+            consumer,
+            &msg,
+            &deliver_subject,
+            actions,
+        );
     }
 }
 
@@ -639,7 +661,8 @@ fn fulfill_pulls(
             pull.delivered += 1;
         }
         let consumer = stream.consumers.get_mut(consumer_name).unwrap();
-        deliver_to_consumer(stream_name, consumer, &msg, &reply, actions);
+        let account = stream.account.clone();
+        deliver_to_consumer(stream_name, &account, consumer, &msg, &reply, actions);
     }
 }
 
@@ -660,6 +683,15 @@ impl Engine {
     /// Process one message. Returns (consumed, actions). API requests and
     /// acks are consumed; stream capture stores and still allows normal
     /// delivery, so it returns consumed=false.
+    /// Stream by name, only when it belongs to `account`.
+    fn stream_for(&self, name: &str, account: &str) -> Option<&Stream> {
+        self.streams.get(name).filter(|s| s.account == account)
+    }
+
+    fn stream_for_mut(&mut self, name: &str, account: &str) -> Option<&mut Stream> {
+        self.streams.get_mut(name).filter(|s| s.account == account)
+    }
+
     fn process(&mut self, msg: &Message, origin: Origin) -> (bool, Vec<Action>) {
         let mut actions = Vec::new();
         if matches!(origin, Origin::Internal) {
@@ -683,7 +715,10 @@ impl Engine {
         let matching: Vec<String> = self
             .streams
             .values()
-            .filter(|s| s.subjects.iter().any(|p| subject_matches(p, &msg.subject)))
+            .filter(|s| {
+                s.account == msg.account
+                    && s.subjects.iter().any(|p| subject_matches(p, &msg.subject))
+            })
             .map(|s| s.name.clone())
             .collect();
         if matching.is_empty() {
@@ -692,7 +727,7 @@ impl Engine {
         let mut stored: Vec<(String, u64, bool)> = Vec::new();
         let mut first_error: Option<(u16, u32, String)> = None;
         for name in &matching {
-            let stream = self.streams.get_mut(name).unwrap();
+            let stream = self.stream_for_mut(name, &msg.account).unwrap();
             // Dedup by Nats-Msg-Id.
             if let Some(id) = header_get(msg, "Nats-Msg-Id") {
                 if let Some((seq, _)) = stream.msg_ids.get(&id) {
@@ -806,7 +841,7 @@ impl Engine {
                 })
                 .unwrap_or_default();
             for cname in push_names {
-                let stream = self.streams.get_mut(name).unwrap();
+                let stream = self.stream_for_mut(name, &msg.account).unwrap();
                 drain_push(name, stream, &cname, actions);
             }
             let pull_names: Vec<String> = self
@@ -821,7 +856,7 @@ impl Engine {
                 })
                 .unwrap_or_default();
             for cname in pull_names {
-                let stream = self.streams.get_mut(name).unwrap();
+                let stream = self.stream_for_mut(name, &msg.account).unwrap();
                 fulfill_pulls(name, stream, &cname, actions);
             }
         }
@@ -843,7 +878,7 @@ impl Engine {
             Some(v) => v,
             None => return,
         };
-        let Some(stream) = self.streams.get_mut(stream_name) else {
+        let Some(stream) = self.stream_for_mut(stream_name, &msg.account) else {
             return;
         };
         // Clone the target message before borrowing the consumer.
@@ -965,7 +1000,7 @@ impl Engine {
         let type_name = format!("io.nats.jetstream.api.v1.{op_name}_response");
         match parts.as_slice() {
             ["STREAM", "CREATE", name] => {
-                self.api_stream_create(name, &body, &reply, &type_name, actions);
+                self.api_stream_create(&msg.account, name, &body, &reply, &type_name, actions);
             }
             ["STREAM", "CREATE"] => {
                 let name = body
@@ -973,17 +1008,25 @@ impl Engine {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                self.api_stream_create(&name, &body, &reply, &type_name, actions);
+                self.api_stream_create(&msg.account, &name, &body, &reply, &type_name, actions);
             }
-            ["STREAM", "INFO", name] => self.api_stream_info(name, &reply, &type_name, actions),
-            ["STREAM", "LIST"] => self.api_stream_list(&body, &reply, &type_name, actions),
-            ["STREAM", "NAMES"] => self.api_stream_names(&body, &reply, &type_name, actions),
-            ["STREAM", "DELETE", name] => self.api_stream_delete(name, &reply, &type_name, actions),
+            ["STREAM", "INFO", name] => {
+                self.api_stream_info(&msg.account, name, &reply, &type_name, actions)
+            }
+            ["STREAM", "LIST"] => {
+                self.api_stream_list(&msg.account, &body, &reply, &type_name, actions)
+            }
+            ["STREAM", "NAMES"] => {
+                self.api_stream_names(&msg.account, &body, &reply, &type_name, actions)
+            }
+            ["STREAM", "DELETE", name] => {
+                self.api_stream_delete(&msg.account, name, &reply, &type_name, actions)
+            }
             ["STREAM", "PURGE", name] => {
-                self.api_stream_purge(name, &body, &reply, &type_name, actions)
+                self.api_stream_purge(&msg.account, name, &body, &reply, &type_name, actions)
             }
             ["STREAM", "MSG", "GET", name] => {
-                self.api_stream_msg_get(name, &body, &reply, &type_name, actions)
+                self.api_stream_msg_get(&msg.account, name, &body, &reply, &type_name, actions)
             }
             ["CONSUMER", "CREATE", stream] | ["CONSUMER", "CREATE", stream, _] => {
                 let from_subject = if parts.len() == 4 {
@@ -991,12 +1034,21 @@ impl Engine {
                 } else {
                     None
                 };
-                self.api_consumer_create(stream, from_subject, &body, &reply, &type_name, actions);
+                self.api_consumer_create(
+                    &msg.account,
+                    stream,
+                    from_subject,
+                    &body,
+                    &reply,
+                    &type_name,
+                    actions,
+                );
             }
             // Legacy durable-create endpoint, used by clients (nats.go)
             // when the server reports a version below 2.9.0.
             ["CONSUMER", "DURABLE", "CREATE", stream, consumer] => {
                 self.api_consumer_create(
+                    &msg.account,
                     stream,
                     Some(consumer.to_string()),
                     &body,
@@ -1006,18 +1058,24 @@ impl Engine {
                 );
             }
             ["CONSUMER", "INFO", stream, consumer] => {
-                self.api_consumer_info(stream, consumer, &reply, &type_name, actions)
+                self.api_consumer_info(&msg.account, stream, consumer, &reply, &type_name, actions)
             }
             ["CONSUMER", "LIST", stream] => {
-                self.api_consumer_list(stream, &body, &reply, &type_name, actions)
+                self.api_consumer_list(&msg.account, stream, &body, &reply, &type_name, actions)
             }
-            ["CONSUMER", "DELETE", stream, consumer] => {
-                self.api_consumer_delete(stream, consumer, &reply, &type_name, actions)
-            }
+            ["CONSUMER", "DELETE", stream, consumer] => self.api_consumer_delete(
+                &msg.account,
+                stream,
+                consumer,
+                &reply,
+                &type_name,
+                actions,
+            ),
             ["CONSUMER", "MSG", "NEXT", stream, consumer] => {
-                self.api_consumer_msg_next(stream, consumer, &body, &reply, actions)
+                self.api_consumer_msg_next(&msg.account, stream, consumer, &body, &reply, actions)
             }
             _ => api_error_action(
+                &msg.account,
                 &reply,
                 &type_name,
                 400,
@@ -1030,6 +1088,7 @@ impl Engine {
 
     fn api_stream_create(
         &mut self,
+        account: &str,
         name: &str,
         body: &Value,
         reply: &str,
@@ -1037,7 +1096,15 @@ impl Engine {
         actions: &mut Vec<Action>,
     ) {
         if !valid_name(name) {
-            api_error_action(reply, type_name, 400, 10002, "invalid stream name", actions);
+            api_error_action(
+                account,
+                reply,
+                type_name,
+                400,
+                10002,
+                "invalid stream name",
+                actions,
+            );
             return;
         }
         let subjects: Vec<String> = body
@@ -1051,6 +1118,7 @@ impl Engine {
             .unwrap_or_default();
         if subjects.is_empty() {
             api_error_action(
+                account,
                 reply,
                 type_name,
                 400,
@@ -1062,6 +1130,7 @@ impl Engine {
         }
         if self.streams.contains_key(name) {
             api_error_action(
+                account,
                 reply,
                 type_name,
                 400,
@@ -1078,6 +1147,7 @@ impl Engine {
             .to_string();
         if retention != "limits" {
             api_error_action(
+                account,
                 reply,
                 type_name,
                 400,
@@ -1094,6 +1164,7 @@ impl Engine {
             .to_string();
         let stream = Stream {
             name: name.to_string(),
+            account: account.to_string(),
             created_ns: now_ns(),
             subjects,
             retention,
@@ -1108,37 +1179,44 @@ impl Engine {
         };
         let info = stream.info_json();
         self.streams.insert(name.to_string(), stream);
-        api_response(reply, type_name, info, actions);
+        api_response(account, reply, type_name, info, actions);
     }
 
     fn api_stream_info(
         &mut self,
+        account: &str,
         name: &str,
         reply: &str,
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        match self.streams.get(name) {
+        match self.stream_for(name, account) {
             Some(stream) => {
                 let info = stream.info_json();
-                api_response(reply, type_name, info, actions);
+                api_response(account, reply, type_name, info, actions);
             }
             None => {
                 let (code, err_code, desc) = err_not_found("stream");
-                api_error_action(reply, type_name, code, err_code, &desc, actions);
+                api_error_action(account, reply, type_name, code, err_code, &desc, actions);
             }
         }
     }
 
     fn api_stream_list(
         &mut self,
+        account: &str,
         body: &Value,
         reply: &str,
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
         let offset = body.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let mut names: Vec<String> = self.streams.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .streams
+            .values()
+            .filter(|s| s.account == account)
+            .map(|s| s.name.clone())
+            .collect();
         names.sort();
         let total = names.len();
         let streams: Vec<Value> = names
@@ -1147,6 +1225,7 @@ impl Engine {
             .filter_map(|n| self.streams.get(n).map(|s| s.info_json()))
             .collect();
         api_response(
+            account,
             reply,
             type_name,
             json!({ "streams": streams, "total": total, "offset": offset, "limit": 1024 }),
@@ -1156,6 +1235,7 @@ impl Engine {
 
     fn api_stream_names(
         &mut self,
+        account: &str,
         body: &Value,
         reply: &str,
         type_name: &str,
@@ -1166,6 +1246,7 @@ impl Engine {
         let mut names: Vec<String> = self
             .streams
             .values()
+            .filter(|s| s.account == account)
             .filter(|s| match subject {
                 Some(subj) => s.subjects.iter().any(|p| subject_matches(p, subj)),
                 None => true,
@@ -1180,6 +1261,7 @@ impl Engine {
             .map(|n| Value::String(n.clone()))
             .collect();
         api_response(
+            account,
             reply,
             type_name,
             json!({ "streams": streams, "total": total, "offset": offset, "limit": 1024 }),
@@ -1189,30 +1271,38 @@ impl Engine {
 
     fn api_stream_delete(
         &mut self,
+        account: &str,
         name: &str,
         reply: &str,
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        if self.streams.remove(name).is_some() {
-            api_response(reply, type_name, json!({ "success": true }), actions);
+        if self.stream_for(name, account).is_some() && self.streams.remove(name).is_some() {
+            api_response(
+                account,
+                reply,
+                type_name,
+                json!({ "success": true }),
+                actions,
+            );
         } else {
             let (code, err_code, desc) = err_not_found("stream");
-            api_error_action(reply, type_name, code, err_code, &desc, actions);
+            api_error_action(account, reply, type_name, code, err_code, &desc, actions);
         }
     }
 
     fn api_stream_purge(
         &mut self,
+        account: &str,
         name: &str,
         body: &Value,
         reply: &str,
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        let Some(stream) = self.streams.get_mut(name) else {
+        let Some(stream) = self.stream_for_mut(name, account) else {
             let (code, err_code, desc) = err_not_found("stream");
-            api_error_action(reply, type_name, code, err_code, &desc, actions);
+            api_error_action(account, reply, type_name, code, err_code, &desc, actions);
             return;
         };
         let filter = body
@@ -1260,6 +1350,7 @@ impl Engine {
             }
         };
         api_response(
+            account,
             reply,
             type_name,
             json!({ "success": true, "purged": purged }),
@@ -1269,15 +1360,16 @@ impl Engine {
 
     fn api_stream_msg_get(
         &mut self,
+        account: &str,
         name: &str,
         body: &Value,
         reply: &str,
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        let Some(stream) = self.streams.get(name) else {
+        let Some(stream) = self.stream_for(name, account) else {
             let (code, err_code, desc) = err_not_found("stream");
-            api_error_action(reply, type_name, code, err_code, &desc, actions);
+            api_error_action(account, reply, type_name, code, err_code, &desc, actions);
             return;
         };
         let found = if let Some(seq) = body.get("seq").and_then(|v| v.as_u64()) {
@@ -1309,19 +1401,28 @@ impl Engine {
                     message["hdrs"] = Value::String(base64_encode(h));
                     message["headers"] = headers_json(h);
                 }
-                api_response(reply, type_name, json!({ "message": message }), actions);
+                api_response(
+                    account,
+                    reply,
+                    type_name,
+                    json!({ "message": message }),
+                    actions,
+                );
             }
             None => {
                 let (code, err_code, desc) = err_not_found("message");
-                api_error_action(reply, type_name, code, err_code, &desc, actions);
+                api_error_action(account, reply, type_name, code, err_code, &desc, actions);
             }
         }
     }
 }
 
 impl Engine {
+    // Account scoping pushed this over clippy's 7-argument default.
+    #[allow(clippy::too_many_arguments)]
     fn api_consumer_create(
         &mut self,
+        account: &str,
         stream_name: &str,
         from_subject: Option<String>,
         body: &Value,
@@ -1329,9 +1430,9 @@ impl Engine {
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        let Some(stream) = self.streams.get_mut(stream_name) else {
+        let Some(stream) = self.stream_for_mut(stream_name, account) else {
             let (code, err_code, desc) = err_not_found("stream");
-            api_error_action(reply, type_name, code, err_code, &desc, actions);
+            api_error_action(account, reply, type_name, code, err_code, &desc, actions);
             return;
         };
         let config = body.get("config").unwrap_or(&Value::Null);
@@ -1351,6 +1452,7 @@ impl Engine {
             .unwrap_or_default();
         if !valid_name(&name) {
             api_error_action(
+                account,
                 reply,
                 type_name,
                 400,
@@ -1362,6 +1464,7 @@ impl Engine {
         }
         if stream.consumers.contains_key(&name) {
             api_error_action(
+                account,
                 reply,
                 type_name,
                 400,
@@ -1443,14 +1546,15 @@ impl Engine {
             .deliver_subject
             .is_some()
         {
-            let stream = self.streams.get_mut(stream_name).unwrap();
+            let stream = self.stream_for_mut(stream_name, account).unwrap();
             drain_push(stream_name, stream, &name, actions);
         }
-        api_response(reply, type_name, info, actions);
+        api_response(account, reply, type_name, info, actions);
     }
 
     fn api_consumer_info(
         &mut self,
+        account: &str,
         stream_name: &str,
         consumer_name: &str,
         reply: &str,
@@ -1464,26 +1568,27 @@ impl Engine {
         {
             Some(consumer) => {
                 let info = consumer.info_json(stream_name);
-                api_response(reply, type_name, info, actions);
+                api_response(account, reply, type_name, info, actions);
             }
             None => {
                 let (code, err_code, desc) = err_not_found("consumer");
-                api_error_action(reply, type_name, code, err_code, &desc, actions);
+                api_error_action(account, reply, type_name, code, err_code, &desc, actions);
             }
         }
     }
 
     fn api_consumer_list(
         &mut self,
+        account: &str,
         stream_name: &str,
         body: &Value,
         reply: &str,
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        let Some(stream) = self.streams.get(stream_name) else {
+        let Some(stream) = self.stream_for(stream_name, account) else {
             let (code, err_code, desc) = err_not_found("stream");
-            api_error_action(reply, type_name, code, err_code, &desc, actions);
+            api_error_action(account, reply, type_name, code, err_code, &desc, actions);
             return;
         };
         let offset = body.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -1496,6 +1601,7 @@ impl Engine {
             .filter_map(|n| stream.consumers.get(n).map(|c| c.info_json(stream_name)))
             .collect();
         api_response(
+            account,
             reply,
             type_name,
             json!({ "consumers": consumers, "total": total, "offset": offset, "limit": 1024 }),
@@ -1505,6 +1611,7 @@ impl Engine {
 
     fn api_consumer_delete(
         &mut self,
+        account: &str,
         stream_name: &str,
         consumer_name: &str,
         reply: &str,
@@ -1517,23 +1624,31 @@ impl Engine {
             .map(|s| s.consumers.remove(consumer_name).is_some())
             .unwrap_or(false);
         if removed {
-            api_response(reply, type_name, json!({ "success": true }), actions);
+            api_response(
+                account,
+                reply,
+                type_name,
+                json!({ "success": true }),
+                actions,
+            );
         } else {
             let (code, err_code, desc) = err_not_found("consumer");
-            api_error_action(reply, type_name, code, err_code, &desc, actions);
+            api_error_action(account, reply, type_name, code, err_code, &desc, actions);
         }
     }
 
     fn api_consumer_msg_next(
         &mut self,
+        account: &str,
         stream_name: &str,
         consumer_name: &str,
         body: &Value,
         reply: &str,
         actions: &mut Vec<Action>,
     ) {
-        let Some(stream) = self.streams.get_mut(stream_name) else {
+        let Some(stream) = self.stream_for_mut(stream_name, account) else {
             api_error_action(
+                account,
                 reply,
                 "io.nats.jetstream.api.v1.consumer_msg_next_response",
                 404,
@@ -1545,6 +1660,7 @@ impl Engine {
         };
         if !stream.consumers.contains_key(consumer_name) {
             api_error_action(
+                account,
                 reply,
                 "io.nats.jetstream.api.v1.consumer_msg_next_response",
                 404,
@@ -1562,6 +1678,7 @@ impl Engine {
             .is_some()
         {
             api_error_action(
+                account,
                 reply,
                 "io.nats.jetstream.api.v1.consumer_msg_next_response",
                 400,
@@ -1625,7 +1742,8 @@ impl Engine {
                 continue;
             }
             let consumer = stream.consumers.get_mut(consumer_name).unwrap();
-            deliver_to_consumer(stream_name, consumer, &m, reply, actions);
+            let account = stream.account.clone();
+            deliver_to_consumer(stream_name, &account, consumer, &m, reply, actions);
             delivered += 1;
         }
         if delivered < batch && !no_wait {
@@ -1667,7 +1785,12 @@ impl Engine {
         let now_ns = now_ns();
         let stream_names: Vec<String> = self.streams.keys().cloned().collect();
         for name in stream_names {
-            let stream = self.streams.get_mut(&name).unwrap();
+            let account = self
+                .streams
+                .get(&name)
+                .map(|s| s.account.clone())
+                .unwrap_or_default();
+            let stream = self.stream_for_mut(&name, &account).unwrap();
             // Max-age eviction.
             if stream.max_age_ns > 0 {
                 let cutoff = now_ns.saturating_sub(stream.max_age_ns as u64);

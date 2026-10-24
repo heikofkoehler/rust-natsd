@@ -11,18 +11,27 @@ pub struct Subscription {
     pub sid: String,
     pub subject: String,
     pub queue: Option<String>,
+    /// Account the subscription belongs to; delivery is scoped to it.
+    pub account: String,
     /// Auto-unsubscribe after this many delivered messages (total).
     pub max_msgs: Option<u64>,
     pub delivered: u64,
 }
 
 impl Subscription {
-    pub fn new(conn_id: u64, sid: String, subject: String, queue: Option<String>) -> Self {
+    pub fn new(
+        conn_id: u64,
+        sid: String,
+        subject: String,
+        queue: Option<String>,
+        account: String,
+    ) -> Self {
         Subscription {
             conn_id,
             sid,
             subject,
             queue,
+            account,
             max_msgs: None,
             delivered: 0,
         }
@@ -90,26 +99,27 @@ impl Sublist {
     }
 
     /// Pattern+queue of one subscription, if it exists.
-    pub fn pattern_of(&self, conn_id: u64, sid: &str) -> Option<(String, Option<String>)> {
+    pub fn pattern_of(&self, conn_id: u64, sid: &str) -> Option<(String, String, Option<String>)> {
         self.subs
             .iter()
             .find(|s| s.conn_id == conn_id && s.sid == sid)
-            .map(|s| (s.subject.clone(), s.queue.clone()))
+            .map(|s| (s.account.clone(), s.subject.clone(), s.queue.clone()))
     }
 
-    /// True when any subscription uses this exact pattern+queue.
-    pub fn has_pattern(&self, subject: &str, queue: Option<&str>) -> bool {
+    /// True when any subscription in `account` uses this exact
+    /// pattern+queue.
+    pub fn has_pattern(&self, subject: &str, queue: Option<&str>, account: &str) -> bool {
         self.subs
             .iter()
-            .any(|s| s.subject == subject && s.queue.as_deref() == queue)
+            .any(|s| s.account == account && s.subject == subject && s.queue.as_deref() == queue)
     }
 
-    /// Distinct (pattern, queue) pairs for one connection.
-    pub fn patterns_for_conn(&self, conn_id: u64) -> Vec<(String, Option<String>)> {
-        let mut out: Vec<(String, Option<String>)> = Vec::new();
+    /// Distinct (account, pattern, queue) triples for one connection.
+    pub fn patterns_for_conn(&self, conn_id: u64) -> Vec<(String, String, Option<String>)> {
+        let mut out: Vec<(String, String, Option<String>)> = Vec::new();
         for s in &self.subs {
             if s.conn_id == conn_id {
-                let key = (s.subject.clone(), s.queue.clone());
+                let key = (s.account.clone(), s.subject.clone(), s.queue.clone());
                 if !out.contains(&key) {
                     out.push(key);
                 }
@@ -125,10 +135,10 @@ impl Sublist {
         self.subs.clone()
     }
 
-    pub fn patterns(&self) -> Vec<(String, Option<String>)> {
-        let mut out: Vec<(String, Option<String>)> = Vec::new();
+    pub fn patterns(&self) -> Vec<(String, String, Option<String>)> {
+        let mut out: Vec<(String, String, Option<String>)> = Vec::new();
         for s in &self.subs {
-            let key = (s.subject.clone(), s.queue.clone());
+            let key = (s.account.clone(), s.subject.clone(), s.queue.clone());
             if !out.contains(&key) {
                 out.push(key);
             }
@@ -163,8 +173,9 @@ impl Sublist {
         subject: &str,
         publisher_conn: u64,
         publisher_echo: bool,
+        account: Option<&str>,
     ) -> MatchResult {
-        let gm = self.match_groups(subject, publisher_conn, publisher_echo);
+        let gm = self.match_groups(subject, publisher_conn, publisher_echo, account);
         let mut deliveries = gm.plain;
         for (_q, members) in gm.groups {
             // Round-robin across the members that matched this message.
@@ -189,9 +200,15 @@ impl Sublist {
         subject: &str,
         publisher_conn: u64,
         publisher_echo: bool,
+        account: Option<&str>,
     ) -> GroupMatch {
         let mut out = GroupMatch::default();
         for sub in &self.subs {
+            if let Some(account) = account {
+                if sub.account != account {
+                    continue;
+                }
+            }
             if !publisher_echo && sub.conn_id == publisher_conn {
                 continue;
             }
@@ -237,7 +254,13 @@ mod tests {
     use super::*;
 
     fn sub(conn: u64, sid: &str, subject: &str, queue: Option<&str>) -> Subscription {
-        Subscription::new(conn, sid.into(), subject.into(), queue.map(|q| q.into()))
+        Subscription::new(
+            conn,
+            sid.into(),
+            subject.into(),
+            queue.map(|q| q.into()),
+            "$G".into(),
+        )
     }
 
     #[test]
@@ -246,7 +269,7 @@ mod tests {
         sl.add(sub(1, "1", "foo", None));
         sl.add(sub(2, "1", "foo", None));
         sl.add(sub(3, "1", "bar", None));
-        let r = sl.match_recipients("foo", 99, true);
+        let r = sl.match_recipients("foo", 99, true, None);
         assert_eq!(r.deliveries.len(), 2);
         assert!(r.deliveries.iter().any(|d| d.conn_id == 1));
         assert!(r.deliveries.iter().any(|d| d.conn_id == 2));
@@ -258,14 +281,24 @@ mod tests {
         sl.add(sub(1, "1", "foo.*", None));
         sl.add(sub(2, "1", "foo.>", None));
         sl.add(sub(3, "1", ">", None));
-        assert_eq!(sl.match_recipients("foo.bar", 99, true).deliveries.len(), 3);
         assert_eq!(
-            sl.match_recipients("foo.bar.baz", 99, true)
+            sl.match_recipients("foo.bar", 99, true, None)
+                .deliveries
+                .len(),
+            3
+        );
+        assert_eq!(
+            sl.match_recipients("foo.bar.baz", 99, true, None)
                 .deliveries
                 .len(),
             2
         );
-        assert_eq!(sl.match_recipients("other", 99, true).deliveries.len(), 1);
+        assert_eq!(
+            sl.match_recipients("other", 99, true, None)
+                .deliveries
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -277,7 +310,7 @@ mod tests {
         sl.add(sub(4, "1", "jobs", None)); // plain sub also receives
         let mut counts = [0usize; 5];
         for _ in 0..99 {
-            let r = sl.match_recipients("jobs", 99, true);
+            let r = sl.match_recipients("jobs", 99, true, None);
             assert_eq!(r.deliveries.len(), 2, "one queue member + plain sub");
             for d in &r.deliveries {
                 counts[d.conn_id as usize] += 1;
@@ -295,7 +328,7 @@ mod tests {
         let mut sl = Sublist::new();
         sl.add(sub(1, "1", "jobs", Some("a")));
         sl.add(sub(2, "1", "jobs", Some("b")));
-        let r = sl.match_recipients("jobs", 99, true);
+        let r = sl.match_recipients("jobs", 99, true, None);
         assert_eq!(r.deliveries.len(), 2);
     }
 
@@ -305,22 +338,25 @@ mod tests {
         let mut s = sub(1, "1", "foo", None);
         s.max_msgs = Some(2);
         sl.add(s);
-        let r1 = sl.match_recipients("foo", 99, true);
+        let r1 = sl.match_recipients("foo", 99, true, None);
         assert_eq!(r1.deliveries.len(), 1);
         assert!(r1.expired.is_empty());
-        let r2 = sl.match_recipients("foo", 99, true);
+        let r2 = sl.match_recipients("foo", 99, true, None);
         assert_eq!(r2.deliveries.len(), 1);
         assert_eq!(r2.expired, vec![(1, "1".to_string())]);
         sl.remove(1, "1");
-        assert_eq!(sl.match_recipients("foo", 99, true).deliveries.len(), 0);
+        assert_eq!(
+            sl.match_recipients("foo", 99, true, None).deliveries.len(),
+            0
+        );
     }
 
     #[test]
     fn set_max_removes_when_already_reached() {
         let mut sl = Sublist::new();
         sl.add(sub(1, "1", "foo", None));
-        let _ = sl.match_recipients("foo", 99, true);
-        let _ = sl.match_recipients("foo", 99, true);
+        let _ = sl.match_recipients("foo", 99, true, None);
+        let _ = sl.match_recipients("foo", 99, true, None);
         assert!(
             sl.set_max(1, "1", 2),
             "delivered 2 >= max 2 removes at once"
@@ -338,13 +374,19 @@ mod tests {
         sl.add(sub(1, "1", "foo", None));
         sl.add(sub(1, "1", "bar", None)); // replaces
         assert_eq!(sl.len(), 1);
-        assert_eq!(sl.match_recipients("foo", 99, true).deliveries.len(), 0);
-        assert_eq!(sl.match_recipients("bar", 99, true).deliveries.len(), 1);
+        assert_eq!(
+            sl.match_recipients("foo", 99, true, None).deliveries.len(),
+            0
+        );
+        assert_eq!(
+            sl.match_recipients("bar", 99, true, None).deliveries.len(),
+            1
+        );
         sl.add(sub(2, "1", "bar", None));
         sl.remove_conn(1);
         assert_eq!(sl.len(), 1);
         assert_eq!(
-            sl.match_recipients("bar", 99, true).deliveries[0].conn_id,
+            sl.match_recipients("bar", 99, true, None).deliveries[0].conn_id,
             2
         );
     }
@@ -354,10 +396,10 @@ mod tests {
         let mut sl = Sublist::new();
         sl.add(sub(1, "1", "foo", None));
         sl.add(sub(2, "1", "foo", None));
-        let r = sl.match_recipients("foo", 1, false);
+        let r = sl.match_recipients("foo", 1, false, None);
         assert_eq!(r.deliveries.len(), 1);
         assert_eq!(r.deliveries[0].conn_id, 2);
-        let r = sl.match_recipients("foo", 1, true);
+        let r = sl.match_recipients("foo", 1, true, None);
         assert_eq!(r.deliveries.len(), 2);
     }
 }

@@ -9,8 +9,8 @@
 //!   both:     RS+ $G <subject> [queue weight] for every local subscription
 //!
 //! Message framing (account is `$G` for the default account, `$SYS` for the
-//! system account; this server is single-account, so the account token is
-//! accepted and otherwise ignored):
+//! system account; the account token is the message's account and is
+//! used to scope delivery on the receiving node):
 //!   RS+ $G <subject> [queue weight]   RS- $G <subject> [queue]
 //!   RMSG $G <subject> [reply] [| queue...] <size>
 //!   HMSG $G <subject> [reply] <hdr_len> <total_len>   (headers, like client
@@ -336,31 +336,32 @@ pub fn route_connect_json(server_id: &str, cluster_name: &str) -> String {
     .to_string()
 }
 
-/// Encode `RS+ $G <subject> [queue weight]`.
-pub fn encode_rs_plus(subject: &str, queue: Option<&str>) -> Bytes {
+/// Encode `RS+ <account> <subject> [queue weight]`.
+pub fn encode_rs_plus(account: &str, subject: &str, queue: Option<&str>) -> Bytes {
     match queue {
-        Some(q) => Bytes::from(format!("RS+ $G {subject} {q} 1\r\n")),
-        None => Bytes::from(format!("RS+ $G {subject}\r\n")),
+        Some(q) => Bytes::from(format!("RS+ {account} {subject} {q} 1\r\n")),
+        None => Bytes::from(format!("RS+ {account} {subject}\r\n")),
     }
 }
 
-/// Encode `RS- $G <subject> [queue]`.
-pub fn encode_rs_minus(subject: &str, queue: Option<&str>) -> Bytes {
+/// Encode `RS- <account> <subject> [queue]`.
+pub fn encode_rs_minus(account: &str, subject: &str, queue: Option<&str>) -> Bytes {
     match queue {
-        Some(q) => Bytes::from(format!("RS- $G {subject} {q}\r\n")),
-        None => Bytes::from(format!("RS- $G {subject}\r\n")),
+        Some(q) => Bytes::from(format!("RS- {account} {subject} {q}\r\n")),
+        None => Bytes::from(format!("RS- {account} {subject}\r\n")),
     }
 }
 
 /// Encode a routed plain message. Queue groups, when present, are listed
 /// after a `|` marker, as Go sends them.
 pub fn encode_rmsg(
+    account: &str,
     subject: &str,
     reply_to: Option<&str>,
     queues: &[String],
     payload: &[u8],
 ) -> Bytes {
-    let mut line = format!("RMSG $G {subject}");
+    let mut line = format!("RMSG {account} {subject}");
     if let Some(r) = reply_to {
         line.push(' ');
         line.push_str(r);
@@ -382,13 +383,14 @@ pub fn encode_rmsg(
 /// Encode a routed header message (Go's route form: HMSG with account and
 /// no subscription id).
 pub fn encode_route_hmsg(
+    account: &str,
     subject: &str,
     reply_to: Option<&str>,
     headers: &[u8],
     payload: &[u8],
 ) -> Bytes {
     let total = headers.len() + payload.len();
-    let mut line = format!("HMSG $G {subject}");
+    let mut line = format!("HMSG {account} {subject}");
     if let Some(r) = reply_to {
         line.push(' ');
         line.push_str(r);

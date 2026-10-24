@@ -305,24 +305,21 @@ async fn tls_verify_requires_client_certificate() {
                 client.stream.read(&mut buf),
             )
             .await;
-            match read {
-                Ok(Ok(n)) => {
-                    assert!(
-                        !buf[..n].starts_with(b"INFO"),
-                        "client without a certificate must never see INFO"
-                    );
-                    // Alert bytes are fine; the connection must then close.
-                    let read2 = tokio::time::timeout(
-                        std::time::Duration::from_secs(3),
-                        client.stream.read(&mut buf),
-                    )
-                    .await;
-                    assert!(
-                        matches!(read2, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
-                        "connection should close after rejection, got {read2:?}"
-                    );
-                }
-                Ok(Err(_)) | Err(_) => {}
+            if let Ok(Ok(n)) = read {
+                assert!(
+                    !buf[..n].starts_with(b"INFO"),
+                    "client without a certificate must never see INFO"
+                );
+                // Alert bytes are fine; the connection must then close.
+                let read2 = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    client.stream.read(&mut buf),
+                )
+                .await;
+                assert!(
+                    matches!(read2, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
+                    "connection should close after rejection, got {read2:?}"
+                );
             }
         }
     }
