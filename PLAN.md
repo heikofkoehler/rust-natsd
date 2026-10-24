@@ -201,6 +201,35 @@ KV/object-store client helpers (their server-side primitives exist).
   persistence PASS; cluster/leaf smoke PASS); see
   `parity/KNOWN_DIFFS.md` for the per-area results.
 
+### Phase 18 — Slow-consumer fix (writer batching + byte-based pending limit)
+- Diagnosis (2026-10-24 benchmark): a burst publisher enqueued far
+  faster than the per-connection writer drained (one `write_all`
+  syscall per frame, ~100-200k small frames/s), so the old 1024-frame
+  queue filled after only ~100 deliveries to a fast reader, which was
+  then dropped as a "slow consumer". Go, by contrast, batches its
+  outbound writes, stalls the producer under pending pressure, and
+  drops only after a 10 s write deadline (never-reading subscriber
+  probe: Go dropped at ~424k published 256 B messages; Rust dropped
+  at ~254k enqueued frames once the limit below was in place).
+- Fix, in `src/server.rs`: the writer coalesces queued frames into
+  64 KiB batched socket writes; the frame-count bound is replaced by
+  a Go-like bytes-based pending limit, `Config::max_pending`
+  (default 64 MiB, Go's `max_pending` default), configurable via
+  `--max-pending` / .conf `max_pending`, reported in `/varz` as
+  `max_pending` and per-connection in `/connz` as `pending_bytes`.
+  Reserved on enqueue (CAS) in `try_send`, released by the writer
+  after a successful write. A fast reader at bench rates is not
+  dropped; a never-reading reader still is, at the byte limit. No
+  publisher-side backpressure was needed, so parity semantics are
+  unchanged (Go drops slow consumers; so does rust-natsd). The
+  connection registry lock in `send_local_frames` is now taken once
+  per message batch of deliveries, not once per delivery.
+- Tests: `burst_to_fast_reader_not_dropped` (50k x 256 B to a fast
+  reader, all delivered, connection alive) and
+  `never_reading_subscriber_dropped_at_byte_limit` (4 KiB limit,
+  5000 x 256 B to a never-reading subscriber, connection closed)
+  in `tests/e2e_raw.rs`.
+
 ## Future work (not in this plan)
 - Gateways, JetStream clustering/replication, mirroring/sourcing,
   MQTT/WebSocket gateways, JWT operator mode, route/leaf TLS,

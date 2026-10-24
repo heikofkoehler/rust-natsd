@@ -75,7 +75,7 @@ rust-natsd does; it replaces the older support table.
 | Leaf nodes | Implemented | Hub accept + solicited leaf, LS+/LS-, LMSG/HMSG, reconnect |
 | Server-initiated PING / stale connection | Implemented | `--ping-interval` / `--ping-max` (Go defaults 2m/2); close with `-ERR 'Stale Connection'` |
 | No-responders 503 | Implemented | HMSG 503 when the publisher set `no_responders` and a publish with a reply subject has no deliveries |
-| Slow-consumer detection | Implemented | Bounded outbound queue (1024 frames) → disconnect. Note: this bound is low enough that a burst publisher trips it — see [Benchmarks](#benchmarks) |
+| Slow-consumer detection | Implemented | Byte-based pending limit (default 64 MiB, `--max-pending` / .conf `max_pending`, reported in `/varz` as `max_pending` and per-connection in `/connz` as `pending_bytes`) → disconnect when exceeded. A fast reader at bench rates is not dropped; a never-reading reader is, like Go |
 | Graceful shutdown on SIGINT/SIGTERM | Implemented | Writer flushes pending frames (e.g. a final `-ERR`) before close |
 | JetStream: streams, pull + push consumers | Implemented | In-memory, or file-persisted with `--js-store-dir` |
 | JetStream: ack policies (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | Implemented | |
@@ -134,17 +134,19 @@ exactly one place: it implements `/subz` and `/accounz`, which Go
 
 **Maturity and operations — not claimed production-ready.** This is
 a from-scratch reimplementation, not a hardened production server:
-no JetStream clustering (so no JS high availability), no
-production-hardening claims, and one benchmark-exposed limitation
-(see below): the bounded outbound queue (1024 frames) drops a
-subscriber as a slow consumer under a burst publisher, where Go
-absorbs the same burst. Do not run this as a drop-in replacement for
+no JetStream clustering (so no JS high availability) and no
+production-hardening claims. The benchmark-exposed slow-consumer
+drop (below) is fixed: the outbound path now batches socket writes
+and enforces a Go-comparable byte-based pending limit instead of a
+1024-frame queue. Do not run this as a drop-in replacement for
 mainline in production without weighing that list.
 
 **Architecture.** Tokio async runtime, a hand-rolled incremental
 protocol parser (no I/O in the parser, which is what makes
 split-at-every-byte tests possible), one reader + one writer task per
-connection joined by a bounded channel, and `#![forbid(unsafe_code)]`
+connection joined by a byte-limited queue (the writer coalesces
+queued frames into 64 KiB batched socket writes), and
+`#![forbid(unsafe_code)]`
 — no unsafe code anywhere. No Go runtime, no vendored Go code; the
 protocol, subject matching, routing, leaf, JetStream, TLS
 (rustls/ring), and monitoring layers are all written for this
@@ -176,52 +178,43 @@ which would dominate the JetStream scenario; Go's `-sd` then holds
 only JetStream metadata for a memory stream, so both message paths
 are in-memory.
 
-**Results — 2026-10-24.** Go `nats-server` v2.15.1 vs rust-natsd
-server code at commit `e752c9c` (the parity-green HEAD at benchmark
-time; the bench harness is new in this commit and does not change
-server behaviour). Machine:
+**Results — 2026-10-24 (post slow-consumer fix).** Go `nats-server`
+v2.15.1 vs rust-natsd server code at the fix commit (the HEAD at
+benchmark time; the bench harness does not change server behaviour).
+Machine:
 Linux x86_64, AMD EPYC 9D64, 2 vCPUs, Go 1.27.3, rustc 1.98.1.
 
 | Scenario | Go nats-server v2.15.1 (median [range]) | rust-natsd (median [range]) |
 |---|---|---|
-| Core pub/sub, 256 B, 200k msgs (msgs/s) | 639,635 [586,290..686,963] | **FAILED** — see below |
-| Core pub/sub, 1 KiB, 200k msgs (msgs/s) | 295,161 [286,663..302,366] | **FAILED** — see below |
-| Request/reply, 256 B, 20k requests (mean / p50 / p99 µs) | 300 / 274 / 860 | 195 / 181 / 434 |
-| JetStream publish with ack, 1 KiB, 20k msgs (msgs/s) | 5,257 [5,199..5,535] | 6,274 [6,256..6,567] |
+| Core pub/sub, 256 B, 200k msgs (msgs/s) | 497,531 [411,559..636,226] | 418,910 [359,904..431,465] |
+| Core pub/sub, 1 KiB, 200k msgs (msgs/s) | 282,695 [244,584..306,766] | 226,910 [222,978..227,694] |
+| Request/reply, 256 B, 20k requests (mean / p50 / p99 µs) | 320 / 293 / 1,001 | 196 / 180 / 537 |
+| JetStream publish with ack, 1 KiB, 20k msgs (msgs/s) | 5,249 [5,096..5,558] | 8,019 [7,941..8,053] |
 
-**Read it plainly.** On request/reply latency and JetStream publish
-throughput, rust-natsd is faster in this run (lower latency, higher
-msgs/s) — that is a localhost, single-client, uncontended result, not
-a general performance claim. On core pub/sub throughput, rust-natsd
-does not finish at all: in all 6 attempts per full bench run (3 runs
-× 2 sizes), the subscriber was dropped as a slow consumer after
-only 1–500 of 200,000 deliveries reached the client, and the run
-timed out. The cause is confirmed independently of the benchmark
-client: a raw fast-reading subscriber sees the same drop, the server
-log prints `slow consumer, dropping connection`, and `/varz`
-reports `slow_consumers: 1`. The mechanism is the 1024-frame bounded
-outbound queue in `src/server.rs` — a burst publisher outruns the
-per-connection writer, the queue fills, and the subscriber is
-disconnected, by design but with a bound far below what Go absorbs
-at these message counts. That is a real limitation, not a benchmark
-artifact, and it is **not fixed** as part of this README/benchmark
-work (server behaviour is out of scope here); it needs a separate
-decision (larger/dynamic pending limits, or backpressure instead of
-drop) before any pub/sub throughput claim can be made for rust-natsd.
+**Read it plainly.** All four scenarios now complete on both
+servers. On core pub/sub throughput rust-natsd is ~15–20% behind Go
+in this run (418,910 vs 497,531 msgs/s at 256 B; 226,910 vs 282,695
+at 1 KiB) — the gap is writer/parse throughput, not drops. On
+request/reply latency and JetStream publish throughput, rust-natsd
+is faster here (lower latency, higher msgs/s) — that is a localhost,
+single-client, uncontended result, not a general performance claim,
+and the JetStream gain vs the pre-fix run (6,274 → 8,019 msgs/s)
+tracks the batched writer, since JS acks and deliveries go through
+the same outbound path. Request/reply is unchanged vs the pre-fix
+run (mean 195 → 196 µs): no regression from the fix. For history:
+before the fix, rust-natsd pub/sub **failed** in all attempts
+(subscriber dropped as a slow consumer after 1–500 of 200,000
+deliveries) because of the old 1024-frame outbound queue; that
+failure mode is gone, and a never-reading subscriber is still
+dropped at the 64 MiB byte limit (see PLAN Phase 18).
 
-**Repeatability.** A second full `bench.sh` run the same day
-reproduced the pattern: Go pub/sub 624,700 [402,795..652,805] (256 B)
-and 316,907 [279,466..318,750] (1 KiB) msgs/s; Go request/reply mean
-312 µs, p50 278 µs, p99 1,059 µs; Go JetStream 5,382
-[5,174..5,497] msgs/s; Rust request/reply mean 198 µs, p50 177 µs,
-p99 558 µs; Rust JetStream 6,547 [6,337..6,642] msgs/s; Rust pub/sub
-failed again in all 6 attempts. No stray servers were left running
-after either run (verified by process and port check).
+**Repeatability.** No stray servers were left running after the run
+(verified by process and port check).
 
 ## Tests
 
 ```sh
-cargo test                    # 98 Rust tests (unit + integration)
+cargo test                    # 100 Rust tests (unit + integration)
 bash scripts/e2e-go.sh        # Go client core e2e
 bash scripts/e2e-go-cluster.sh  # Go <-> Rust route interop, both seed directions
 bash scripts/e2e-go-leaf.sh     # Go <-> Rust leaf interop, both directions
@@ -314,7 +307,9 @@ handled in the implementation:
   queue groups, auto-unsub accounting, echo filtering) happens under a
   short lock, writes to sockets happen outside it.
 - `src/server.rs` — Tokio listener; one reader task and one writer task per
-  connection connected by a bounded channel (the slow-consumer bound). The
+  connection connected by a byte-limited queue (default 64 MiB pending,
+  the slow-consumer bound; the writer coalesces queued frames into
+  64 KiB batched socket writes). The
   writer holds no channel sender, so closing a connection flushes pending
   frames (like a final `-ERR`) before the socket closes. Global queue
   selection across local members, routes, and leafs lives in `deliver()`.
@@ -328,7 +323,8 @@ handled in the implementation:
 - `src/tls.rs` — rustls (ring) TLS server config for client connections.
 - `src/monitor.rs` — hand-rolled HTTP/1.1 monitoring server (one request
   per connection, then close). Only tracked fields are filled in;
-  untracked ones (memory, RTT, pending bytes) report 0.
+  untracked ones (memory, RTT) report 0. Per-connection pending bytes
+  are tracked (`/connz` `pending_bytes`).
 - `src/conf.rs` — `.conf` parser (blocks, lists, quoted strings,
   comments, URLs intact).
 - `src/config.rs` — CLI and CONNECT authorization.

@@ -3,6 +3,10 @@
 use crate::protocol::DEFAULT_MAX_PAYLOAD;
 use crate::subject::subject_matches;
 
+/// Default queued-outbound limit per connection, matching Go
+/// `nats-server`'s default `max_pending` (64 MiB).
+pub const DEFAULT_MAX_PENDING: usize = 64 * 1024 * 1024;
+
 /// Subject permissions for one user (or one account, as a default).
 /// Each field is `Option`: absent means "no restriction on this axis"
 /// (allow-all for that axis, except denies, which always win). Present
@@ -147,6 +151,12 @@ pub struct Config {
     pub port: u16,
     pub name: String,
     pub max_payload: usize,
+    /// Maximum queued outbound bytes per connection before the
+    /// connection is dropped as a slow consumer (Go's `max_pending`,
+    /// default 64 MiB). This is a *bytes* limit, not a frame count: a
+    /// burst of small messages must not be dropped at an arbitrary
+    /// frame count while the writer is still draining.
+    pub max_pending: usize,
     pub user: Option<String>,
     pub pass: Option<String>,
     pub auth_token: Option<String>,
@@ -194,6 +204,7 @@ impl Default for Config {
             port: 4222,
             name: "rust-natsd".to_string(),
             max_payload: DEFAULT_MAX_PAYLOAD,
+            max_pending: DEFAULT_MAX_PENDING,
             user: None,
             pass: None,
             auth_token: None,
@@ -365,6 +376,7 @@ impl Config {
                 }
                 "-n" | "--name" => cfg.name = next(&mut i)?,
                 "--max-payload" => cfg.max_payload = parse_size(&next(&mut i)?)?,
+                "--max-pending" => cfg.max_pending = parse_size(&next(&mut i)?)?,
                 "--ping-interval" => cfg.ping_interval = parse_duration(&next(&mut i)?)?,
                 "--ping-max" => {
                     cfg.ping_max = next(&mut i)?
@@ -447,6 +459,7 @@ impl Config {
          \x20   -p, --port <PORT>       Client port (default 4222)\n\
          \x20   -n, --name <NAME>       Server name (default rust-natsd)\n\
          \x20   --max-payload <SIZE>    Max payload, e.g. 1048576, 512k, 8mb (default 1mb)\n\
+         \x20   --max-pending <SIZE>    Queued outbound bytes per conn before slow-consumer drop (default 64mb)\n\
          \x20   --ping-interval <DUR>   Server PING interval, e.g. 200ms, 2m (default 2m)\n\
          \x20   --ping-max <N>          Missed PONGs before stale close (default 2)\n\
          \x20   --user <USER>           Require this username for CONNECT\n\

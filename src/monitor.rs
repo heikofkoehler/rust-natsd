@@ -194,6 +194,7 @@ fn varz(shared: &Shared) -> Value {
         "out_bytes": stats.out_bytes.load(Ordering::Relaxed),
         "subscriptions": subs,
         "slow_consumers": stats.slow_consumers.load(Ordering::Relaxed),
+        "max_pending": shared.config.max_pending,
     });
     if let Some(js) = &shared.jetstream {
         body["jetstream"] = json!({
@@ -233,14 +234,15 @@ fn connz(shared: &Shared, query: &str) -> Value {
             Some((ip, port)) => (ip.to_string(), port.parse::<u16>().unwrap_or(0)),
             None => (info.addr.clone(), 0),
         };
-        let (in_msgs, out_msgs, in_bytes, out_bytes) = match handles.get(&info.id) {
+        let (in_msgs, out_msgs, in_bytes, out_bytes, pending_bytes) = match handles.get(&info.id) {
             Some(h) => (
                 h.in_msgs.load(Ordering::Relaxed),
                 h.out_msgs.load(Ordering::Relaxed),
                 h.in_bytes.load(Ordering::Relaxed),
                 h.out_bytes.load(Ordering::Relaxed),
+                h.pending_bytes.load(Ordering::Relaxed),
             ),
-            None => (0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0),
         };
         let sub_list: Vec<String> = subs
             .patterns_for_conn(info.id)
@@ -264,7 +266,7 @@ fn connz(shared: &Shared, query: &str) -> Value {
             ),
             "uptime": go_duration(info.started.elapsed()),
             "idle": 0,
-            "pending_bytes": 0,
+            "pending_bytes": pending_bytes,
             "in_msgs": in_msgs,
             "out_msgs": out_msgs,
             "in_bytes": in_bytes,

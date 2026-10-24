@@ -484,6 +484,13 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
             _ => return Err("max_payload must be a number or size".to_string()),
         };
     }
+    if let Some(v) = lookup(&top, "max_pending") {
+        cfg.max_pending = match &v {
+            Value::Num(n) if *n >= 0 => *n as usize,
+            Value::Str(s) => parse_size(s)?,
+            _ => return Err("max_pending must be a number or size".to_string()),
+        };
+    }
     // Go .conf durations: a string is a Go duration ("200ms"), a number
     // is nanoseconds (Go's time.Duration representation).
     if let Some(v) = lookup(&top, "ping_interval") {

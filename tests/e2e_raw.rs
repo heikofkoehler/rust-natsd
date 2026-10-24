@@ -362,3 +362,64 @@ async fn many_concurrent_clients_fanout() {
     }
     srv.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn burst_to_fast_reader_not_dropped() {
+    // Regression for the 2026-10-24 benchmark failure: a 1024-frame
+    // outbound queue dropped a fast reader after ~100 deliveries of a
+    // 200k burst. With the byte-based pending limit (default 64 MiB)
+    // and a batched writer, the full burst must arrive.
+    let srv = start_server(test_config()).await;
+    let mut sub = RawClient::connect(srv.addr, "{}").await;
+    sub.send_sync("SUB bench 1\r\n").await;
+    let mut pubc = RawClient::connect(srv.addr, "{}").await;
+    let frame = format!("PUB bench 256\r\n{}\r\n", "x".repeat(256));
+    let batch = frame.repeat(1000);
+    for _ in 0..50 {
+        pubc.send(&batch).await;
+    }
+    for _ in 0..50_000 {
+        let (_, payload) = sub.read_msg().await;
+        assert_eq!(payload.len(), 256);
+    }
+    // Still connected afterwards: PING must still be answered.
+    sub.send("PING\r\n").await;
+    assert_eq!(sub.read_line().await, "PONG");
+    srv.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn never_reading_subscriber_dropped_at_byte_limit() {
+    // The byte limit must still drop a subscriber that never reads:
+    // with a 4 KiB limit, 5000 x 256 B publishes (~1.28 MB, far above
+    // the kernel socket buffer plus the limit) must close it.
+    let mut cfg = test_config();
+    cfg.max_pending = 4096;
+    let srv = start_server(cfg).await;
+    let mut sub = RawClient::connect(srv.addr, "{}").await;
+    sub.send_sync("SUB bench 1\r\n").await;
+    // Deliberately never read from `sub` after this point.
+    let mut pubc = RawClient::connect(srv.addr, "{}").await;
+    let frame = format!("PUB bench 256\r\n{}\r\n", "x".repeat(256));
+    let batch = frame.repeat(1000);
+    for _ in 0..5 {
+        pubc.send(&batch).await;
+    }
+    // Drain whatever the server already wrote, then expect EOF: the
+    // server closes a slow consumer, it does not keep it open.
+    let mut buf = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut closed = false;
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(500), sub.reader.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                closed = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => continue,
+        }
+    }
+    assert!(closed, "never-reading subscriber was not dropped");
+    srv.shutdown().await.unwrap();
+}

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,9 +40,21 @@ use crate::route::{
 };
 use crate::sublist::{Sublist, Subscription};
 
-/// Bounded per-connection outbound queue. A subscriber that cannot keep up
-/// (queue full) is disconnected as a slow consumer, like `nats-server`.
-const OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
+/// Bytes the writer coalesces into a single socket write. The old code
+/// did one `write_all` syscall per frame, so the writer drained at
+/// ~100-200k small frames/s while a burst publisher enqueued far faster,
+/// and the 1024-frame queue filled after only ~100 deliveries to a fast
+/// reader. Batching is what lets the writer keep up with a burst (Go
+/// batches through its outbound buffer the same way).
+const WRITE_BATCH_BYTES: usize = 64 * 1024;
+
+/// The channel itself is effectively unbounded (capacity 2^30 frames):
+/// the real bound is the per-connection *byte* limit enforced in
+/// `try_send` (`Config::max_pending`, default 64 MiB, Go's `max_pending`
+/// default). A frame-count cap would bind first for small frames — a
+/// 1024-frame cap is only ~280 KiB at 256 B payloads — which is exactly
+/// how fast readers were dropped as "slow consumers" under bursts.
+const OUTBOUND_CHANNEL_CAPACITY: usize = 1 << 30;
 
 /// A message in flight: subject, optional reply, optional raw header block
 /// (starts with `NATS/1.0\r\n`, ends with `\r\n\r\n`), payload.
@@ -131,10 +143,21 @@ pub(crate) struct ConnHandle {
     pub(crate) out_bytes: AtomicU64,
     /// PINGs sent by the server ping task without a PONG reply.
     pub(crate) ping_missed: AtomicU64,
+    /// Queued outbound bytes, reserved in `try_send` and released by
+    /// the writer after a successful write. Kept as a separate Arc so
+    /// the writer task can own it without owning the handle (which
+    /// holds a channel sender; the writer holding one would keep the
+    /// channel open forever). Control frames sent directly on `tx`
+    /// (a connection's own +OK/PONG/-ERR) are not reserved, so this
+    /// slightly undercounts; they are a handful of bytes per round
+    /// trip and the decrement below saturates rather than underflowing.
+    pub(crate) pending_bytes: Arc<AtomicUsize>,
+    /// Byte limit for `pending_bytes`; see `Config::max_pending`.
+    pub(crate) max_pending: usize,
 }
 
 impl ConnHandle {
-    fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
+    fn new(tx: mpsc::Sender<Bytes>, max_pending: usize) -> Arc<Self> {
         Arc::new(ConnHandle {
             tx,
             headers: Arc::new(AtomicBool::new(false)),
@@ -145,6 +168,8 @@ impl ConnHandle {
             out_msgs: AtomicU64::new(0),
             out_bytes: AtomicU64::new(0),
             ping_missed: AtomicU64::new(0),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            max_pending,
         })
     }
     fn mark_closed(&self) {
@@ -577,9 +602,10 @@ where
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOUND_CHANNEL_CAPACITY);
-    let handle = ConnHandle::new(tx.clone());
+    let handle = ConnHandle::new(tx.clone(), shared.config.max_pending);
     let closed = handle.closed.clone();
     let close = handle.close.clone();
+    let pending = handle.pending_bytes.clone();
     let shutdown = shared.shutdown.clone();
     tokio::spawn(async move {
         let shutdown = shutdown.notified();
@@ -590,8 +616,11 @@ where
             }
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Some(bytes) => {
-                        if writer.write_all(&bytes).await.is_err() {
+                    Some(first) => {
+                        if write_batch(&mut writer, &mut rx, &pending, Some(first))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -600,16 +629,22 @@ where
                 // On close/shutdown, drain any queued frames first so a
                 // final -ERR (e.g. 'Stale Connection') is not lost.
                 _ = close.notified() => {
-                    while let Ok(bytes) = rx.try_recv() {
-                        if writer.write_all(&bytes).await.is_err() {
+                    while let Ok(first) = rx.try_recv() {
+                        if write_batch(&mut writer, &mut rx, &pending, Some(first))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
                     break;
                 }
                 _ = &mut shutdown => {
-                    while let Ok(bytes) = rx.try_recv() {
-                        if writer.write_all(&bytes).await.is_err() {
+                    while let Ok(first) = rx.try_recv() {
+                        if write_batch(&mut writer, &mut rx, &pending, Some(first))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -622,17 +657,91 @@ where
     (handle, tx)
 }
 
-/// Send a frame to a connection's queue. Returns false when the queue is
-/// full (slow consumer) or closed.
+/// Write `first` plus whatever else is already queued, coalesced into
+/// as few socket writes as possible (one batch of up to
+/// WRITE_BATCH_BYTES). Returns the bytes written; the writer releases
+/// that many pending bytes. Saturating so unreserved control frames
+/// cannot underflow the counter.
+async fn write_batch<W>(
+    writer: &mut W,
+    rx: &mut mpsc::Receiver<Bytes>,
+    pending: &AtomicUsize,
+    first: Option<Bytes>,
+) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(first) = first else {
+        return Ok(());
+    };
+    let mut buf = Vec::with_capacity(first.len().min(WRITE_BATCH_BYTES));
+    buf.extend_from_slice(&first);
+    let mut total = first.len();
+    while total < WRITE_BATCH_BYTES {
+        match rx.try_recv() {
+            Ok(frame) => {
+                total += frame.len();
+                buf.extend_from_slice(&frame);
+            }
+            Err(_) => break,
+        }
+    }
+    writer.write_all(&buf).await?;
+    // Release pending bytes (saturating: see ConnHandle::pending_bytes).
+    let mut cur = pending.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_sub(total);
+        match pending.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+    Ok(())
+}
+
+/// Send a frame to a connection's queue. Returns false when the queued
+/// byte limit (`max_pending`) would be exceeded (slow consumer) or the
+/// channel is closed. The byte reservation is released by the writer
+/// after a successful write, or here if the enqueue itself fails.
 fn try_send(handle: &ConnHandle, frame: Bytes) -> bool {
-    let n = frame.len() as u64;
+    let n = frame.len();
+    let mut cur = handle.pending_bytes.load(Ordering::Relaxed);
+    loop {
+        if cur + n > handle.max_pending {
+            return false;
+        }
+        match handle.pending_bytes.compare_exchange_weak(
+            cur,
+            cur + n,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
     match handle.tx.try_send(frame) {
         Ok(()) => {
             handle.out_msgs.fetch_add(1, Ordering::Relaxed);
-            handle.out_bytes.fetch_add(n, Ordering::Relaxed);
+            handle.out_bytes.fetch_add(n as u64, Ordering::Relaxed);
             true
         }
-        Err(_) => false,
+        Err(_) => {
+            let mut cur = handle.pending_bytes.load(Ordering::Relaxed);
+            loop {
+                let next = cur.saturating_sub(n);
+                match handle.pending_bytes.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+            false
+        }
     }
 }
 
@@ -853,10 +962,18 @@ pub fn deliver(
 }
 
 /// Send MSG/HMSG frames for local deliveries, dropping slow consumers.
+/// The connection registry is locked once for all targets, not once
+/// per message: at burst rates a per-message lock was measurable
+/// contention on the publisher thread.
 fn send_local_frames(shared: &Arc<Shared>, msg: &Message, deliveries: &[crate::sublist::Delivery]) {
-    for d in deliveries {
-        let target = shared.conns.lock().unwrap().get(&d.conn_id).cloned();
-        let Some(target) = target else { continue };
+    let targets: Vec<(crate::sublist::Delivery, Arc<ConnHandle>)> = {
+        let conns = shared.conns.lock().unwrap();
+        deliveries
+            .iter()
+            .filter_map(|d| conns.get(&d.conn_id).cloned().map(|h| (d.clone(), h)))
+            .collect()
+    };
+    for (d, target) in targets {
         let frame = match &msg.headers {
             Some(h) if target.headers.load(Ordering::SeqCst) => encode_hmsg(
                 &msg.subject,
