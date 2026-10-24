@@ -6,7 +6,7 @@
 //! The parser is a pure state machine over an internal buffer — no I/O — so
 //! it can be unit-tested by feeding input split at arbitrary byte offsets.
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 /// Maximum length of a control line (op line) we accept before payload.
@@ -314,9 +314,7 @@ impl Parser {
                             max: Some(max),
                         }))
                     }
-                    _ => Err(ParseError::InvalidArgs(
-                        "UNSUB expects sid [max]".into(),
-                    )),
+                    _ => Err(ParseError::InvalidArgs("UNSUB expects sid [max]".into())),
                 }
             }
             other => Err(ParseError::UnknownOperation(other.to_string())),
@@ -368,9 +366,8 @@ pub fn encode_info(info: &ServerInfo) -> Bytes {
 pub fn encode_msg(subject: &str, sid: &str, reply_to: Option<&str>, payload: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(payload.len() + subject.len() + sid.len() + 32);
     match reply_to {
-        Some(r) => out.extend_from_slice(
-            format!("MSG {subject} {sid} {r} {}\r\n", payload.len()).as_bytes(),
-        ),
+        Some(r) => out
+            .extend_from_slice(format!("MSG {subject} {sid} {r} {}\r\n", payload.len()).as_bytes()),
         None => {
             out.extend_from_slice(format!("MSG {subject} {sid} {}\r\n", payload.len()).as_bytes())
         }
@@ -543,7 +540,9 @@ mod tests {
     #[test]
     fn split_at_every_byte() {
         let mut input = Vec::new();
-        input.extend_from_slice(b"CONNECT {\"verbose\":true}\r\nSUB foo.> 9\r\nPUB foo.bar 5\r\nhello\r\nPING\r\n");
+        input.extend_from_slice(
+            b"CONNECT {\"verbose\":true}\r\nSUB foo.> 9\r\nPUB foo.bar 5\r\nhello\r\nPING\r\n",
+        );
         let whole = parse_all(&input).unwrap();
         let split = parse_all_split(&input).unwrap();
         assert_eq!(whole, split);
@@ -584,10 +583,7 @@ mod tests {
         // Payload exceeding max.
         let mut p = Parser::new(4);
         p.feed(b"PUB foo 5\r\nhello\r\n");
-        assert!(matches!(
-            p.next_op(),
-            Err(ParseError::PayloadTooLarge(5))
-        ));
+        assert!(matches!(p.next_op(), Err(ParseError::PayloadTooLarge(5))));
         // Bad payload terminator.
         assert!(matches!(
             parse_all(b"PUB foo 2\r\nabXX"),
@@ -596,10 +592,7 @@ mod tests {
         // Control line too long.
         let mut p = Parser::default();
         p.feed(&vec![b'A'; DEFAULT_MAX_CONTROL_LINE + 1]);
-        assert!(matches!(
-            p.next_op(),
-            Err(ParseError::ControlLineTooLong)
-        ));
+        assert!(matches!(p.next_op(), Err(ParseError::ControlLineTooLong)));
     }
 
     #[test]

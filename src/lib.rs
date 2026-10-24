@@ -3,5 +3,8 @@
 //!
 //! See `PLAN.md` in the repository for the phased implementation plan.
 
+pub mod config;
 pub mod protocol;
+pub mod server;
 pub mod subject;
+pub mod sublist;
