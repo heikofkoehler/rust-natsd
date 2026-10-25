@@ -67,6 +67,7 @@ rust-natsd does; it replaces the older support table.
 | NKey auth | Implemented | Per-connection `nonce` in `INFO`, `nkey`/`sig` in `CONNECT`, verified with the `nkeys` crate; standalone nkey users only |
 | JWT operator mode | Not implemented | Non-goal |
 | Multi-account + pub/sub allow/deny | Implemented | `accounts {}` in `.conf` (per-user `permissions` or account-level `authorization`), `system_account`, `no_auth_user`; subscriptions/deliveries/routes/leafs/JetStream scoped per account; Go's exact permission-violation `-ERR` text, connection stays alive |
+| Account imports/exports (service + stream) | Implemented (same node) | `accounts { NAME { exports: [{service\|stream: "subj", accounts: ["B"]}], imports: [{service\|stream: {account: A, subject: "subj"}, to: "local"}] } }` — Go v2.15.1 `.conf` shape probed (`to`, not `local_subject`; the older spelling is accepted as an alias). Service requests are rewritten into the exporting account with a synthetic `_RIMPORT.<seq>` reply subject that routes replies back; stream publishes are copied to the importer's local subject. Unauthorized imports (account not listed, remote pattern not covered by the export) are dropped, never delivered; the importing account's publish allow/deny is checked on the local subject and the responder's subscribe allow/deny on the exported subject. Same-node only: imports do not cross routes/leafs, and route/leaf-origin messages do not fan out to stream importers. Reply mappings are retained for the server lifetime (Go's `_R_.` mappings expire by TTL) |
 | TLS client connections | Implemented | `--tls/--tlscert/--tlskey/--tlsverify/--tlscacert`, `tls {}` in `.conf`, `tls_required` in `INFO`; STARTTLS order (plaintext `INFO` first, then upgrade), matching Go |
 | Route/leaf TLS | Not implemented | Non-goal |
 | TLS client-certificate-to-user mapping | Not implemented | Non-goal (CA verification only, via `--tlsverify`) |
@@ -128,7 +129,8 @@ supported fields / totals only, by design.
 Gateways (super-cluster), JetStream clustering/replication,
 cross-node mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
 route/leaf TLS, TLS certificate-to-user mapping, and XKeys. JetStream
-here is single-node only (mirroring/sourcing work on the same node).
+here is single-node only (mirroring/sourcing and account imports work
+on the same node).
 Conversely, rust-natsd is a superset in
 exactly one place: it implements `/subz` and `/accounz`, which Go
 2.15.1 answers with 404.

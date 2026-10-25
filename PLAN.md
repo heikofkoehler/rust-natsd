@@ -301,6 +301,58 @@ KV/object-store client helpers (their server-side primitives exist).
   cargo test 116 green; parity GREEN (52 pass + 1 exception);
   bench no regression vs 86edbe8.
 
+### Phase 21 — Account imports/exports (gap area 6)
+- Go semantics probed first against nats-server v2.15.1: the `.conf`
+  import key is `to` (v2.15.1 rejects `local_subject` as an unknown
+  field); a service request is delivered to the responder on the
+  exported subject with the reply rewritten to a Go-generated
+  `_R_.<...>` subject plus a `Nats-Request-Info: {"acc":"B",...}`
+  header, and a reply to `_R_.` returns to the importer's original
+  inbox; a stream publish on the exported subject is copied to the
+  importer's local subject; an import by an account not listed on
+  the export makes Go refuse to start ("service import not
+  authorized").
+- Implementation (same node): `Export`/`Import` types in
+  `src/config.rs` (kind service/stream, export subject + account
+  list, import source account + remote/local subjects);
+  `translate_subject` (wildcard captures carried across patterns)
+  and `pattern_covers` (export-coverage check) in `src/subject.rs`;
+  `.conf` parsing in `src/conf.rs` (`exports`/`imports`, `to` with
+  `local_subject` as an alias). In `src/server.rs`, a local publish
+  matching a service import is rewritten into the exporting account
+  (the import shadows the local subject) with a synthetic
+  `_RIMPORT.<seq>` reply subject registered in
+  `Shared::import_replies`; the responder's publish to that subject
+  is intercepted before the permission check and delivered to the
+  importer's original reply subject. Local publishes in an exporting
+  account are additionally copied (subject rewritten) to local
+  subscribers of authorized stream imports, via
+  `deliver_stream_copy` (local only, marked `import_copy` so it
+  never translates again). `deliver()` now returns whether anything
+  was delivered, used for the translated no-responders 503 (sent to
+  the original reply subject).
+- Authorization is enforced on both sides and never bypassed: the
+  importing account's publish allow/deny is checked on the local
+  subject before translation, the responder's subscribe allow/deny
+  on the exported subject at SUB time, and the export must cover
+  the import's remote pattern and list the importer — otherwise the
+  message is dropped (with a startup warning). Deliberate
+  deviations from Go: an unauthorized import does not stop the
+  server (Go refuses to start); no `Nats-Request-Info` header is
+  injected on translated requests; reply mappings are retained for
+  the server lifetime (Go's expire by TTL); imports do not cross
+  routes/leafs, and route/leaf-origin messages do not fan out to
+  stream importers (remainder of this area).
+- Verified: 6 new tests in `tests/e2e_imports.rs` (service
+  request/reply through an import, stream copy, denied import
+  dropped, import subject outside the export dropped, local
+  allow/deny still enforced, `.conf` shape + authorization logic)
+  plus 2 unit tests for translation/coverage; cargo test 124
+  green; parity GREEN (52 pass + 1 exception); bench no regression
+  vs 86edbe8 (pub/sub 422,899/297,869 vs 418,910/226,910; req/reply
+  mean 74 µs vs 196 µs; JS 21,735 vs 8,019 — run-to-run noise, all
+  at or above baseline).
+
 ## Future work (not in this plan)
 - Gateways, JetStream clustering/replication, cross-node
   mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,

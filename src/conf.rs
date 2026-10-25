@@ -13,7 +13,8 @@
 //! - `jetstream` (boolean, or a block with `store_dir`)
 //! - `tls { cert_file, key_file, ca_file, verify }` (client listener only)
 //! - `accounts { NAME { users [...], permissions/authorization {...},
-//!   jetstream: enabled } }`, `system_account`, `no_auth_user`
+//!   jetstream: enabled, exports [...], imports [...] } }`,
+//!   `system_account`, `no_auth_user`
 //!
 //! Not supported (ignored or, for `include`, rejected): `include`,
 //! logging, limits, websocket/mqtt/gateway sections. A config using
@@ -22,7 +23,8 @@
 use std::collections::HashMap;
 
 use crate::config::{
-    parse_duration, parse_size, Account, AccountUser, Config, Permissions, TlsSettings,
+    parse_duration, parse_size, Account, AccountUser, Config, Export, Import, ImportKind,
+    Permissions, TlsSettings,
 };
 
 /// A parsed config value.
@@ -429,6 +431,66 @@ fn parse_account(name: &str, v: &Value) -> Option<Account> {
     if let Some(js) = map.get("jetstream") {
         account.jetstream_enabled =
             matches!(js, Value::Bool(true)) || matches!(js.as_str(), Some("enabled"));
+    }
+    // Account imports/exports (Go v2.15.1 shape, probed):
+    //   exports: [ { service: "svc.>", accounts: ["B"] },
+    //              { stream: "events.>", accounts: ["B"] } ]
+    //   imports: [ { service: { account: A, subject: "svc.>" },
+    //                to: "local.>" } ]
+    // `local_subject` is accepted as an alias for `to`.
+    if let Some(Value::List(items)) = map.get("exports") {
+        for m in items.iter().filter_map(map_of) {
+            let (kind, subject) = if let Some(s) = m.get("service").and_then(|v| v.as_str()) {
+                (Some(ImportKind::Service), s.to_string())
+            } else if let Some(s) = m.get("stream").and_then(|v| v.as_str()) {
+                (Some(ImportKind::Stream), s.to_string())
+            } else {
+                continue;
+            };
+            let accounts = m
+                .get("accounts")
+                .and_then(|v| as_string_list(v).ok())
+                .unwrap_or_default();
+            account.exports.push(Export {
+                kind,
+                subject,
+                accounts,
+            });
+        }
+    }
+    if let Some(Value::List(items)) = map.get("imports") {
+        for m in items.iter().filter_map(map_of) {
+            let (kind, source, remote) = if let Some(svc) = m.get("service").and_then(|v| map_of(v))
+            {
+                (
+                    Some(ImportKind::Service),
+                    svc.get("account").and_then(|v| v.as_str()).unwrap_or(""),
+                    svc.get("subject").and_then(|v| v.as_str()).unwrap_or(""),
+                )
+            } else if let Some(st) = m.get("stream").and_then(|v| map_of(v)) {
+                (
+                    Some(ImportKind::Stream),
+                    st.get("account").and_then(|v| v.as_str()).unwrap_or(""),
+                    st.get("subject").and_then(|v| v.as_str()).unwrap_or(""),
+                )
+            } else {
+                continue;
+            };
+            let local = m
+                .get("to")
+                .or_else(|| m.get("local_subject"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if source.is_empty() || remote.is_empty() || local.is_empty() {
+                continue;
+            }
+            account.imports.push(Import {
+                kind,
+                source_account: source.to_string(),
+                remote_subject: remote.to_string(),
+                local_subject: local.to_string(),
+            });
+        }
     }
     Some(account)
 }

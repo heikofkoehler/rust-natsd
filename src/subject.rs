@@ -52,6 +52,95 @@ pub fn is_valid_subscribe_subject(subject: &str) -> bool {
     true
 }
 
+/// Translate a concrete `subject` that matched `from_pattern` into the
+/// corresponding subject under `to_pattern`, by carrying wildcard
+/// captures across: each `*` in `to_pattern` takes the next captured
+/// single token, each `>` takes the remaining captured tokens. Returns
+/// None when `subject` does not match `from_pattern`, or when
+/// `to_pattern` needs a capture `from_pattern` did not produce (e.g.
+/// `from` is literal but `to` has a `*`). Used for account
+/// import/export subject mapping (service and stream imports).
+pub fn translate_subject(from_pattern: &str, to_pattern: &str, subject: &str) -> Option<String> {
+    if !subject_matches(from_pattern, subject) {
+        return None;
+    }
+    let from: Vec<&str> = from_pattern.split('.').collect();
+    let subj: Vec<&str> = subject.split('.').collect();
+    // Captures: single tokens (from `*`) in order, then the `>` tail
+    // (if any) as a token list.
+    let mut singles: Vec<&str> = Vec::new();
+    let mut tail: Vec<&str> = Vec::new();
+    let mut i = 0;
+    for tok in &from {
+        match *tok {
+            ">" => {
+                tail = subj[i..].to_vec();
+                i = subj.len();
+            }
+            "*" => {
+                singles.push(subj[i]);
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    let to: Vec<&str> = to_pattern.split('.').collect();
+    let mut single_idx = 0;
+    let mut out: Vec<String> = Vec::new();
+    for tok in &to {
+        match *tok {
+            "*" => {
+                let captured = singles.get(single_idx)?;
+                single_idx += 1;
+                out.push((*captured).to_string());
+            }
+            ">" => {
+                if tail.is_empty() {
+                    return None;
+                }
+                out.extend(tail.iter().map(|t| (*t).to_string()));
+            }
+            literal => out.push(literal.to_string()),
+        }
+    }
+    Some(out.join("."))
+}
+
+/// True when every subject matched by `import_pattern` is also matched
+/// by `export_pattern` (pattern-coverage, not subject matching): an
+/// export of `svc.>` covers an import of `svc.echo` and of `svc.>`;
+/// an export of `svc.echo` does not cover an import of `svc.>`.
+/// Used to decide whether an account import is authorized by an export.
+pub fn pattern_covers(export_pattern: &str, import_pattern: &str) -> bool {
+    let exp: Vec<&str> = export_pattern.split('.').collect();
+    let imp: Vec<&str> = import_pattern.split('.').collect();
+    let mut i = 0;
+    while i < exp.len() {
+        match exp[i] {
+            ">" => return true,
+            "*" => {
+                if i >= imp.len() {
+                    return false;
+                }
+                // `*` covers a literal token or a `*`; it does not
+                // cover a terminal `>` (different arity).
+                if imp[i] == ">" {
+                    return false;
+                }
+            }
+            literal => {
+                if i >= imp.len() || imp[i] != literal {
+                    return false;
+                }
+            }
+        }
+        i += 1;
+    }
+    i == imp.len()
+}
+
 /// Returns true if a published `subject` matches subscription pattern
 /// `pattern` (which may contain `*` / `>` wildcards).
 pub fn subject_matches(pattern: &str, subject: &str) -> bool {
@@ -124,6 +213,40 @@ mod tests {
         assert!(!is_valid_subscribe_subject("foo.>.bar"));
         assert!(!is_valid_subscribe_subject("foo..*"));
         assert!(!is_valid_subscribe_subject(""));
+    }
+
+    #[test]
+    fn translate_subject_mapping() {
+        assert_eq!(
+            translate_subject("local.>", "svc.>", "local.echo"),
+            Some("svc.echo".to_string())
+        );
+        assert_eq!(
+            translate_subject("local.>", "svc.>", "local.a.b"),
+            Some("svc.a.b".to_string())
+        );
+        assert_eq!(
+            translate_subject("local.*.x", "svc.*.y", "local.echo.x"),
+            Some("svc.echo.y".to_string())
+        );
+        assert_eq!(translate_subject("local.>", "svc.>", "other.echo"), None);
+        assert_eq!(translate_subject("local", "svc.*", "local"), None);
+        assert_eq!(
+            translate_subject("events.>", "feed.>", "events.news"),
+            Some("feed.news".to_string())
+        );
+    }
+
+    #[test]
+    fn pattern_covers_cases() {
+        assert!(pattern_covers("svc.>", "svc.echo"));
+        assert!(pattern_covers("svc.>", "svc.>"));
+        assert!(pattern_covers("svc.*", "svc.echo"));
+        assert!(pattern_covers("svc.*", "svc.*"));
+        assert!(!pattern_covers("svc.echo", "svc.>"));
+        assert!(!pattern_covers("svc.*", "svc.>"));
+        assert!(!pattern_covers("svc.echo", "svc.other"));
+        assert!(!pattern_covers("svc.>", "other.>"));
     }
 
     #[test]

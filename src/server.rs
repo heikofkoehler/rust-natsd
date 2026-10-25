@@ -72,6 +72,14 @@ pub struct Message {
     /// Only meaningful for Local origin; route/leaf/internal messages
     /// never carry it.
     pub no_responders: bool,
+    /// True for a stream-import copy (already translated once): it is
+    /// delivered to local subscribers only and is never translated
+    /// again, so import chains cannot loop.
+    pub import_copy: bool,
+    /// True for a service-import translated request (already rewritten
+    /// into the exporting account): it must not be service-translated
+    /// a second time, but it may still fan out to stream importers.
+    pub service_translated: bool,
 }
 
 impl Message {
@@ -88,6 +96,8 @@ impl Message {
             payload,
             account: "$G".to_string(),
             no_responders: false,
+            import_copy: false,
+            service_translated: false,
         }
     }
 
@@ -276,6 +286,16 @@ pub struct Shared {
     pub(crate) shutdown_flag: AtomicBool,
     /// JetStream engine, present when `--jetstream` is set (Phase 9).
     pub(crate) jetstream: Option<Arc<crate::jetstream::JetStream>>,
+    /// Service-import reply mappings: synthetic reply subject
+    /// (`_RIMPORT.<seq>`, handed to the exporting account's responder)
+    /// -> (importing account, original reply subject). Replies
+    /// published to a synthetic subject are delivered back into the
+    /// importing account (see process_op). Entries are retained for
+    /// the server's lifetime (Go's `_R_.` mappings expire by TTL;
+    /// unbounded retention here is a known limitation, noted in PLAN).
+    pub(crate) import_replies: Mutex<HashMap<String, (String, String)>>,
+    /// Counter for synthetic service-import reply subjects.
+    pub(crate) import_seq: AtomicU64,
 }
 
 /// Targets for one cross-node fan-out: (conn id, writer, has plain
@@ -335,6 +355,18 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
     } else {
         None
     };
+    // Unauthorized imports are warned about at startup (Go refuses to
+    // start instead); at delivery time they are dropped, never leaked.
+    for account in &config.accounts {
+        for import in &account.imports {
+            if !config.import_authorized(&account.name, import) {
+                eprintln!(
+                    "rust-natsd: unauthorized import in account {}: {}:{} -> {} (no matching export; messages through it will be dropped)",
+                    account.name, import.source_account, import.remote_subject, import.local_subject
+                );
+            }
+        }
+    }
     // Build the TLS acceptor up front so a bad cert/key is a startup
     // error, not a per-connection failure.
     let tls_acceptor = match &config.tls {
@@ -366,6 +398,8 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         shutdown: Arc::new(Notify::new()),
         shutdown_flag: AtomicBool::new(false),
         jetstream,
+        import_replies: Mutex::new(HashMap::new()),
+        import_seq: AtomicU64::new(1),
     });
     // JetStream nodes advertise $JS.API.> interest to routes/leafs so API
     // requests published on other nodes are forwarded to the node that
@@ -752,6 +786,16 @@ fn try_send(handle: &ConnHandle, frame: Bytes) -> bool {
 /// Deliver a message: to local subscribers, and (unless it arrived on a
 /// route/leaf) forward it to routes and leafs with matching interest.
 ///
+/// Account imports/exports (same node only): a local publish whose
+/// subject matches a service import is rewritten into the exporting
+/// account instead of being delivered locally, with the reply subject
+/// replaced by a synthetic `_RIMPORT.<seq>` subject that routes
+/// replies back to the importer's original reply subject; a local
+/// publish in an exporting account is additionally copied to local
+/// subscribers of every authorized stream import of that subject.
+/// Returns true when the message reached at least one subscriber (or
+/// was consumed by JetStream), which the no-responders logic uses.
+///
 /// `queue_filter` restricts queue-group delivery for messages arriving
 /// on a route/leaf: only the listed groups are delivered (the sender
 /// already ran the global queue selection). `None` means all groups
@@ -761,7 +805,7 @@ pub fn deliver(
     msg: &Message,
     origin: Origin,
     queue_filter: Option<&[String]>,
-) {
+) -> bool {
     // JetStream capture / API handling happens before core delivery so a
     // stream message is stored even when nobody is subscribed, and API
     // requests are answered by the hosting node.
@@ -769,7 +813,7 @@ pub fn deliver(
         if crate::jetstream::handle_message(shared, js, msg, origin) {
             // API requests and acks are consumed by JetStream; they are not
             // also delivered as ordinary messages.
-            return;
+            return true;
         }
     }
 
@@ -818,7 +862,65 @@ pub fn deliver(
             .stats
             .out_msgs
             .fetch_add(result.deliveries.len() as u64, Ordering::Relaxed);
-        return;
+        return !result.deliveries.is_empty();
+    }
+
+    // Service import (local publishes only, same node): a publish on
+    // the importing account's local subject is rewritten into the
+    // exporting account and never delivered locally — the import
+    // shadows the local subject, as on Go. An import the exporting
+    // account does not authorize (account not listed on the export, or
+    // remote pattern not covered by the export) is dropped outright:
+    // it must never leak across accounts. Go refuses to start on an
+    // unauthorized service import; rust-natsd keeps the server up and
+    // drops the message instead (see Config::import_authorized).
+    if matches!(origin, Origin::Local(_, _)) && !msg.service_translated && !msg.import_copy {
+        if let Some(publisher_account) = shared.config.account(&msg.account).cloned() {
+            if let Some((import, remote)) = publisher_account.service_import_for(&msg.subject) {
+                if !shared.config.import_authorized(&msg.account, import) {
+                    eprintln!(
+                        "rust-natsd: dropping unauthorized service import {} -> {}:{}",
+                        msg.subject, import.source_account, remote
+                    );
+                    return false;
+                }
+                let mut translated =
+                    Message::new(&remote, None, msg.headers.clone(), msg.payload.clone())
+                        .with_account(&import.source_account)
+                        .with_no_responders(msg.no_responders);
+                translated.service_translated = true;
+                if let Some(orig_reply) = &msg.reply_to {
+                    let seq = shared.import_seq.fetch_add(1, Ordering::SeqCst);
+                    let synthetic = format!("_RIMPORT.{seq}");
+                    shared
+                        .import_replies
+                        .lock()
+                        .unwrap()
+                        .insert(synthetic.clone(), (msg.account.clone(), orig_reply.clone()));
+                    translated.reply_to = Some(synthetic);
+                }
+                let delivered = deliver(shared, &translated, origin, None);
+                // No-responders for the translated request: the 503 goes
+                // to the importer's original reply subject, not to the
+                // synthetic one (nothing subscribes to that in A).
+                if msg.no_responders && !delivered {
+                    if let Some(orig_reply) = &msg.reply_to {
+                        let headers = Bytes::from(format!(
+                            "NATS/1.0 503\r\nNats-Subject: {}\r\n\r\n",
+                            msg.subject
+                        ));
+                        deliver(
+                            shared,
+                            &Message::new(orig_reply, None, Some(headers), Bytes::new())
+                                .with_account(&msg.account),
+                            Origin::Internal,
+                            None,
+                        );
+                    }
+                }
+                return delivered;
+            }
+        }
     }
 
     // Local / internal origin: global queue selection across local
@@ -880,7 +982,7 @@ pub fn deliver(
     // No-responders accounting is computed before the route/leaf loops
     // consume route_full/leaf_full: any local delivery, plain route/leaf
     // interest, or selected queue group counts as a responder.
-    let has_delivery = !local_deliveries.is_empty()
+    let mut has_delivery = !local_deliveries.is_empty()
         || route_selected.values().any(|v| !v.is_empty())
         || leaf_selected.values().any(|v| !v.is_empty())
         || route_full.iter().any(|(_, _, plain, _)| *plain)
@@ -939,6 +1041,45 @@ pub fn deliver(
         }
     }
 
+    // Stream imports (local/internal publishes only, same node):
+    // copy the message, subject rewritten to the importer's local
+    // subject, to that account's local subscribers. The importer's
+    // subscribe permission was checked against the local subject at
+    // SUB time, and the export must cover this concrete subject and
+    // name the importer — otherwise no copy is made. Copies are
+    // marked import_copy, so they never translate again.
+    if !msg.import_copy {
+        let importers: Vec<(String, String)> = shared
+            .config
+            .accounts
+            .iter()
+            .filter(|a| a.name != msg.account)
+            .filter_map(|a| {
+                a.stream_import_for(&msg.account, &msg.subject)
+                    .map(|(_, local)| (a.name.clone(), local))
+            })
+            .collect();
+        for (importer, local) in importers {
+            if !shared
+                .config
+                .stream_export_allows(&msg.account, &importer, &msg.subject)
+            {
+                continue;
+            }
+            let mut copy = Message::new(
+                &local,
+                msg.reply_to.clone(),
+                msg.headers.clone(),
+                msg.payload.clone(),
+            )
+            .with_account(&importer);
+            copy.import_copy = true;
+            if deliver_stream_copy(shared, &copy) {
+                has_delivery = true;
+            }
+        }
+    }
+
     // No-responders (Go behaviour, verified against v2.15.1): a local
     // publish with a reply subject and no deliveries, from a connection
     // that set no_responders:true, generates an HMSG to the reply subject
@@ -959,6 +1100,34 @@ pub fn deliver(
             );
         }
     }
+    has_delivery
+}
+
+/// Deliver a stream-import copy to local subscribers of its (already
+/// rewritten) subject/account only — no route/leaf forwarding, no
+/// further import translation. Queue groups get exactly one member,
+/// like the route/leaf-origin path. Returns true on any delivery.
+fn deliver_stream_copy(shared: &Arc<Shared>, msg: &Message) -> bool {
+    let (deliveries, expired) = {
+        let mut sl = shared.sublist.write().unwrap();
+        let gm = sl.match_groups(&msg.subject, u64::MAX, true, Some(&msg.account));
+        let mut deliveries = gm.plain;
+        for members in gm.groups.values() {
+            if !members.is_empty() {
+                let cursor = shared.queue_cursor.fetch_add(1, Ordering::SeqCst);
+                deliveries.push(members[(cursor as usize) % members.len()].clone());
+            }
+        }
+        let expired = sl.note_deliveries(&deliveries);
+        (deliveries, expired)
+    };
+    send_local_frames(shared, msg, &deliveries);
+    cleanup_expired(shared, &expired);
+    shared
+        .stats
+        .out_msgs
+        .fetch_add(deliveries.len() as u64, Ordering::Relaxed);
+    !deliveries.is_empty()
 }
 
 /// Send MSG/HMSG frames for local deliveries, dropping slow consumers.
@@ -1503,6 +1672,30 @@ async fn process_op(
                 .stats
                 .in_bytes
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            // Service-import reply: a responder in the exporting
+            // account publishes to the synthetic `_RIMPORT.<seq>`
+            // subject it received as its reply subject. That publish
+            // is routed back to the importer's original reply subject
+            // before any permission check — the responder's publish
+            // allow list is about its own subjects, not the import
+            // machinery's reply channel (Go's `_R_.` replies work the
+            // same way). An unmapped synthetic subject falls through
+            // to the normal permission-checked publish path.
+            if subject.starts_with("_RIMPORT.") {
+                let reply_map = shared.import_replies.lock().unwrap().get(&subject).cloned();
+                if let Some((account, orig_reply)) = reply_map {
+                    if state.verbose {
+                        let _ = tx.send(encode_ok()).await;
+                    }
+                    deliver(
+                        shared,
+                        &Message::new(&orig_reply, None, None, payload).with_account(&account),
+                        Origin::Internal,
+                        None,
+                    );
+                    return true;
+                }
+            }
             if !state.permissions.can_publish(&subject) {
                 // Go's exact error text; the connection stays alive and
                 // the verbose +OK is replaced by the error (verified
@@ -1551,6 +1744,24 @@ async fn process_op(
                 .stats
                 .in_bytes
                 .fetch_add((headers.len() + payload.len()) as u64, Ordering::Relaxed);
+            // Same synthetic-reply interception as PUB, preserving
+            // headers on the return leg.
+            if subject.starts_with("_RIMPORT.") {
+                let reply_map = shared.import_replies.lock().unwrap().get(&subject).cloned();
+                if let Some((account, orig_reply)) = reply_map {
+                    if state.verbose {
+                        let _ = tx.send(encode_ok()).await;
+                    }
+                    deliver(
+                        shared,
+                        &Message::new(&orig_reply, None, Some(headers), payload)
+                            .with_account(&account),
+                        Origin::Internal,
+                        None,
+                    );
+                    return true;
+                }
+            }
             if !state.permissions.can_publish(&subject) {
                 let _ = tx
                     .send(encode_err(&format!(

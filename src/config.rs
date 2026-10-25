@@ -84,6 +84,39 @@ pub struct AccountUser {
     pub permissions: Permissions,
 }
 
+/// Kind of an account export/import: a service import rewrites a
+/// request published on the importing account's local subject into the
+/// exporting account's subject (with the reply routed back); a stream
+/// import copies messages published on the exporting account's subject
+/// to subscribers on the importing account's local subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportKind {
+    Service,
+    Stream,
+}
+
+/// One export declared by an account: subjects in this account that
+/// other accounts may import, and which accounts may import them.
+/// `accounts` may contain `"*"` to allow any account.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Export {
+    pub kind: Option<ImportKind>,
+    pub subject: String,
+    pub accounts: Vec<String>,
+}
+
+/// One import declared by an account: `local_subject` in this account
+/// maps to `remote_subject` in `source_account`. The `.conf` key for
+/// the local subject is Go v2.15.1's `to` (the older `local_subject`
+/// spelling is accepted as an alias).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Import {
+    pub kind: Option<ImportKind>,
+    pub source_account: String,
+    pub remote_subject: String,
+    pub local_subject: String,
+}
+
 /// One account (tenant). Users in different accounts share no subject
 /// space: subscriptions and deliveries are filtered by account.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -99,6 +132,46 @@ pub struct Account {
     /// but not enforced — when `--jetstream` is on, all accounts get
     /// JetStream (see README non-goals/notes).
     pub jetstream_enabled: bool,
+    /// Subjects this account exports to other accounts.
+    pub exports: Vec<Export>,
+    /// Subjects this account imports from other accounts.
+    pub imports: Vec<Import>,
+}
+
+impl Account {
+    /// Find an import of `kind` in this account whose local subject
+    /// pattern matches `local_subject`, and translate it to the remote
+    /// subject. Returns (import, remote subject).
+    pub fn service_import_for(&self, local_subject: &str) -> Option<(&Import, String)> {
+        self.imports
+            .iter()
+            .filter(|i| i.kind == Some(ImportKind::Service))
+            .find_map(|i| {
+                crate::subject::translate_subject(
+                    &i.local_subject,
+                    &i.remote_subject,
+                    local_subject,
+                )
+                .map(|remote| (i, remote))
+            })
+    }
+
+    /// Find a stream import in this account sourced from
+    /// `source_account` whose remote pattern matches a concrete
+    /// published `subject`, and translate it to the local subject.
+    pub fn stream_import_for(
+        &self,
+        source_account: &str,
+        subject: &str,
+    ) -> Option<(&Import, String)> {
+        self.imports
+            .iter()
+            .filter(|i| i.kind == Some(ImportKind::Stream) && i.source_account == source_account)
+            .find_map(|i| {
+                crate::subject::translate_subject(&i.remote_subject, &i.local_subject, subject)
+                    .map(|local| (i, local))
+            })
+    }
 }
 
 /// Result of a successful authentication.
@@ -496,6 +569,52 @@ impl Config {
         self.cluster_name
             .clone()
             .unwrap_or_else(|| self.name.clone())
+    }
+
+    /// Look up a configured account by name.
+    pub fn account(&self, name: &str) -> Option<&Account> {
+        self.accounts.iter().find(|a| a.name == name)
+    }
+
+    /// True when an import is authorized by the source account's
+    /// exports: the source account must export `kind` subjects covering
+    /// the import's remote pattern, and the export's account list must
+    /// name the importing account (or `"*"`). Go v2.15.1 refuses to
+    /// start on an unauthorized service import ("service import not
+    /// authorized", probed); rust-natsd instead keeps the server up
+    /// and drops messages through unauthorized imports (see server.rs),
+    /// so a bad import can never leak across accounts.
+    pub fn import_authorized(&self, importer: &str, import: &Import) -> bool {
+        let Some(kind) = import.kind else {
+            return false;
+        };
+        let Some(source) = self.account(&import.source_account) else {
+            return false;
+        };
+        source.exports.iter().any(|e| {
+            e.kind == Some(kind)
+                && crate::subject::pattern_covers(&e.subject, &import.remote_subject)
+                && (e.accounts.iter().any(|a| a == importer || a == "*"))
+        })
+    }
+
+    /// True when a concrete published `subject` in `source_account` is
+    /// covered by a stream export that names `importer` — the
+    /// delivery-time check for stream-import copies.
+    pub fn stream_export_allows(
+        &self,
+        source_account: &str,
+        importer: &str,
+        subject: &str,
+    ) -> bool {
+        let Some(source) = self.account(source_account) else {
+            return false;
+        };
+        source.exports.iter().any(|e| {
+            e.kind == Some(ImportKind::Stream)
+                && crate::subject::subject_matches(&e.subject, subject)
+                && e.accounts.iter().any(|a| a == importer || a == "*")
+        })
     }
 
     /// True when any authentication is configured (legacy user/token
