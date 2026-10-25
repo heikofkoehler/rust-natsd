@@ -219,7 +219,8 @@ dropped at the 64 MiB byte limit (see PLAN Phase 18).
 ## Tests
 
 ```sh
-cargo test                    # 150 Rust tests (unit + integration)
+cargo test                    # 200 Rust tests passing, 2 ignored (unit + integration)
+bash scripts/e2e-go-advanced.sh # Go client imports, mirror, JWT minting
 bash scripts/e2e-go.sh        # Go client core e2e
 bash scripts/e2e-go-cluster.sh  # Go <-> Rust route interop, both seed directions
 bash scripts/e2e-go-leaf.sh     # Go <-> Rust leaf interop, both directions
