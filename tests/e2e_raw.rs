@@ -342,6 +342,15 @@ async fn protocol_error_closes_connection() {
     c.send("BOGUS\r\n").await;
     let line = c.read_line().await;
     assert!(line.starts_with("-ERR"), "expected -ERR, got: {line}");
+    // The connection must actually close after the protocol error
+    // (previously this test only checked the -ERR line and could not
+    // have caught a server that kept the connection open).
+    let mut tail = String::new();
+    let n = timeout(T, c.reader.read_line(&mut tail))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF after protocol error");
     srv.shutdown().await.unwrap();
 }
 
