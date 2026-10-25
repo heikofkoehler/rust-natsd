@@ -305,7 +305,8 @@ handled in the implementation:
 - `src/subject.rs` — subject validation and wildcard matching.
 - `src/sublist.rs` — subscription registry; recipient resolution (fan-out,
   queue groups, auto-unsub accounting, echo filtering) happens under a
-  short lock, writes to sockets happen outside it. Matching is a subject
+  short RwLock read lock for matching and a write lock for mutation,
+  writes to sockets happen outside it. Matching is a subject
   trie (exact / `*` / `>` nodes) over insertion-ordered subscriptions,
   not a linear scan; see `examples/sublist_bench.rs` for the 10k-subscription
   harness (sparse-subject match ~0.3 µs vs ~350 µs linear, release).

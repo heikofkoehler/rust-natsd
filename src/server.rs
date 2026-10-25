@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -260,7 +260,7 @@ pub struct Shared {
     pub(crate) started: Instant,
     /// Wall-clock start time, for the monitoring endpoint's `start` field.
     pub(crate) started_wall: std::time::SystemTime,
-    pub(crate) sublist: Mutex<Sublist>,
+    pub(crate) sublist: RwLock<Sublist>,
     pub(crate) conns: Mutex<HashMap<u64, Arc<ConnHandle>>>,
     pub(crate) conn_info: Mutex<HashMap<u64, ConnInfo>>,
     pub(crate) routes: Mutex<HashMap<u64, Arc<RouteConn>>>,
@@ -353,7 +353,7 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         server_id: gen_server_id(),
         started: Instant::now(),
         started_wall: std::time::SystemTime::now(),
-        sublist: Mutex::new(Sublist::new()),
+        sublist: RwLock::new(Sublist::new()),
         conns: Mutex::new(HashMap::new()),
         conn_info: Mutex::new(HashMap::new()),
         routes: Mutex::new(HashMap::new()),
@@ -782,7 +782,7 @@ pub fn deliver(
     // (full mesh / hub-and-spoke loop prevention).
     if matches!(origin, Origin::Route(_) | Origin::Leaf(_)) {
         let result = {
-            let mut sl = shared.sublist.lock().unwrap();
+            let mut sl = shared.sublist.write().unwrap();
             match origin {
                 Origin::Route(_) | Origin::Leaf(_) => {
                     // Filtered queue selection for remote-origin messages.
@@ -825,7 +825,7 @@ pub fn deliver(
     // members, routes, and leafs (weighted by member count), so a queue
     // group spanning nodes still delivers exactly once per message.
     let gm = {
-        let sl = shared.sublist.lock().unwrap();
+        let sl = shared.sublist.read().unwrap();
         sl.match_groups(
             &msg.subject,
             publisher_conn,
@@ -867,7 +867,7 @@ pub fn deliver(
         }
     }
     let expired = {
-        let mut sl = shared.sublist.lock().unwrap();
+        let mut sl = shared.sublist.write().unwrap();
         sl.note_deliveries(&local_deliveries)
     };
     send_local_frames(shared, msg, &local_deliveries);
@@ -990,7 +990,7 @@ fn send_local_frames(shared: &Arc<Shared>, msg: &Message, deliveries: &[crate::s
                 "rust-natsd: slow consumer, dropping connection {}",
                 d.conn_id
             );
-            shared.sublist.lock().unwrap().remove_conn(d.conn_id);
+            shared.sublist.write().unwrap().remove_conn(d.conn_id);
             if let Some(h) = shared.conns.lock().unwrap().remove(&d.conn_id) {
                 h.mark_closed();
             }
@@ -1006,14 +1006,14 @@ fn cleanup_expired(shared: &Arc<Shared>, expired: &[(u64, String)]) {
         return;
     }
     let patterns: Vec<(String, String, Option<String>)> = {
-        let sl = shared.sublist.lock().unwrap();
+        let sl = shared.sublist.read().unwrap();
         expired
             .iter()
             .filter_map(|(cid, sid)| sl.pattern_of(*cid, sid))
             .collect()
     };
     {
-        let mut sl = shared.sublist.lock().unwrap();
+        let mut sl = shared.sublist.write().unwrap();
         for (cid, sid) in expired {
             sl.remove(*cid, sid);
         }
@@ -1098,10 +1098,19 @@ fn propagate_local_sub(
     } else {
         encode_rs_minus(account, subject, queue)
     };
-    for r in shared.routes.lock().unwrap().values() {
-        if !r.handle.is_closed() {
-            let _ = try_send(&r.handle, rframe.clone());
-        }
+    // Collect handles first and send after the locks drop, mirroring
+    // send_local_frames: the registry locks are never held across the
+    // (non-blocking channel) sends.
+    let route_handles: Vec<Arc<ConnHandle>> = shared
+        .routes
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|r| !r.handle.is_closed())
+        .map(|r| r.handle.clone())
+        .collect();
+    for handle in route_handles {
+        let _ = try_send(&handle, rframe.clone());
     }
     // Leaf frames carry no account token: a leaf connection only ever
     // carries its own account, so propagate only to matching leafs.
@@ -1110,10 +1119,16 @@ fn propagate_local_sub(
     } else {
         encode_ls_minus(subject, queue)
     };
-    for l in shared.leafs.lock().unwrap().values() {
-        if !l.handle.is_closed() && l.account == account {
-            let _ = try_send(&l.handle, lframe.clone());
-        }
+    let leaf_handles: Vec<Arc<ConnHandle>> = shared
+        .leafs
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|l| !l.handle.is_closed() && l.account == account)
+        .map(|l| l.handle.clone())
+        .collect();
+    for handle in leaf_handles {
+        let _ = try_send(&handle, lframe.clone());
     }
 }
 
@@ -1130,7 +1145,7 @@ fn local_pattern_in_use(
     }
     shared
         .sublist
-        .lock()
+        .read()
         .unwrap()
         .has_pattern(subject, queue, account)
 }
@@ -1144,7 +1159,7 @@ fn send_local_interest(
     leaf_account: Option<&str>,
 ) {
     let subs: Vec<(String, String, Option<String>)> = {
-        let sl = shared.sublist.lock().unwrap();
+        let sl = shared.sublist.read().unwrap();
         sl.patterns()
     };
     for (account, subject, queue) in subs {
@@ -1385,7 +1400,7 @@ async fn handle_conn<R, W>(
     // channel senders closes the writer queue, so the writer flushes any
     // pending frames (e.g. a final -ERR) and then exits on its own.
     let removed = {
-        let mut sl = shared.sublist.lock().unwrap();
+        let mut sl = shared.sublist.write().unwrap();
         let patterns = sl.patterns_for_conn(client_id);
         sl.remove_conn(client_id);
         patterns
@@ -1559,12 +1574,12 @@ async fn process_op(
             // must not replace it and must not propagate its (different)
             // pattern to routes/leafs. It still gets the verbose +OK.
             let already = {
-                let sl = shared.sublist.lock().unwrap();
+                let sl = shared.sublist.read().unwrap();
                 sl.pattern_of(client_id, &sid).is_some()
             };
             if !already {
                 let is_new = {
-                    let mut sl = shared.sublist.lock().unwrap();
+                    let mut sl = shared.sublist.write().unwrap();
                     let is_new = !sl.has_pattern(&subject, queue.as_deref(), &state.account);
                     sl.add(Subscription::new(
                         client_id,
@@ -1588,7 +1603,7 @@ async fn process_op(
             match max {
                 None => {
                     let pattern = {
-                        let mut sl = shared.sublist.lock().unwrap();
+                        let mut sl = shared.sublist.write().unwrap();
                         let p = sl.pattern_of(client_id, &sid);
                         sl.remove(client_id, &sid);
                         p
@@ -1606,7 +1621,11 @@ async fn process_op(
                     }
                 }
                 Some(max) => {
-                    shared.sublist.lock().unwrap().set_max(client_id, &sid, max);
+                    shared
+                        .sublist
+                        .write()
+                        .unwrap()
+                        .set_max(client_id, &sid, max);
                 }
             }
             if state.verbose {

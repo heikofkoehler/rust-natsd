@@ -157,7 +157,7 @@ fn varz(shared: &Shared) -> Value {
     let routes = shared.routes.lock().unwrap().len();
     let leafs = shared.leafs.lock().unwrap().len();
     let conns = shared.conns.lock().unwrap().len();
-    let subs = shared.sublist.lock().unwrap().len();
+    let subs = shared.sublist.read().unwrap().len();
     let mut body = json!({
         "server_id": shared.server_id,
         "server_name": cfg.name,
@@ -225,7 +225,7 @@ fn connz(shared: &Shared, query: &str) -> Value {
         infos.clear();
     }
     infos.retain(|i| i.kind == "client" && acc.map(|a| i.account == a).unwrap_or(true));
-    let subs = shared.sublist.lock().unwrap();
+    let subs = shared.sublist.read().unwrap();
     let handles = shared.conns.lock().unwrap();
     let total = infos.len();
     let mut connections = Vec::new();
@@ -302,7 +302,7 @@ fn accounz(shared: &Shared) -> Value {
         }
     }
     let infos = shared.conn_info.lock().unwrap();
-    let subs = shared.sublist.lock().unwrap();
+    let subs = shared.sublist.read().unwrap();
     let accounts: Vec<Value> = names
         .iter()
         .map(|name| {
@@ -332,7 +332,7 @@ fn gatewayz(shared: &Shared) -> Value {
 }
 
 fn subz(shared: &Shared) -> Value {
-    let sl = shared.sublist.lock().unwrap();
+    let sl = shared.sublist.read().unwrap();
     let mut subscriptions: Vec<Value> = sl
         .subscriptions()
         .iter()
