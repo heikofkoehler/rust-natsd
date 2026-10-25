@@ -97,20 +97,22 @@ README, and PLAN agree. They do not fail the parity run, because the
 parity probes do not cover them — that is a coverage statement, not
 a claim that they match Go.
 
-- **CONSUMER.INFO `num_pending` hardcoded to 0**;
-  `num_ack_pending` is real.
 - **Deliberate deviations from Go** (verified against 2.15.1):
   mirror backfill synchronous (Go async, final state matches);
   mirror/source of a nonexistent stream rejected 404/10059 (Go
   accepts and leaves empty); unauthorized import drops the message
-  (Go refuses to start); import reply mappings retained for server
-  lifetime (Go's expire by TTL); no `Nats-Request-Info` header on
-  translated service requests; JWT `limits` not enforced,
-  `revocations` not honored, `bearer_token` not honored (nonce
-  signature always required), `iat` >60 s future cap stricter
-  than Go, `$SYS` not special-cased, Go-generated JWT → Rust not
-  run (no `nsc`); cert-to-user mapping is client-connections only
-  (route/leaf use CA verification only).
+  (Go refuses to start); import reply mappings expire after 60 s
+  (Phase 28C, pruned on insert/lookup); translated service requests
+  carry `Nats-Request-Info: {"acc": ...}` without Go's `rtt` (no
+  client RTT measurement); JWT `limits` enforced since Phase 28C
+  (`data` as a cumulative inbound budget — a rust-natsd
+  interpretation, Go does not visibly enforce it; a limits-less
+  account JWT is unlimited here where Go rejects its first
+  connection), `revocations` and `bearer_token` honored since Phase
+  28C, `iat` >60 s future cap stricter than Go, `$SYS` not
+  special-cased, Go-generated JWT → Rust not run (no `nsc`);
+  cert-to-user mapping is client-connections only (route/leaf use
+  CA verification only).
 
 ## Deliberately out of scope (unchanged, and identical to the
 README Known issues list and PLAN's Future work list)

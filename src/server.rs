@@ -299,14 +299,20 @@ pub struct Shared {
     pub(crate) jetstream: Option<Arc<crate::jetstream::JetStream>>,
     /// Service-import reply mappings: synthetic reply subject
     /// (`_RIMPORT.<seq>`, handed to the exporting account's responder)
-    /// -> (importing account, original reply subject). Replies
-    /// published to a synthetic subject are delivered back into the
-    /// importing account (see process_op). Entries are retained for
-    /// the server's lifetime (Go's `_R_.` mappings expire by TTL;
-    /// unbounded retention here is a known limitation, noted in PLAN).
-    pub(crate) import_replies: Mutex<HashMap<String, (String, String)>>,
+    /// -> (importing account, original reply subject, creation
+    /// instant). Replies published to a synthetic subject are
+    /// delivered back into the importing account (see process_op).
+    /// Entries expire after 60 s (Phase 28C; Go's `_R_.` mappings
+    /// expire by TTL, and unbounded retention was a known
+    /// limitation) and are pruned opportunistically on insert and
+    /// lookup, so a stale mapping can never route a reply.
+    pub(crate) import_replies: Mutex<HashMap<String, (String, String, std::time::Instant)>>,
     /// Counter for synthetic service-import reply subjects.
     pub(crate) import_seq: AtomicU64,
+    /// Account-wide cumulative inbound payload bytes, for JWT
+    /// account `limits.data` enforcement (Phase 28C). Only accounts
+    /// with a data limit are tracked here; see `ConnState`.
+    pub(crate) account_data_bytes: Mutex<HashMap<String, u64>>,
 }
 
 /// Targets for one cross-node fan-out: (conn id, writer, has plain
@@ -442,6 +448,7 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         jetstream,
         import_replies: Mutex::new(HashMap::new()),
         import_seq: AtomicU64::new(1),
+        account_data_bytes: Mutex::new(HashMap::new()),
     });
     // JetStream nodes advertise $JS.API.> interest to routes/leafs so API
     // requests published on other nodes are forwarded to the node that
@@ -942,6 +949,78 @@ fn try_send(handle: &ConnHandle, frame: Bytes) -> bool {
 // Routing
 // ---------------------------------------------------------------------------
 
+/// Lifetime of a service-import reply mapping (Phase 28C; Go's
+/// `_R_.` mappings expire by TTL).
+const IMPORT_REPLY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Drop expired import-reply mappings. Called opportunistically on
+/// insert and lookup; there is no background sweep task, so expiry
+/// is enforced at every use and the map cannot grow without bound
+/// on a live server (each new import also prunes the old ones).
+fn prune_import_replies(shared: &Arc<Shared>) {
+    let mut map = shared.import_replies.lock().unwrap();
+    prune_import_map(&mut map, std::time::Instant::now());
+}
+
+/// The TTL rule itself, factored out so tests can exercise it with
+/// an explicit `now` instead of waiting 60 s (see the unit tests).
+fn prune_import_map(
+    map: &mut HashMap<String, (String, String, std::time::Instant)>,
+    now: std::time::Instant,
+) {
+    map.retain(|_, (_, _, created)| now.duration_since(*created) < IMPORT_REPLY_TTL);
+}
+
+/// Look up a service-import reply mapping, honouring the TTL: an
+/// expired entry is removed and treated as unmapped, so a reply
+/// arriving after 60 s falls through to the normal publish path
+/// instead of being routed to a stale inbox.
+fn lookup_import_reply(shared: &Arc<Shared>, subject: &str) -> Option<(String, String)> {
+    prune_import_replies(shared);
+    shared
+        .import_replies
+        .lock()
+        .unwrap()
+        .get(subject)
+        .map(|(account, orig, _)| (account.clone(), orig.clone()))
+}
+
+/// Add (or replace) a `Nats-Request-Info` header on a translated
+/// service-import request. Go v2.15.1 shape, probed: the responder
+/// sees `Nats-Request-Info: {"acc":"<importing account>","rtt":<ns>}`
+/// where `rtt` is the importing client's measured RTT (omitted by
+/// Go when 0). rust-natsd does not measure client RTT, so it emits
+/// `{"acc":...}` only — the account identity, which is what
+/// responders use, is exact; the RTT is absent, as Go's is when
+/// unmeasured.
+fn with_request_info(headers: Option<Bytes>, importing_account: &str) -> Option<Bytes> {
+    let info = serde_json::json!({"acc": importing_account}).to_string();
+    let line = format!("Nats-Request-Info: {info}");
+    match headers {
+        None => Some(Bytes::from(format!("NATS/1.0\r\n{line}\r\n\r\n"))),
+        Some(h) => {
+            let text = String::from_utf8_lossy(&h);
+            let mut body = text.trim_end_matches(['\r', '\n']).to_string();
+            // Drop any pre-existing (possibly forged) Request-Info.
+            let mut kept: Vec<&str> = Vec::new();
+            for l in body.lines() {
+                if l.split(':')
+                    .next()
+                    .is_some_and(|k| k.eq_ignore_ascii_case("Nats-Request-Info"))
+                {
+                    continue;
+                }
+                kept.push(l);
+            }
+            body = kept.join("\r\n");
+            if !body.starts_with("NATS/") {
+                body = format!("NATS/1.0\r\n{body}");
+            }
+            Some(Bytes::from(format!("{body}\r\n{line}\r\n\r\n")))
+        }
+    }
+}
+
 /// Deliver a message: to local subscribers, and (unless it arrived on a
 /// route/leaf) forward it to routes and leafs with matching interest.
 ///
@@ -1043,19 +1122,27 @@ pub fn deliver(
                     );
                     return false;
                 }
-                let mut translated =
-                    Message::new(&remote, None, msg.headers.clone(), msg.payload.clone())
-                        .with_account(&import.source_account)
-                        .with_no_responders(msg.no_responders);
+                let mut translated = Message::new(
+                    &remote,
+                    None,
+                    with_request_info(msg.headers.clone(), &msg.account),
+                    msg.payload.clone(),
+                )
+                .with_account(&import.source_account)
+                .with_no_responders(msg.no_responders);
                 translated.service_translated = true;
                 if let Some(orig_reply) = &msg.reply_to {
                     let seq = shared.import_seq.fetch_add(1, Ordering::SeqCst);
                     let synthetic = format!("_RIMPORT.{seq}");
-                    shared
-                        .import_replies
-                        .lock()
-                        .unwrap()
-                        .insert(synthetic.clone(), (msg.account.clone(), orig_reply.clone()));
+                    prune_import_replies(shared);
+                    shared.import_replies.lock().unwrap().insert(
+                        synthetic.clone(),
+                        (
+                            msg.account.clone(),
+                            orig_reply.clone(),
+                            std::time::Instant::now(),
+                        ),
+                    );
                     translated.reply_to = Some(synthetic);
                 }
                 let delivered = deliver(shared, &translated, origin, None);
@@ -1607,6 +1694,16 @@ struct ConnState {
     no_responders: bool,
     /// Account this connection authenticated as ($G by default).
     account: String,
+    /// JWT account limits for this connection's account, if it is a
+    /// JWT account carrying a `limits` object (Phase 28C). `None`
+    /// means static accounts or limits-less JWT accounts: unlimited.
+    jwt_limits: Option<crate::jwt::AccountLimits>,
+    /// Effective per-message payload limit for this connection:
+    /// min(server `max_payload`, account `payload` limit) when the
+    /// account limit is >= 0, else the server value. Synced into the
+    /// connection's parser after each CONNECT (so a PUB in the same
+    /// TCP chunk as CONNECT is still checked).
+    effective_max_payload: usize,
     /// Effective subject permissions for this connection.
     permissions: crate::config::Permissions,
     /// Per-connection INFO nonce (nkey clients sign this).
@@ -1717,6 +1814,8 @@ async fn handle_conn<R, W>(
         pedantic: false,
         no_responders: false,
         account: "$G".to_string(),
+        jwt_limits: None,
+        effective_max_payload: shared.config.max_payload,
         permissions: crate::config::Permissions::default(),
         nonce: nonce.clone(),
         cert_candidates,
@@ -1743,6 +1842,12 @@ async fn handle_conn<R, W>(
                     if !process_op(op, client_id, &shared, &handle, &tx, &mut state).await {
                         break 'read_loop;
                     }
+                    // Re-sync the parser's payload ceiling after a
+                    // CONNECT that set a per-connection limit (Phase
+                    // 28C): a PUB arriving in the same TCP chunk as
+                    // CONNECT is parsed after this sync, so it is
+                    // checked against the account limit too.
+                    parser.set_max_payload(state.effective_max_payload);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -1778,6 +1883,39 @@ async fn handle_conn<R, W>(
     drop(handle);
 }
 
+/// JWT account publish limits (Phase 28C). Returns `Some(err)` when
+/// the publish must not be delivered, with `close` saying whether
+/// the connection closes too (Go: payload violations close, data
+/// budget exhaustion drops the message and keeps the connection).
+/// A data-limit check that passes charges the payload bytes to the
+/// account's cumulative budget before returning `None`.
+fn publish_limit_violation(
+    state: &ConnState,
+    shared: &Arc<Shared>,
+    payload_len: usize,
+) -> Option<(&'static str, bool)> {
+    let limits = state.jwt_limits.as_ref()?;
+    if limits.payload >= 0 && payload_len > limits.payload as usize {
+        return Some(("Maximum Payload Violation", true));
+    }
+    if limits.data >= 0 {
+        let mut usage = shared.account_data_bytes.lock().unwrap();
+        let used = *usage.get(&state.account).unwrap_or(&0);
+        if used.saturating_add(payload_len as u64) > limits.data as u64 {
+            return Some(("Maximum Data Exceeded", false));
+        }
+        usage.insert(state.account.clone(), used + payload_len as u64);
+    }
+    None
+}
+
+/// Send the limit error for a publish that `publish_limit_violation`
+/// rejected. Returns false when the connection must close.
+async fn send_limit_error(tx: &mpsc::Sender<Bytes>, err: &'static str, close: bool) -> bool {
+    let _ = tx.send(encode_err(err)).await;
+    !close
+}
+
 /// Process one client operation. Returns false when the connection must close.
 async fn process_op(
     op: ClientOp,
@@ -1802,6 +1940,35 @@ async fn process_op(
             state.echo = info.echo;
             state.pedantic = info.pedantic;
             state.no_responders = info.no_responders;
+            // JWT account limits (Phase 28C). The connection limit
+            // is account-wide: count live connections already on
+            // this account (the current entry still says `$G` until
+            // the block below, so it is not counted; exclude it
+            // anyway). At the limit, Go's text and a close.
+            let jwt_limits = shared.config.jwt_account_limits(&outcome.account);
+            if let Some(limits) = &jwt_limits {
+                if limits.conn >= 0 {
+                    let live = {
+                        let infos = shared.conn_info.lock().unwrap();
+                        infos
+                            .values()
+                            .filter(|ci| ci.account == outcome.account && ci.id != client_id)
+                            .count()
+                    };
+                    if live >= limits.conn as usize {
+                        let _ = tx
+                            .send(encode_err("maximum account active connections exceeded"))
+                            .await;
+                        return false;
+                    }
+                }
+                state.effective_max_payload = if limits.payload >= 0 {
+                    shared.config.max_payload.min(limits.payload as usize)
+                } else {
+                    shared.config.max_payload
+                };
+            }
+            state.jwt_limits = jwt_limits;
             state.account = outcome.account.clone();
             state.permissions = outcome.permissions.clone();
             handle.headers.store(info.headers, Ordering::SeqCst);
@@ -1851,8 +2018,13 @@ async fn process_op(
             // same way). An unmapped synthetic subject falls through
             // to the normal permission-checked publish path.
             if subject.starts_with("_RIMPORT.") {
-                let reply_map = shared.import_replies.lock().unwrap().get(&subject).cloned();
+                let reply_map = lookup_import_reply(shared, &subject);
                 if let Some((account, orig_reply)) = reply_map {
+                    if let Some((err, close)) =
+                        publish_limit_violation(state, shared, payload.len())
+                    {
+                        return send_limit_error(tx, err, close).await;
+                    }
                     if state.verbose {
                         let _ = tx.send(encode_ok()).await;
                     }
@@ -1875,6 +2047,12 @@ async fn process_op(
                     )))
                     .await;
                 return true;
+            }
+            // JWT account publish limits (Phase 28C), checked after
+            // permissions and before the verbose +OK, so a rejected
+            // publish is never acknowledged as delivered.
+            if let Some((err, close)) = publish_limit_violation(state, shared, payload.len()) {
+                return send_limit_error(tx, err, close).await;
             }
             // Go ordering (verified): pedantic -ERR first, then the
             // verbose +OK, then delivery to the publisher itself. An
@@ -1916,8 +2094,13 @@ async fn process_op(
             // Same synthetic-reply interception as PUB, preserving
             // headers on the return leg.
             if subject.starts_with("_RIMPORT.") {
-                let reply_map = shared.import_replies.lock().unwrap().get(&subject).cloned();
+                let reply_map = lookup_import_reply(shared, &subject);
                 if let Some((account, orig_reply)) = reply_map {
+                    if let Some((err, close)) =
+                        publish_limit_violation(state, shared, payload.len())
+                    {
+                        return send_limit_error(tx, err, close).await;
+                    }
                     if state.verbose {
                         let _ = tx.send(encode_ok()).await;
                     }
@@ -1938,6 +2121,10 @@ async fn process_op(
                     )))
                     .await;
                 return true;
+            }
+            // JWT account publish limits (Phase 28C), as for PUB.
+            if let Some((err, close)) = publish_limit_violation(state, shared, payload.len()) {
+                return send_limit_error(tx, err, close).await;
             }
             if state.pedantic && !crate::subject::is_valid_publish_subject(&subject) {
                 let _ = tx.send(encode_err("Invalid Publish Subject")).await;
@@ -1985,6 +2172,24 @@ async fn process_op(
                 let sl = shared.sublist.read().unwrap();
                 sl.pattern_of(client_id, &sid).is_some()
             };
+            // JWT account subscription limit (Phase 28C, Go:
+            // per-connection, connection stays alive, subscription
+            // is not created). Duplicate sids are exempt — Go keeps
+            // the first subscription and its count is unchanged.
+            if !already {
+                if let Some(limits) = &state.jwt_limits {
+                    if limits.subs >= 0 {
+                        let count = {
+                            let sl = shared.sublist.read().unwrap();
+                            sl.patterns_for_conn(client_id).len()
+                        };
+                        if count >= limits.subs as usize {
+                            let _ = tx.send(encode_err("maximum subscriptions exceeded")).await;
+                            return true;
+                        }
+                    }
+                }
+            }
             if !already {
                 let is_new = {
                     let mut sl = shared.sublist.write().unwrap();
@@ -3038,5 +3243,63 @@ mod tests {
         assert!(id
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn import_reply_prune_drops_expired_only() {
+        // Phase 28C: entries older than 60 s expire; fresh ones stay.
+        // Exercised with an explicit `now` so the test never waits.
+        let now = std::time::Instant::now();
+        let mut map = HashMap::new();
+        map.insert(
+            "_RIMPORT.1".to_string(),
+            (
+                "B".to_string(),
+                "_INBOX.x".to_string(),
+                now - std::time::Duration::from_secs(61),
+            ),
+        );
+        map.insert(
+            "_RIMPORT.2".to_string(),
+            ("B".to_string(), "_INBOX.y".to_string(), now),
+        );
+        prune_import_map(&mut map, now);
+        assert!(!map.contains_key("_RIMPORT.1"), "expired entry must go");
+        assert!(map.contains_key("_RIMPORT.2"), "fresh entry must stay");
+    }
+
+    #[test]
+    fn request_info_injected_and_forged_replaced() {
+        // No prior headers: a fresh header block is created.
+        let h = with_request_info(None, "B").unwrap();
+        let text = String::from_utf8_lossy(&h);
+        assert_eq!(
+            text, "NATS/1.0\r\nNats-Request-Info: {\"acc\":\"B\"}\r\n\r\n",
+            "fresh header block: {text}"
+        );
+        // Existing headers are preserved, a forged Request-Info is
+        // replaced (exactly one survives, with the real account).
+        let prior = Bytes::from(
+            "NATS/1.0\r\nNats-Msg-Id: abc\r\nNats-Request-Info: {\"acc\":\"E\"}\r\n\r\n",
+        );
+        let h = with_request_info(Some(prior), "B").unwrap();
+        let text = String::from_utf8_lossy(&h);
+        assert!(
+            text.contains("Nats-Msg-Id: abc"),
+            "other header kept: {text}"
+        );
+        assert!(
+            text.contains("Nats-Request-Info: {\"acc\":\"B\"}"),
+            "real account wins: {text}"
+        );
+        assert!(
+            !text.contains("\"acc\":\"E\""),
+            "forged account must not survive: {text}"
+        );
+        assert_eq!(
+            text.matches("Nats-Request-Info").count(),
+            1,
+            "exactly one Request-Info line: {text}"
+        );
     }
 }

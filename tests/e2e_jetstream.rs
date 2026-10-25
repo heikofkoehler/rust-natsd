@@ -396,3 +396,179 @@ async fn raw_api_list_purge_delete() {
     let gone = api(&client, "$JS.API.STREAM.INFO.RAW", serde_json::json!({})).await;
     assert!(gone.get("error").is_some(), "deleted stream must error");
 }
+
+#[tokio::test]
+async fn consumer_info_num_pending_before_and_after_consumption() {
+    // Phase 28C: num_pending is the exact count of non-deleted
+    // stream messages past the consumer's last delivered sequence
+    // matching its filter — not the old hardcoded 0.
+    let (_srv, client) = start_js().await;
+    let js = js(&client);
+    let stream = js
+        .create_stream(jetstream::stream::Config {
+            name: "NP".into(),
+            subjects: vec!["np.>".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("create stream");
+    for (subject, payload) in [("np.a", "one"), ("np.b", "two"), ("np.a", "three")] {
+        js.publish(subject, Bytes::from(payload))
+            .await
+            .expect("send")
+            .await
+            .expect("ack");
+    }
+    let consumer = stream
+        .create_consumer(pull::Config {
+            durable_name: Some("c1".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("create pull consumer");
+    let info = api(
+        &client,
+        "$JS.API.CONSUMER.INFO.NP.c1",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(info["num_pending"], 3, "three messages pending: {info}");
+    let mut batch = consumer
+        .fetch()
+        .max_messages(10)
+        .messages()
+        .await
+        .expect("fetch");
+    let mut got = 0;
+    while let Ok(Some(msg)) = timeout(T, batch.next()).await {
+        msg.expect("fetch message").ack().await.expect("ack");
+        got += 1;
+    }
+    assert_eq!(got, 3);
+    let info = api(
+        &client,
+        "$JS.API.CONSUMER.INFO.NP.c1",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(info["num_pending"], 0, "nothing pending after ack: {info}");
+
+    // A filter_subjects consumer counts only matching messages:
+    // np.a appears at sequences 1 and 3, np.b at 2 does not.
+    let created = api(
+        &client,
+        "$JS.API.CONSUMER.CREATE.NP.c2",
+        serde_json::json!({"stream_name": "NP", "config": {
+            "durable_name": "c2", "filter_subjects": ["np.a"],
+        }}),
+    )
+    .await;
+    assert!(created.get("error").is_none(), "create c2: {created}");
+    let info = api(
+        &client,
+        "$JS.API.CONSUMER.INFO.NP.c2",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(info["num_pending"], 2, "filtered pending count: {info}");
+    assert_eq!(
+        info["config"]["filter_subjects"],
+        serde_json::json!(["np.a"]),
+        "filter_subjects round-trips: {info}"
+    );
+}
+
+#[tokio::test]
+async fn per_account_jetstream_gate_blocks_disabled_account() {
+    // Phase 28C: with multi-account configuration, an account
+    // without `jetstream: enabled` gets Go's 503/10039
+    // "JetStream not enabled for account" on $JS.API.> requests.
+    use rust_natsd::config::{Account, AccountUser};
+    let cfg = Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        cluster_port: 0,
+        jetstream: true,
+        accounts: vec![
+            Account {
+                name: "JA".into(),
+                users: vec![AccountUser {
+                    name: "alice".into(),
+                    pass: Some("alicepw".into()),
+                    ..Default::default()
+                }],
+                jetstream_enabled: true,
+                ..Default::default()
+            },
+            Account {
+                name: "JB".into(),
+                users: vec![AccountUser {
+                    name: "bob".into(),
+                    pass: Some("bobpw".into()),
+                    ..Default::default()
+                }],
+                jetstream_enabled: false,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let srv = server::start(cfg).await.expect("server starts");
+    // async-nats 0.38 ignores URL userinfo (it sends user/pass null),
+    // so credentials go through ConnectOptions explicitly.
+    let alice = async_nats::ConnectOptions::new()
+        .user_and_password("alice".into(), "alicepw".into())
+        .connect(format!("nats://{}", srv.addr))
+        .await
+        .expect("alice connects");
+    let bob = async_nats::ConnectOptions::new()
+        .user_and_password("bob".into(), "bobpw".into())
+        .connect(format!("nats://{}", srv.addr))
+        .await
+        .expect("bob connects");
+
+    let created = api(
+        &alice,
+        "$JS.API.STREAM.CREATE.GATED",
+        serde_json::json!({"subjects": ["g.>"]}),
+    )
+    .await;
+    assert!(
+        created.get("error").is_none(),
+        "enabled account creates: {created}"
+    );
+
+    let denied = api(
+        &bob,
+        "$JS.API.STREAM.CREATE.BLOCKED",
+        serde_json::json!({"subjects": ["b.>"]}),
+    )
+    .await;
+    assert_eq!(denied["error"]["code"], 503, "gated create error: {denied}");
+    assert_eq!(
+        denied["error"]["err_code"], 10039,
+        "gated create err_code: {denied}"
+    );
+    assert!(
+        denied["error"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("JetStream not enabled for account"),
+        "gated create description: {denied}"
+    );
+
+    let info_denied = api(&bob, "$JS.API.INFO", serde_json::json!({})).await;
+    assert_eq!(
+        info_denied["error"]["code"], 503,
+        "gated INFO error: {info_denied}"
+    );
+    assert_eq!(
+        info_denied["error"]["err_code"], 10039,
+        "gated INFO err_code: {info_denied}"
+    );
+    assert_eq!(
+        info_denied["type"], "io.nats.jetstream.api.v1.account_info_response",
+        "gated INFO type matches Go: {info_denied}"
+    );
+    srv.shutdown().await.expect("shutdown");
+}

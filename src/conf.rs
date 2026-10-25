@@ -444,8 +444,25 @@ fn parse_account(name: &str, v: &Value) -> Option<Account> {
         }
     }
     if let Some(js) = map.get("jetstream") {
-        account.jetstream_enabled =
-            matches!(js, Value::Bool(true)) || matches!(js.as_str(), Some("enabled"));
+        // Go shapes: `jetstream: enabled`, `jetstream: true`, and a
+        // `jetstream { ... }` limits block (presence enables it,
+        // unless it explicitly says enabled: false / disabled).
+        // This flag was parsed but not enforced before Phase 28C;
+        // it now gates $JS.API.> for multi-account servers (see
+        // Config::jetstream_enabled_for_account).
+        account.jetstream_enabled = match js {
+            Value::Bool(b) => *b,
+            Value::Str(s) => s == "enabled",
+            Value::Map(m) => {
+                let enabled = m.iter().find(|(k, _)| k == "enabled").map(|(_, v)| v);
+                match enabled {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::Str(s)) => s == "enabled",
+                    _ => true,
+                }
+            }
+            _ => false,
+        };
     }
     // Account imports/exports (Go v2.15.1 shape, probed):
     //   exports: [ { service: "svc.>", accounts: ["B"] },

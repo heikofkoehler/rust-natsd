@@ -40,16 +40,19 @@
 //! implementation: import source pubkeys and export account pubkeys
 //! are translated to account *names* where the account is trusted;
 //! imports from, and exports to, untrusted accounts are dropped
-//! (fail-closed). Account JWT `limits` are not enforced (connections
-//! use the server-wide `max_payload`); account `default_permissions`
+//! (fail-closed). Account JWT `limits` are enforced since Phase
+//! 28C (see [`AccountLimits`]); account `default_permissions`
 //! become the account-level permission fallback for user JWTs that
 //! omit a pub/sub axis. Note for tokens also meant for Go: Go's
 //! limits keys are `conn`/`subs`/`payload`/`data`/`leaf`/
 //! `imports`/`exports` (jwt v2), and an absent numeric limit decodes
-//! to 0, which Go enforces as a real limit (only -1 is unlimited) —
-//! a limits-less account JWT is rejected by Go on the first
-//! connection. Rust ignores limits entirely, so the same token
-//! authenticates here either way.
+//! to 0, which Go enforces as a real limit (only -1 is unlimited).
+//! rust-natsd follows that rule inside a present `limits` object;
+//! a limits-less account JWT (no `limits` object at all) is treated
+//! as unlimited here, where Go would reject its first connection —
+//! a documented deviation that keeps hand-written limits-less
+//! tokens working. Account `revocations` and user `bearer_token`
+//! are honored since Phase 28C (see `verify_user`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -264,6 +267,55 @@ pub fn permissions_from_nats(nats: &Value) -> Permissions {
     }
 }
 
+/// Account-JWT `nats.limits` (Go jwt v2 `OperatorLimits`'s
+/// `NatsLimits` + `AccountLimits` subset that rust-natsd enforces).
+/// -1 means unlimited, any other value (including 0) is a real
+/// limit — Go's decoding, where an absent numeric field decodes to
+/// 0. The whole object is `Option`: when the account JWT carries no
+/// `limits` object at all, rust-natsd treats the account as
+/// unlimited (a deliberate deviation from Go, which would enforce
+/// the zero value and reject the first connection — see the
+/// Phase 28C note; the deviation keeps hand-written limits-less
+/// account JWTs, as used by several existing tests, working).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AccountLimits {
+    /// Max concurrent connections for the account (Go: account-wide).
+    pub conn: i64,
+    /// Max subscriptions per connection (Go: per-connection, via
+    /// the client's effective `msubs`).
+    pub subs: i64,
+    /// Max payload bytes per message for the account.
+    pub payload: i64,
+    /// Account-wide cumulative inbound payload budget, in bytes.
+    /// Go's server does not visibly enforce `NatsLimits.Data` on
+    /// the wire; rust-natsd enforces it as this cumulative budget
+    /// and documents the interpretation (Phase 28C).
+    pub data: i64,
+    /// `limits.disallow_bearer`: user JWTs with `bearer_token`
+    /// must not authenticate against this account.
+    pub disallow_bearer: bool,
+}
+
+impl AccountLimits {
+    fn from_nats(nats: &Value) -> Option<Self> {
+        let limits = nats.get("limits")?;
+        if !limits.is_object() {
+            return None;
+        }
+        let int = |key: &str| -> i64 { limits.get(key).and_then(|v| v.as_i64()).unwrap_or(0) };
+        Some(AccountLimits {
+            conn: int("conn"),
+            subs: int("subs"),
+            payload: int("payload"),
+            data: int("data"),
+            disallow_bearer: limits
+                .get("disallow_bearer")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        })
+    }
+}
+
 /// One trusted account: its JWT-derived identity plus the [`Account`]
 /// the server routes and enforces imports/exports against.
 #[derive(Debug, Clone, PartialEq)]
@@ -278,6 +330,12 @@ pub struct JwtAccount {
     /// Converted account: name, default permissions, imports/exports.
     /// `users` is always empty — users arrive via user JWTs.
     pub account: Account,
+    /// Account-JWT limits, if the claim carried a `limits` object.
+    pub limits: Option<AccountLimits>,
+    /// Account-JWT `nats.revocations`: user public key (or `"*"`)
+    /// -> unix timestamp; a user JWT issued at or before that
+    /// timestamp is revoked (Go `RevocationList::is_revoked`).
+    pub revocations: std::collections::HashMap<String, i64>,
 }
 
 /// Operator trust: one operator public key and the account JWTs it
@@ -506,11 +564,22 @@ impl OperatorTrust {
                     });
                 }
             }
+            let limits = AccountLimits::from_nats(nats);
+            let mut revocations = std::collections::HashMap::new();
+            if let Some(Value::Object(map)) = nats.get("revocations") {
+                for (key, value) in map {
+                    if let Some(ts) = value.as_i64() {
+                        revocations.insert(key.clone(), ts);
+                    }
+                }
+            }
             accounts.push(JwtAccount {
                 pubkey: raw.pubkey,
                 name: raw.name,
                 signing_keys: raw.signing_keys,
                 account,
+                limits,
+                revocations,
             });
         }
         Ok(OperatorTrust {
@@ -559,6 +628,42 @@ impl OperatorTrust {
         if claims.sub != sub {
             return Err("user JWT sub changed between parse and verify".to_string());
         }
+        // Account-level revocations (Phase 28C, Go semantics): a
+        // user JWT issued at or before the revocation timestamp for
+        // its public key — or for `"*"` (all users of the account) —
+        // is revoked. A missing `iat` counts as 0, so any revocation
+        // entry revokes it, as in Go's `is_revoked`.
+        let iat = unverified
+            .payload
+            .get("iat")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if jwt_account
+            .revocations
+            .get("*")
+            .or_else(|| jwt_account.revocations.get(&sub))
+            .is_some_and(|ts| *ts >= iat)
+        {
+            return Err("User Authentication Revoked".to_string());
+        }
+        // Bearer tokens (Phase 28C): `nats.bearer_token: true` on
+        // the user JWT means the JWT itself is the credential and
+        // nonce-signature verification is skipped (Go's
+        // `IsBearerToken`). An account with
+        // `limits.disallow_bearer` rejects bearer tokens outright.
+        let bearer = claims
+            .nats
+            .get("bearer_token")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if bearer
+            && jwt_account
+                .limits
+                .as_ref()
+                .is_some_and(|l| l.disallow_bearer)
+        {
+            return Err("Bearer token not allowed for this account".to_string());
+        }
         match expected_nkey {
             Some(nkey) if nkey == sub => {}
             Some(_) => {
@@ -573,12 +678,16 @@ impl OperatorTrust {
         // Possession proof: the INFO nonce signed with the user key
         // (the JWT sub, whether or not CONNECT carried an nkey).
         // Missing nonce, missing sig, or a bad sig all reject — a JWT
-        // alone never authenticates.
-        let (Some(nonce), Some(sig)) = (nonce, sig_b64) else {
-            return Err("user JWT authentication requires a nonce signature".to_string());
-        };
-        if !crate::config::verify_nkey_sig(&sub, nonce, sig) {
-            return Err("user JWT nonce signature verification failed".to_string());
+        // alone never authenticates. Bearer tokens skip this step
+        // (above); the JWT's own Ed25519 signature, verified in
+        // `verify_jwt`, is still the credential in that case.
+        if !bearer {
+            let (Some(nonce), Some(sig)) = (nonce, sig_b64) else {
+                return Err("user JWT authentication requires a nonce signature".to_string());
+            };
+            if !crate::config::verify_nkey_sig(&sub, nonce, sig) {
+                return Err("user JWT nonce signature verification failed".to_string());
+            }
         }
         let user_name = claims.name.clone().unwrap_or_else(|| sub.clone());
         Ok(UserAuth {

@@ -72,6 +72,33 @@ impl Raw {
         (subject, reply, data[..size].to_vec())
     }
 
+    /// Read one HMSG frame, returning (subject, reply, headers, payload).
+    async fn read_hmsg(&mut self) -> (String, Option<String>, String, Vec<u8>) {
+        let line = self.read_line().await;
+        let parts: Vec<&str> = line.split(' ').collect();
+        assert_eq!(parts[0], "HMSG", "expected HMSG, got: {line}");
+        let (subject, reply, hdr_len, total_len) = if parts.len() == 5 {
+            (
+                parts[1].to_string(),
+                None,
+                parts[3].parse::<usize>().unwrap(),
+                parts[4].parse::<usize>().unwrap(),
+            )
+        } else {
+            assert_eq!(parts.len(), 6, "HMSG shape: {line}");
+            (
+                parts[1].to_string(),
+                Some(parts[3].to_string()),
+                parts[4].parse::<usize>().unwrap(),
+                parts[5].parse::<usize>().unwrap(),
+            )
+        };
+        let data = self.read_exact_n(total_len + 2).await;
+        let headers = String::from_utf8_lossy(&data[..hdr_len]).into_owned();
+        let payload = data[hdr_len..total_len].to_vec();
+        (subject, reply, headers, payload)
+    }
+
     async fn send(&mut self, data: &str) {
         self.stream.write_all(data.as_bytes()).await.unwrap();
     }
@@ -186,10 +213,16 @@ async fn service_request_reply_through_import() {
 
     // Bob requests on B's local subject; alice must see the request
     // on A's exported subject, with a synthetic reply subject.
+    // Phase 28C: the translated request is an HMSG carrying
+    // Nats-Request-Info naming the importing account (B).
     bob.send("PUB local.echo _INBOX.bob1 5\r\nhello\r\n").await;
-    let (subject, reply, payload) = alice.read_msg().await;
+    let (subject, reply, headers, payload) = alice.read_hmsg().await;
     assert_eq!(subject, "svc.echo");
     assert_eq!(payload, b"hello");
+    assert!(
+        headers.contains("Nats-Request-Info: {\"acc\":\"B\"}"),
+        "translated request must carry Nats-Request-Info for B: {headers}"
+    );
     let reply = reply.expect("service request carries a reply subject");
     assert!(
         reply.starts_with("_RIMPORT."),

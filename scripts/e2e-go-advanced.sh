@@ -28,6 +28,9 @@ jetstream {
 accounts {
   A {
     users: [{user: alice, password: alicepw}]
+    # Per-account JetStream gate (Phase 28C): the mirror mode uses
+    # account A, so A must opt in explicitly now.
+    jetstream: enabled
     exports: [{service: "svc.>", accounts: ["B"]}]
   }
   B {

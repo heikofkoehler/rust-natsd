@@ -79,6 +79,33 @@ impl Raw {
         (subject, reply, data[..size].to_vec())
     }
 
+    /// Read one HMSG frame, returning (subject, reply, headers, payload).
+    async fn read_hmsg(&mut self) -> (String, Option<String>, String, Vec<u8>) {
+        let line = self.read_line().await;
+        let parts: Vec<&str> = line.split(' ').collect();
+        assert_eq!(parts[0], "HMSG", "expected HMSG, got: {line}");
+        let (subject, reply, hdr_len, total_len) = if parts.len() == 5 {
+            (
+                parts[1].to_string(),
+                None,
+                parts[3].parse::<usize>().unwrap(),
+                parts[4].parse::<usize>().unwrap(),
+            )
+        } else {
+            assert_eq!(parts.len(), 6, "HMSG shape: {line}");
+            (
+                parts[1].to_string(),
+                Some(parts[3].to_string()),
+                parts[4].parse::<usize>().unwrap(),
+                parts[5].parse::<usize>().unwrap(),
+            )
+        };
+        let data = self.read_exact_n(total_len + 2).await;
+        let headers = String::from_utf8_lossy(&data[..hdr_len]).into_owned();
+        let payload = data[hdr_len..total_len].to_vec();
+        (subject, reply, headers, payload)
+    }
+
     async fn send(&mut self, data: &str) {
         self.stream.write_all(data.as_bytes()).await.unwrap();
     }
@@ -578,9 +605,15 @@ async fn jwt_service_import_uses_area6_machinery() {
     bob.send("SUB _INBOX.bob1 2\r\n").await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     bob.send("PUB local.echo _INBOX.bob1 5\r\nhello\r\n").await;
-    let (subject, reply, payload) = alice.read_msg().await;
+    // Phase 28C: the translated request is an HMSG carrying
+    // Nats-Request-Info naming the importing account (ACCT2).
+    let (subject, reply, headers, payload) = alice.read_hmsg().await;
     assert_eq!(subject, "svc.echo");
     assert_eq!(payload, b"hello");
+    assert!(
+        headers.contains("Nats-Request-Info: {\"acc\":\"ACCT2\"}"),
+        "translated request must carry Nats-Request-Info for ACCT2: {headers}"
+    );
     let reply = reply.expect("service request carries a reply subject");
     assert!(reply.starts_with("_RIMPORT."), "reply: {reply}");
     alice.send(&format!("PUB {reply} 5\r\nworld\r\n")).await;
@@ -877,5 +910,224 @@ async fn jwt_login_without_nkey_field_authenticates() {
     let (subject, _, payload) = client.read_msg().await;
     assert_eq!(subject, "allowed.z");
     assert_eq!(payload, b"hi");
+    srv.shutdown().await.expect("shutdown");
+}
+
+/// Build a server trusting one account JWT with the given extra
+/// `nats` fields (limits, revocations, ...).
+async fn server_with_account_extra(fx: &Fixture, extra: Value) -> server::RunningServer {
+    let acct_jwt = account_jwt(&fx.op, &fx.acct_pub, "ACCT", extra);
+    let cfg = Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        cluster_port: 0,
+        operator: Some(OperatorTrust::from_jwts(&fx.op_jwt, &[acct_jwt]).unwrap()),
+        ..Default::default()
+    };
+    server::start(cfg).await.expect("server starts")
+}
+
+fn full_limits() -> Value {
+    json!({"limits": {"payload": 1048576, "subs": 1000, "data": -1,
+                      "conn": 100, "leaf": -1, "imports": -1, "exports": -1,
+                      "wildcards": true}})
+}
+
+#[tokio::test]
+async fn jwt_account_revocation_rejects_and_past_revocation_allows() {
+    let fx = fixture();
+    // Revocation timestamp in the future: the user JWT (issued now)
+    // is revoked.
+    let mut extra = full_limits();
+    extra.as_object_mut().unwrap().insert(
+        "revocations".into(),
+        serde_json::json!({fx.user_pub.clone(): now_unix() + 3600}),
+    );
+    let srv = server_with_account_extra(&fx, extra).await;
+    let mut client = Raw::connect(srv.addr).await;
+    client
+        .jwt_login(&fx.user_jwt, &fx.user_pub, Some(&fx.user))
+        .await;
+    let line = client.read_line().await;
+    assert!(
+        line.starts_with("-ERR 'Authorization Violation'"),
+        "revoked user rejection: {line}"
+    );
+    srv.shutdown().await.expect("shutdown");
+
+    // Revocation timestamp in the past: the user JWT was issued
+    // after it, so it still authenticates.
+    let mut extra = full_limits();
+    extra.as_object_mut().unwrap().insert(
+        "revocations".into(),
+        serde_json::json!({fx.user_pub.clone(): now_unix() - 3600}),
+    );
+    let srv = server_with_account_extra(&fx, extra).await;
+    let mut client = Raw::connect(srv.addr).await;
+    client
+        .jwt_login(&fx.user_jwt, &fx.user_pub, Some(&fx.user))
+        .await;
+    client.send("PING\r\n").await;
+    assert_eq!(client.read_line().await, "PONG");
+    srv.shutdown().await.expect("shutdown");
+
+    // A "*" revocation revokes every user of the account.
+    let mut extra = full_limits();
+    extra.as_object_mut().unwrap().insert(
+        "revocations".into(),
+        serde_json::json!({"*": now_unix() + 3600}),
+    );
+    let srv = server_with_account_extra(&fx, extra).await;
+    let mut client = Raw::connect(srv.addr).await;
+    client
+        .jwt_login(&fx.user_jwt, &fx.user_pub, Some(&fx.user))
+        .await;
+    let line = client.read_line().await;
+    assert!(
+        line.starts_with("-ERR 'Authorization Violation'"),
+        "star revocation rejection: {line}"
+    );
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn jwt_bearer_token_authenticates_without_nonce_signature() {
+    let fx = fixture();
+    // Bearer user JWT, no nonce signature at all: the JWT itself is
+    // the credential (Go's IsBearerToken).
+    let bearer_jwt = user_jwt(
+        &fx.acct,
+        &fx.acct_pub,
+        &fx.user_pub,
+        None,
+        Some(json!({"bearer_token": true})),
+    );
+    let srv = server_with_account_extra(&fx, full_limits()).await;
+    let mut client = Raw::connect(srv.addr).await;
+    client.jwt_login(&bearer_jwt, &fx.user_pub, None).await;
+    client.send("SUB allowed.x 1\r\n").await;
+    client.send("PUB allowed.x 2\r\nhi\r\n").await;
+    let (subject, _, payload) = client.read_msg().await;
+    assert_eq!(subject, "allowed.x");
+    assert_eq!(payload, b"hi");
+    srv.shutdown().await.expect("shutdown");
+
+    // The same bearer JWT against an account with disallow_bearer
+    // is rejected.
+    let mut extra = full_limits();
+    extra["limits"]["disallow_bearer"] = json!(true);
+    let srv = server_with_account_extra(&fx, extra).await;
+    let mut client = Raw::connect(srv.addr).await;
+    client.jwt_login(&bearer_jwt, &fx.user_pub, None).await;
+    let line = client.read_line().await;
+    assert!(
+        line.starts_with("-ERR 'Authorization Violation'"),
+        "disallow_bearer rejection: {line}"
+    );
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn jwt_account_conn_limit_rejects_second_connection() {
+    let fx = fixture();
+    let extra = json!({"limits": {"payload": 1048576, "subs": 1000, "data": -1,
+                                  "conn": 1}});
+    let srv = server_with_account_extra(&fx, extra).await;
+    let mut first = Raw::connect(srv.addr).await;
+    first
+        .jwt_login(&fx.user_jwt, &fx.user_pub, Some(&fx.user))
+        .await;
+    first.send("PING\r\n").await;
+    assert_eq!(first.read_line().await, "PONG");
+    let mut second = Raw::connect(srv.addr).await;
+    second
+        .jwt_login(&fx.user_jwt, &fx.user_pub, Some(&fx.user))
+        .await;
+    let line = second.read_line().await;
+    assert!(
+        line.contains("maximum account active connections exceeded"),
+        "conn limit rejection: {line}"
+    );
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn jwt_account_subs_limit_rejects_extra_subscription() {
+    let fx = fixture();
+    let extra = json!({"limits": {"payload": 1048576, "subs": 1, "data": -1,
+                                  "conn": 100}});
+    let srv = server_with_account_extra(&fx, extra).await;
+    let mut client = Raw::connect(srv.addr).await;
+    client
+        .jwt_login(&fx.user_jwt, &fx.user_pub, Some(&fx.user))
+        .await;
+    client.send("SUB allowed.a 1\r\n").await;
+    client.send("SUB allowed.b 2\r\n").await;
+    let line = client.read_line().await;
+    assert!(
+        line.contains("maximum subscriptions exceeded"),
+        "subs limit rejection: {line}"
+    );
+    // Connection stays alive after the rejection (Go behaviour).
+    client.send("PING\r\n").await;
+    assert_eq!(client.read_line().await, "PONG");
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn jwt_account_payload_limit_rejects_oversized_publish() {
+    let fx = fixture();
+    let extra = json!({"limits": {"payload": 5, "subs": 1000, "data": -1,
+                                  "conn": 100}});
+    let srv = server_with_account_extra(&fx, extra).await;
+    let mut client = Raw::connect(srv.addr).await;
+    client
+        .jwt_login(&fx.user_jwt, &fx.user_pub, Some(&fx.user))
+        .await;
+    client.send("SUB allowed.x 1\r\n").await;
+    client.send("PUB allowed.x 2\r\nhi\r\n").await;
+    let (subject, _, payload) = client.read_msg().await;
+    assert_eq!(subject, "allowed.x");
+    assert_eq!(payload, b"hi");
+    // 7 bytes over a 5-byte limit: Go's exact error, connection closes.
+    client.send("PUB allowed.x 7\r\ntoolong\r\n").await;
+    let line = client.read_line().await;
+    assert!(
+        line.contains("Maximum Payload Violation"),
+        "payload limit rejection: {line}"
+    );
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn jwt_account_data_limit_drops_over_budget_publish() {
+    let fx = fixture();
+    // Cumulative inbound budget of 10 bytes for the account.
+    let extra = json!({"limits": {"payload": 1048576, "subs": 1000, "data": 10,
+                                  "conn": 100}});
+    let srv = server_with_account_extra(&fx, extra).await;
+    let mut client = Raw::connect(srv.addr).await;
+    client
+        .jwt_login(&fx.user_jwt, &fx.user_pub, Some(&fx.user))
+        .await;
+    client.send("SUB allowed.x 1\r\n").await;
+    for payload in ["12345", "12345"] {
+        client
+            .send(&format!("PUB allowed.x 5\r\n{payload}\r\n"))
+            .await;
+        let (subject, _, got) = client.read_msg().await;
+        assert_eq!(subject, "allowed.x");
+        assert_eq!(got, payload.as_bytes());
+    }
+    // Budget exhausted (10/10): the next byte is dropped with an
+    // error, and the connection stays alive.
+    client.send("PUB allowed.x 1\r\nx\r\n").await;
+    let line = client.read_line().await;
+    assert!(
+        line.contains("Maximum Data Exceeded"),
+        "data limit rejection: {line}"
+    );
+    client.send("PING\r\n").await;
+    assert_eq!(client.read_line().await, "PONG");
     srv.shutdown().await.expect("shutdown");
 }

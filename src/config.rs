@@ -128,9 +128,11 @@ pub struct Account {
     /// `permissions` blocks) and the account-level `authorization`
     /// block some configs use.
     pub permissions: Permissions,
-    /// Parsed from `accounts { NAME { jetstream: enabled } }`; stored
-    /// but not enforced — when `--jetstream` is on, all accounts get
-    /// JetStream (see README non-goals/notes).
+    /// Parsed from `accounts { NAME { jetstream: enabled } }` (see
+    /// `conf.rs` for the accepted shapes). Enforced since Phase
+    /// 28C: on a multi-account server, an account without this flag
+    /// gets 503/10039 on `$JS.API.>` requests (see
+    /// `Config::jetstream_enabled_for_account`).
     pub jetstream_enabled: bool,
     /// Subjects this account exports to other accounts.
     pub exports: Vec<Export>,
@@ -702,6 +704,38 @@ impl Config {
     /// Look up a configured account by name (static or JWT).
     pub fn account(&self, name: &str) -> Option<&Account> {
         self.all_accounts().find(|a| a.name == name)
+    }
+
+    /// True when `name` may use JetStream. Go v2.15.1 behaviour,
+    /// probed: with a global `jetstream {}` block and multi-account
+    /// configuration, an account without `jetstream: enabled` gets
+    /// 503/10039 "JetStream not enabled for account" on `$JS.API.>`
+    /// requests, while an account with the flag works. Single-account
+    /// (`$G`) and JWT-operator accounts are not gated here: JWT
+    /// accounts carry no `.conf` flag, and gating them on a default
+    /// false flag would deny JetStream to every JWT account (Go
+    /// gates JWT JetStream via the account claim's JetStream limits,
+    /// which rust-natsd does not yet parse — see jwt.rs).
+    pub fn jetstream_enabled_for_account(&self, name: &str) -> bool {
+        if self.accounts.is_empty() {
+            return true;
+        }
+        match self.accounts.iter().find(|a| a.name == name) {
+            Some(account) => account.jetstream_enabled,
+            // Not a static account (e.g. a JWT account in mixed
+            // mode): do not gate it on a flag it cannot carry.
+            None => true,
+        }
+    }
+
+    /// JWT-account limits for `name`, if `name` is an operator-trust
+    /// account (see `crate::jwt::AccountLimits`). Static `.conf`
+    /// accounts have no JWT limits and return None.
+    pub fn jwt_account_limits(&self, name: &str) -> Option<crate::jwt::AccountLimits> {
+        self.operator
+            .as_ref()
+            .and_then(|op| op.accounts.iter().find(|a| a.name == name))
+            .and_then(|a| a.limits.clone())
     }
 
     /// True when an import is authorized by the source account's

@@ -340,6 +340,10 @@ struct Consumer {
     created_ns: u64,
     deliver_subject: Option<String>,
     filter_subject: Option<String>,
+    /// Multi-subject filter (`filter_subjects` in CONSUMER.CREATE);
+    /// when non-empty it takes precedence over `filter_subject`,
+    /// matching Go's consumer filter resolution.
+    filter_subjects: Vec<String>,
     ack_policy: AckPolicy,
     ack_wait: Duration,
     max_deliver: i64,
@@ -678,7 +682,39 @@ impl Stream {
 }
 
 impl Consumer {
-    fn info_json(&self, stream_name: &str) -> Value {
+    /// True when `subject` matches this consumer's filter: any of
+    /// `filter_subjects` when set, else `filter_subject`, else all.
+    fn matches_filter(&self, subject: &str) -> bool {
+        if !self.filter_subjects.is_empty() {
+            return self
+                .filter_subjects
+                .iter()
+                .any(|f| subject_matches(f, subject));
+        }
+        match &self.filter_subject {
+            Some(f) => subject_matches(f, subject),
+            None => true,
+        }
+    }
+
+    /// Go's CONSUMER.INFO `num_pending`: non-deleted stream messages
+    /// with sequence greater than the last delivered stream sequence
+    /// (`next_stream_seq - 1`) whose subject matches the consumer's
+    /// filter. Already-delivered-but-unacked messages (in
+    /// `ack_pending`) and redelivery-queue messages have sequences
+    /// below `next_stream_seq`, so they are correctly excluded.
+    fn num_pending(&self, stream: &Stream) -> u64 {
+        let floor = self.next_stream_seq.saturating_sub(1);
+        stream
+            .messages
+            .iter()
+            .filter(|m| {
+                m.seq > floor && !stream.deleted.contains(&m.seq) && self.matches_filter(&m.subject)
+            })
+            .count() as u64
+    }
+
+    fn info_json(&self, stream_name: &str, stream: &Stream) -> Value {
         let ack_policy = match self.ack_policy {
             AckPolicy::Explicit => "explicit",
             AckPolicy::None => "none",
@@ -695,6 +731,7 @@ impl Consumer {
                 // async-nats parses filter_subject as a plain string
                 // (null is a deserialization error); unset means "".
                 "filter_subject": self.filter_subject.clone().unwrap_or_default(),
+                "filter_subjects": self.filter_subjects,
                 "deliver_policy": self.deliver_policy,
                 "ack_policy": ack_policy,
                 "ack_wait": self.ack_wait.as_nanos() as u64,
@@ -715,7 +752,7 @@ impl Consumer {
             "num_ack_pending": self.pending.len(),
             "num_redelivered": self.num_redelivered,
             "num_waiting": self.waiting_pulls.len(),
-            "num_pending": 0,
+            "num_pending": self.num_pending(stream),
         })
     }
 
@@ -887,7 +924,7 @@ fn drain_push(
     actions: &mut Vec<Action>,
 ) {
     loop {
-        let (deliver_subject, filter, max_pending, pending_len, seq) = {
+        let (deliver_subject, matches_filter, max_pending, pending_len, seq) = {
             let Some(c) = stream.consumers.get(consumer_name) else {
                 return;
             };
@@ -896,7 +933,7 @@ fn drain_push(
             };
             (
                 ds,
-                c.filter_subject.clone(),
+                (c.filter_subject.clone(), c.filter_subjects.clone()),
                 c.max_ack_pending,
                 c.pending.len(),
                 c.next_stream_seq,
@@ -922,9 +959,16 @@ fn drain_push(
             }
             break;
         };
-        let matches = match &filter {
-            Some(f) => subject_matches(f, &msg.subject),
-            None => true,
+        let (filter_subject, filter_subjects) = matches_filter;
+        let matches = if !filter_subjects.is_empty() {
+            filter_subjects
+                .iter()
+                .any(|f| subject_matches(f, &msg.subject))
+        } else {
+            match &filter_subject {
+                Some(f) => subject_matches(f, &msg.subject),
+                None => true,
+            }
         };
         let consumer = stream.consumers.get_mut(consumer_name).unwrap();
         consumer.next_stream_seq = seq + 1;
@@ -974,13 +1018,16 @@ fn fulfill_pulls(
                 continue;
             }
         }
-        let Some((reply, filter)) = ({
+        let Some((reply, filters)) = ({
             let Some(c) = stream.consumers.get(consumer_name) else {
                 return;
             };
-            c.waiting_pulls
-                .front()
-                .map(|p| (p.reply.clone(), c.filter_subject.clone()))
+            c.waiting_pulls.front().map(|p| {
+                (
+                    p.reply.clone(),
+                    (c.filter_subject.clone(), c.filter_subjects.clone()),
+                )
+            })
         }) else {
             return;
         };
@@ -1049,9 +1096,16 @@ fn fulfill_pulls(
         }) else {
             continue;
         };
-        let matches = match &filter {
-            Some(f) => subject_matches(f, &msg.subject),
-            None => true,
+        let (filter_subject, filter_subjects) = filters;
+        let matches = if !filter_subjects.is_empty() {
+            filter_subjects
+                .iter()
+                .any(|f| subject_matches(f, &msg.subject))
+        } else {
+            match &filter_subject {
+                Some(f) => subject_matches(f, &msg.subject),
+                None => true,
+            }
         };
         if !matches {
             continue;
@@ -1152,6 +1206,7 @@ impl Engine {
                             "name": c.name,
                             "deliver_subject": c.deliver_subject,
                             "filter_subject": c.filter_subject,
+                            "filter_subjects": c.filter_subjects,
                             "ack_policy": match c.ack_policy {
                                 AckPolicy::Explicit => "explicit",
                                 AckPolicy::None => "none",
@@ -1501,6 +1556,15 @@ impl Engine {
                                 .get("filter_subject")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
+                            filter_subjects: cv
+                                .get("filter_subjects")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                             ack_policy,
                             ack_wait,
                             max_deliver,
@@ -1551,7 +1615,12 @@ impl Engine {
         self.streams.get_mut(name).filter(|s| s.account == account)
     }
 
-    fn process(&mut self, msg: &Message, origin: Origin) -> (bool, Vec<Action>) {
+    fn process(
+        &mut self,
+        msg: &Message,
+        origin: Origin,
+        js_enabled_for_account: bool,
+    ) -> (bool, Vec<Action>) {
         let mut actions = Vec::new();
         if matches!(origin, Origin::Internal) {
             return (false, actions);
@@ -1562,7 +1631,7 @@ impl Engine {
             return (true, actions);
         }
         if let Some(rest) = subject.strip_prefix("$JS.API.") {
-            self.process_api(rest, msg, &mut actions);
+            self.process_api(rest, msg, js_enabled_for_account, &mut actions);
             return (true, actions);
         }
         self.capture(msg, &mut actions);
@@ -2124,7 +2193,13 @@ impl Engine {
 }
 
 impl Engine {
-    fn process_api(&mut self, rest: &str, msg: &Message, actions: &mut Vec<Action>) {
+    fn process_api(
+        &mut self,
+        rest: &str,
+        msg: &Message,
+        js_enabled_for_account: bool,
+        actions: &mut Vec<Action>,
+    ) {
         let Some(reply) = msg.reply_to.clone() else {
             return;
         };
@@ -2134,6 +2209,11 @@ impl Engine {
         // consumer (real nats-server: "...consumer_create_response",
         // not "...consumer_create_<stream>_<consumer>_response").
         let op_name = match parts.as_slice() {
+            // $JS.API.INFO has no rust-natsd implementation (it falls
+            // through to the unknown-operation error), but its type
+            // marker is the account_info one so the not-enabled error
+            // below matches Go's shape for that subject.
+            ["INFO"] => "account_info",
             ["STREAM", "CREATE", ..] => "stream_create",
             ["STREAM", "INFO", ..] => "stream_info",
             ["STREAM", "LIST"] => "stream_list",
@@ -2150,6 +2230,24 @@ impl Engine {
             _ => "unknown",
         };
         let type_name = format!("io.nats.jetstream.api.v1.{op_name}_response");
+        // Per-account JetStream gate (Phase 28C, Go 503/10039): a
+        // multi-account account without `jetstream: enabled` gets
+        // the not-enabled error for every $JS.API operation,
+        // including $JS.API.INFO (Go's account_info_response shape
+        // is approximated by the op-specific type marker, as with
+        // all other rust-natsd API errors).
+        if !js_enabled_for_account {
+            api_error_action(
+                &msg.account,
+                &reply,
+                &type_name,
+                503,
+                10039,
+                "JetStream not enabled for account",
+                actions,
+            );
+            return;
+        }
         match parts.as_slice() {
             ["STREAM", "CREATE", name] => {
                 self.api_stream_create(&msg.account, name, &body, &reply, &type_name, actions);
@@ -2761,6 +2859,16 @@ impl Engine {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty());
+        let filter_subjects: Vec<String> = config
+            .get("filter_subjects")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         let ack_policy = match config.get("ack_policy").and_then(|v| v.as_str()) {
             Some("none") => AckPolicy::None,
             Some("all") => AckPolicy::All,
@@ -2783,14 +2891,21 @@ impl Engine {
                 // With a filter, "last" means the last message matching
                 // the filter, not the stream's last message (which the
                 // drain would otherwise skip past).
-                if let Some(filter) = &filter_subject {
+                let filter_matches = |subject: &str| -> bool {
+                    if !filter_subjects.is_empty() {
+                        filter_subjects.iter().any(|f| subject_matches(f, subject))
+                    } else if let Some(filter) = &filter_subject {
+                        subject_matches(filter, subject)
+                    } else {
+                        true
+                    }
+                };
+                if !filter_subjects.is_empty() || filter_subject.is_some() {
                     stream
                         .messages
                         .iter()
                         .rev()
-                        .find(|m| {
-                            !stream.deleted.contains(&m.seq) && subject_matches(filter, &m.subject)
-                        })
+                        .find(|m| !stream.deleted.contains(&m.seq) && filter_matches(&m.subject))
                         .map(|m| m.seq)
                         .unwrap_or_else(|| stream.last_seq() + 1)
                 } else if stream.messages.is_empty() {
@@ -2813,6 +2928,7 @@ impl Engine {
             created_ns: now_ns(),
             deliver_subject,
             filter_subject,
+            filter_subjects,
             ack_policy,
             ack_wait,
             max_deliver: config
@@ -2833,7 +2949,7 @@ impl Engine {
             ack_floor_consumer_seq: 0,
             num_redelivered: 0,
         };
-        let info = consumer.info_json(stream_name);
+        let info = consumer.info_json(stream_name, stream);
         stream.consumers.insert(name.clone(), consumer);
         // Push consumers with backlog deliver immediately.
         if stream
@@ -2858,15 +2974,17 @@ impl Engine {
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        match self
-            .streams
-            .get(stream_name)
-            .and_then(|s| s.consumers.get(consumer_name))
-        {
-            Some(consumer) => {
-                let info = consumer.info_json(stream_name);
-                api_response(account, reply, type_name, info, actions);
-            }
+        match self.streams.get(stream_name) {
+            Some(stream) => match stream.consumers.get(consumer_name) {
+                Some(consumer) => {
+                    let info = consumer.info_json(stream_name, stream);
+                    api_response(account, reply, type_name, info, actions);
+                }
+                None => {
+                    let (code, err_code, desc) = err_not_found("consumer");
+                    api_error_action(account, reply, type_name, code, err_code, &desc, actions);
+                }
+            },
             None => {
                 let (code, err_code, desc) = err_not_found("consumer");
                 api_error_action(account, reply, type_name, code, err_code, &desc, actions);
@@ -2895,7 +3013,12 @@ impl Engine {
         let consumers: Vec<Value> = names
             .iter()
             .skip(offset)
-            .filter_map(|n| stream.consumers.get(n).map(|c| c.info_json(stream_name)))
+            .filter_map(|n| {
+                stream
+                    .consumers
+                    .get(n)
+                    .map(|c| c.info_json(stream_name, stream))
+            })
             .collect();
         api_response(
             account,
@@ -3031,10 +3154,30 @@ impl Engine {
             }) else {
                 continue;
             };
-            let matches = match &stream.consumers.get(consumer_name).unwrap().filter_subject {
-                Some(f) => subject_matches(f, &m.subject),
-                None => true,
-            };
+            // Defensive exhaustion guard (see fulfill_pulls): a
+            // redelivery queue entry past the cap is dropped with an
+            // advisory, never delivered.
+            {
+                let (max_deliver, account) = {
+                    let c = stream.consumers.get(consumer_name).unwrap();
+                    (c.max_deliver, stream.account.clone())
+                };
+                if max_deliver > 0 && delivered_count > max_deliver as u64 {
+                    actions.push(max_deliver_advisory_action(
+                        stream_name,
+                        &account,
+                        consumer_name,
+                        seq,
+                        delivered_count - 1,
+                    ));
+                    continue;
+                }
+            }
+            let matches = stream
+                .consumers
+                .get(consumer_name)
+                .unwrap()
+                .matches_filter(&m.subject);
             if !matches {
                 continue;
             }
@@ -3258,9 +3401,10 @@ pub fn handle_message(
     msg: &Message,
     origin: Origin,
 ) -> bool {
+    let js_enabled_for_account = shared.config.jetstream_enabled_for_account(&msg.account);
     let (consumed, actions) = {
         let mut engine = js.engine.lock().unwrap();
-        engine.process(msg, origin)
+        engine.process(msg, origin, js_enabled_for_account)
     };
     // Persist after every mutating operation (capture, API, ack) so
     // a restart restores the engine. Cheap at this scale (whole-engine

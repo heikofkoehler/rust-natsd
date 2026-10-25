@@ -967,6 +967,93 @@ for current behaviour.
   issues (JWT bullet removed; the suite now has no `#[ignore]`d
   tests), `parity/KNOWN_DIFFS.md`.
 
+### Phase 28C — num_pending, import reply TTL, JWT/conf enforcement (2026-10-25)
+- Renumbering note (as for 28A/28B): these phases were plan
+  Phases 27A–C; PLAN already has a Phase 27 docs refresh, so they
+  are recorded as 28A–C and the Phase 27 entry is untouched.
+- `src/jetstream.rs`: `ConsumerInfo.num_pending` is now the exact
+  count of non-deleted stream messages with sequence past the
+  consumer's last delivered stream sequence matching
+  `filter_subject` / `filter_subjects` (the latter takes
+  precedence, as in Go); `filter_subjects` is parsed at
+  consumer-create, stored in snapshot v2, round-tripped in
+  CONSUMER.INFO config, and used for delivery matching in
+  `drain_push`, `fulfill_pulls`, and MSG.NEXT (which also gained
+  the 28A max-deliver guard). `Engine::process` takes a
+  per-account JetStream-enabled flag; when false it returns Go's
+  503/10039 "JetStream not enabled for account" with the
+  op-specific type marker (INFO maps to
+  `account_info_response`, matching Go's probed shape).
+- `src/conf.rs` / `src/config.rs`: account `jetstream` now
+  accepts `true`, `enabled`, and a `jetstream { ... }` limits
+  block (presence enables, unless it says `enabled: false` /
+  `disabled`); `Config::jetstream_enabled_for_account` gates
+  only when static multi-account configuration is present —
+  single-account and JWT-operator servers return true (JWT
+  accounts carry no `.conf` flag; Go gates those via account-claim
+  JetStream limits, which rust-natsd does not yet parse).
+- `src/server.rs`: import-reply mappings are now
+  `(account, orig_reply, Instant)` and expire after 60 s, pruned
+  opportunistically on insert and lookup (no background sweep;
+  the TTL rule is unit-tested with an explicit `now` so no test
+  waits 60 s). Translated service-import requests carry
+  `Nats-Request-Info: {"acc": "<importing account>"}` — Go's
+  probed shape minus `rtt`, which Go omits when 0 and rust-natsd
+  never measures; a forged pre-existing header is replaced.
+  JWT account limits are enforced for JWT accounts only (static
+  accounts have no JWT limits): `conn` account-wide at CONNECT
+  (Go's "maximum account active connections exceeded", close),
+  `subs` per-connection at SUB (Go's "maximum subscriptions
+  exceeded", connection stays alive, duplicate sids exempt),
+  `payload` per-message via the connection parser's ceiling
+  (synced after CONNECT so a PUB in the same TCP chunk is
+  checked) plus a belt-and-braces check in PUB/HPUB (Go's
+  "Maximum Payload Violation", close), and `data` as an
+  account-wide cumulative inbound payload budget ("Maximum Data
+  Exceeded", message dropped, connection stays alive). The data
+  interpretation is rust-natsd's own: Go's server does not
+  visibly enforce `NatsLimits.Data` on the wire, and this is
+  stated as such in README and the code.
+- `src/jwt.rs`: account `limits` and `revocations` are parsed
+  from the account JWT (`AccountLimits`, `revocations` map);
+  `verify_user` rejects a user JWT issued at or before its (or
+  `"*"`) revocation timestamp (missing `iat` counts as 0, as in
+  Go), skips the nonce-signature check for `bearer_token: true`
+  unless the account sets `limits.disallow_bearer` (then it
+  rejects), and keeps the nonce check otherwise. Limits
+  semantics: a field absent inside a present `limits` object
+  decodes to 0 and is enforced as a real limit (Go's rule, only
+  -1 is unlimited); an account JWT with no `limits` object at
+  all is treated as unlimited — a deliberate deviation from Go
+  (which would reject its first connection) that keeps
+  hand-written limits-less tokens, as used by several existing
+  tests, working.
+- Tests (existing files only): `tests/e2e_jetstream.rs` gains
+  `consumer_info_num_pending_before_and_after_consumption`
+  (3 → 0 across fetch+ack, plus a `filter_subjects` consumer
+  counting 2 of 3) and
+  `per_account_jetstream_gate_blocks_disabled_account` (503/10039
+  for the disabled account, success for the enabled one, INFO
+  type `account_info_response`); `tests/e2e_imports.rs` gains an
+  HMSG reader and asserts `Nats-Request-Info` for B on the
+  translated request; `tests/e2e_jwt.rs` gains revocation
+  (per-user future/past and `"*"`), bearer (no-sig success,
+  `disallow_bearer` rejection), and conn/subs/payload/data limit
+  tests; the JWT service-import test there also moved to HMSG
+  with a Request-Info assertion for ACCT2. The server unit tests
+  cover the TTL prune rule and Request-Info injection/replacement.
+  `scripts/e2e-go-advanced.sh` gains `jetstream: enabled` on
+  account A (its mirror mode needs JetStream there) now the gate
+  is enforced. Note for future tests: async-nats 0.38 ignores URL
+  userinfo (it sends `user`/`pass` null), so authenticated
+  async-nats clients must use `ConnectOptions::user_and_password`.
+- Docs synced in the same commit: README feature matrix, Known
+  issues (num_pending, import-TTL, Request-Info, JWT limitation
+  bullets rewritten), the `.conf` `jetstream` line, and the stale
+  Tests-section counts; `parity/KNOWN_DIFFS.md` (same items
+  rewritten); this PLAN entry. The suite still has no
+  `#[ignore]`d tests.
+
 ## Future work (not in this plan)
 - Gateways (Phase 24) and JetStream clustering/replication
   (Phase 25): documented remainders with design notes, not
@@ -975,7 +1062,7 @@ for current behaviour.
   JWT imports across routes/leafs, MQTT/WebSocket gateways,
   XKeys, cert-to-user mapping on route/leaf connections,
   KV/object-store client-helper verification.
-- Phase 28C (num_pending, import reply TTL, JWT/conf enforcement)
+- Phase 28C is complete (see above); no further 28-series item
   remains.
 
 ## Design notes
