@@ -1054,6 +1054,97 @@ for current behaviour.
   rewritten); this PLAN entry. The suite still has no
   `#[ignore]`d tests.
 
+### Phase 29 — Modularization: split `server.rs` and `jetstream.rs` (2026-10-25)
+- Renumbering: this work was planned as Phase 28, but PLAN.md
+  already has a Phase 27 (docs refresh) and the bug-fix series is
+  recorded as 28A–C, so the modularization is recorded as Phase 29
+  (plan 28 → 29). The Phase 27 and 28A–C entries are untouched.
+- Pure refactor, no behaviour change: code moved verbatim except
+  visibility bumps (private → `pub(crate)`) for items now used
+  across sibling modules, and the two `deliver()` import blocks
+  below, which became functions. No test file was modified; the
+  test count is unchanged (215 passed / 0 failed / 0 ignored).
+  No `parity/KNOWN_DIFFS.md` change: no behavioural difference
+  closed (any closure would have been a bug in the refactor).
+- `src/server.rs` (3,305 lines) → `src/server/`:
+  `mod.rs` (1,155: `Shared`, `RunningServer`, `start`, supervisor,
+  listener loops, route/leaf handshakes + solicitation),
+  `conn.rs` (1,031: `ConnHandle`/writer/slow-consumer byte queue,
+  `ConnState`, `handle_conn`, `process_op`, client/route/leaf info
+  helpers), `delivery.rs` (991: `Message`/`Origin`, `deliver`,
+  fan-out, global queue-group selection, interest propagation,
+  inbound route/leaf frame processing), `imports.rs` (275:
+  service/stream import translation, `_RIMPORT` TTL table with
+  the 60 s prune rule from Phase 28C). `Message`/`Origin` live in
+  `delivery.rs` and are re-exported from `server/mod.rs`, so
+  `crate::server::{deliver, Message, Origin, Shared}` and the
+  integration-test imports (`server::{self, RunningServer}`) are
+  unchanged. Route/leaf read loops and `process_route_op` /
+  `process_leaf_op` live in `delivery.rs` (they feed `deliver`
+  and interest propagation directly); route/leaf handshakes stay
+  in `mod.rs` (listener/lifecycle). `ConnHandle.headers` /
+  `ConnHandle.close` became `pub(crate)` (read from
+  `delivery.rs`); `ConnState` became `pub(crate)` (named in
+  `process_op`'s now-`pub(crate)` signature). Server unit tests
+  moved with their code: `server_id_shape` stays in
+  `server/mod.rs`, the import-TTL prune and Request-Info tests
+  moved to `server/imports.rs`.
+- `deliver()` import extraction (the only non-verbatim moves in
+  the server split, both in `imports.rs`, both behaviour-identical):
+  the service-import block became `try_service_import`
+  (guard → early `None` return; `return delivered` /
+  `return false` → `Some(..)`), and the stream-import block
+  became `deliver_stream_imports` (`has_delivery = true` →
+  local `delivered_any` flag). `deliver()` calls them at the
+  same points, in the same order. The `_RIMPORT` reply
+  interception in `process_op` still calls `lookup_import_reply`.
+- `src/jetstream.rs` (3,448 lines) → `src/jetstream/`:
+  `mod.rs` (740: `JetStream` facade + lock coordinator,
+  `Engine`/`Stream`/`Consumer`/… types, helpers, `Stream` +
+  `Consumer` method impls), `api.rs` (736: `handle_message`,
+  `Engine::process` dispatch, `process_api` + stream API
+  handlers, API helpers, error codes), `stream.rs` (590:
+  `stream_for`, `store_message`, `fan_out`,
+  `copy_to_dependents`, `backfill`, `would_cycle`, `capture`,
+  `process_ack`), `consumer.rs` (947: `deliver_to_consumer`,
+  `drain_push`, `fulfill_pulls`, consumer API handlers, `tick`,
+  `redelivery_loop`), `storage.rs` (536: `JetStream::persist` /
+  `load_snapshot`, `Engine::snapshot_json` /
+  `from_snapshot_json`). Snapshot format (v2, incl. pending ack
+  state) and the WAL design are untouched — the WAL is still a
+  later phase. `JetStream::load_snapshot` became `pub(crate)`
+  (called from `mod.rs`'s `with_store_dir`); all `Engine` /
+  `Stream` / `Consumer` fields and methods used across modules
+  became `pub(crate)`; `DEDUP_WINDOW`, `DEFAULT_ACK_WAIT`,
+  `TICK` became `pub(crate)` consts. Public exports unchanged
+  (`JetStream`, `handle_message`, `redelivery_loop`,
+  `rfc3339` — the last two re-exported from `jetstream/mod.rs`).
+- Invariants verified by reading the moved code, not assumed:
+  the sublist `RwLock` is never held across socket/channel ops
+  (`deliver` computes matches / notes deliveries under the lock
+  and sends after it drops; `send_local_frames` snapshots
+  targets under the `conns` Mutex and only takes the sublist
+  write lock for `remove_conn` on the slow-consumer path;
+  interest propagation collects handles first, sends after the
+  locks drop); JetStream deliveries still go through the
+  actions pattern (`handle_message` and `redelivery_loop` lock,
+  collect actions, release, persist, then dispatch `deliver` —
+  never delivering while holding `engine.lock()`).
+- Gate: no `src/` file exceeds 1,200 lines after the split
+  (largest is `src/server/mod.rs` at 1,155; next
+  `src/config.rs`, untouched, at 1,100).
+- Verification (full suite, same commit): `cargo fmt --check`
+  clean; `cargo clippy --all-targets -- -D warnings` clean;
+  `cargo test` 215 passed / 0 failed / 0 ignored (same as the
+  pre-refactor baseline); `bash scripts/e2e-go.sh` OK (all Go
+  e2e checks passed, plain + auth); `bash scripts/parity.sh`
+  GREEN — raw probes 52 pass / 1 exception / 0 fail of 53
+  (the exception is the documented nats.go KV client version
+  gate), JS full PASS, JS persistence-restart PASS, cluster
+  smoke PASS, leaf smoke PASS. Docs synced in the same commit:
+  README Design section file layout; this PLAN entry.
+  `parity/KNOWN_DIFFS.md` intentionally untouched.
+
 ## Future work (not in this plan)
 - Gateways (Phase 24) and JetStream clustering/replication
   (Phase 25): documented remainders with design notes, not

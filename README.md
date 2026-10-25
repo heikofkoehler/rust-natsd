@@ -413,20 +413,35 @@ handled in the implementation:
   trie (exact / `*` / `>` nodes) over insertion-ordered subscriptions,
   not a linear scan; see `examples/sublist_bench.rs` for the 10k-subscription
   harness (sparse-subject match ~0.3 µs vs ~350 µs linear, release).
-- `src/server.rs` — Tokio listener; one reader task and one writer task per
+- `src/server/` — Tokio listener; one reader task and one writer task per
   connection connected by a byte-limited queue (default 64 MiB pending,
   the slow-consumer bound; the writer coalesces queued frames into
   64 KiB batched socket writes). The
   writer holds no channel sender, so closing a connection flushes pending
   frames (like a final `-ERR`) before the socket closes. Global queue
   selection across local members, routes, and leafs lives in `deliver()`.
+  Split in Phase 29 (pure move, no behaviour change): `mod.rs` (Shared,
+  lifecycle, listener loops, route/leaf handshakes + solicitation),
+  `conn.rs` (client connections, writer, CONNECT/PING/PONG state machine),
+  `delivery.rs` (`deliver`, fan-out, queue selection, inbound route/leaf
+  frame processing), `imports.rs` (service/stream import translation,
+  `_RIMPORT` TTL table). Public exports unchanged (`server::start`,
+  `RunningServer`, `Message`, `Origin`, `deliver`, …).
 - `src/route.rs` / `src/leaf.rs` — route and leaf protocols, parsers and
   encoders.
-- `src/jetstream.rs` — JetStream engine (in-memory, or file-persisted with `--js-store-dir`). API/ack handling runs
+- `src/jetstream/` — JetStream engine (in-memory, or file-persisted with `--js-store-dir`). API/ack handling runs
   under one lock; deliveries are collected as actions and sent after the
   lock is released (delivery re-enters the engine, so holding the lock
   across it would deadlock). Streams capture only messages published on
   the hosting node; `$JS.API` requests and acks route cluster-wide.
+  Split in Phase 29 (pure move, no behaviour change, snapshot v2 format
+  unchanged): `mod.rs` (facade + lock coordinator, shared types,
+  helpers), `api.rs` (`$JS.API.>` router, stream API handlers, error
+  codes), `stream.rs` (stream state, capture, dedup, retention,
+  mirroring/sourcing), `consumer.rs` (push/pull state machines,
+  `MSG.NEXT`, tick, redelivery loop), `storage.rs` (atomic JSON snapshot
+  persistence). Public exports unchanged (`JetStream`, `handle_message`,
+  `redelivery_loop`, `rfc3339`).
 - `src/tls.rs` — rustls (ring) TLS server config for client connections.
 - `src/monitor.rs` — hand-rolled HTTP/1.1 monitoring server (one request
   per connection, then close). Memory is real (`/varz` `mem` from
