@@ -213,14 +213,24 @@ func auth(url string) {
 // cluster runs cross-node checks: subscribe on addr2, publish on addr1
 // (and the reverse), plus a queue group split across both nodes and a
 // request/reply across nodes. Used for route and leaf interop tests.
+var clusterUser, clusterPass string
+
+func clusterOpts() []nats.Option {
+	opts := []nats.Option{nats.Timeout(5 * time.Second)}
+	if clusterUser != "" {
+		opts = append(opts, nats.UserInfo(clusterUser, clusterPass))
+	}
+	return opts
+}
+
 func cluster(url1, url2 string) {
-	subConn, err := nats.Connect(url2, nats.Timeout(5*time.Second))
+	subConn, err := nats.Connect(url2, clusterOpts()...)
 	check("cluster connect node2", err)
 	if err != nil {
 		return
 	}
 	defer subConn.Close()
-	pubConn, err := nats.Connect(url1, nats.Timeout(5*time.Second))
+	pubConn, err := nats.Connect(url1, clusterOpts()...)
 	check("cluster connect node1", err)
 	if err != nil {
 		return
@@ -364,11 +374,113 @@ func cluster(url1, url2 string) {
 	}
 }
 
+// gateway runs the supercluster account/queue matrix: subscribe on
+// addr2, publish on addr1. APP traffic crosses; OTHER traffic does
+// not; a queue group split across both nodes delivers exactly 20.
+func gateway(url1, url2 string) {
+	appSub, err := nats.Connect(url2, nats.UserInfo("app", "app"), nats.Timeout(5*time.Second))
+	check("gateway app sub connect", err)
+	if err != nil {
+		return
+	}
+	defer appSub.Close()
+	othSub, err := nats.Connect(url2, nats.UserInfo("oth", "oth"), nats.Timeout(5*time.Second))
+	check("gateway oth sub connect", err)
+	if err != nil {
+		return
+	}
+	defer othSub.Close()
+	appPub, err := nats.Connect(url1, nats.UserInfo("app", "app"), nats.Timeout(5*time.Second))
+	check("gateway app pub connect", err)
+	if err != nil {
+		return
+	}
+	defer appPub.Close()
+	othPub, err := nats.Connect(url1, nats.UserInfo("oth", "oth"), nats.Timeout(5*time.Second))
+	check("gateway oth pub connect", err)
+	if err != nil {
+		return
+	}
+	defer othPub.Close()
+
+	asub, err := appSub.SubscribeSync("orders.new")
+	check("gateway app subscribe", err)
+	osub, err := othSub.SubscribeSync("orders.new")
+	check("gateway oth subscribe", err)
+	_ = appSub.Flush()
+	_ = othSub.Flush()
+	got := false
+	for i := 0; i < 50 && !got; i++ {
+		_ = appPub.Publish("orders.new", []byte("app-msg"))
+		_ = appPub.Flush()
+		if msg, err := asub.NextMsg(100 * time.Millisecond); err == nil {
+			expect("gateway app payload", string(msg.Data) == "app-msg", string(msg.Data))
+			got = true
+		}
+	}
+	expect("gateway app delivery", got, "no APP message across gateway")
+	// OTHER must receive nothing for APP publishes, and nothing for
+	// its own publishes from the other node either (no cross-account
+	// leak in either direction is covered by the APP/OTHER split;
+	// here we check the OTHER subscriber stays silent on APP traffic).
+	for i := 0; i < 3; i++ {
+		_ = appPub.Publish("orders.new", []byte("app-msg"))
+	}
+	_ = appPub.Flush()
+	_, err = osub.NextMsg(600 * time.Millisecond)
+	expect("gateway other receives nothing", err == nats.ErrTimeout, fmt.Sprint(err))
+	// OTHER's own traffic does cross within OTHER.
+	_ = othPub.Publish("orders.new", []byte("oth-msg"))
+	_ = othPub.Flush()
+	if msg, err := osub.NextMsg(3 * time.Second); err == nil {
+		expect("gateway oth payload", string(msg.Data) == "oth-msg", string(msg.Data))
+	} else {
+		expect("gateway oth delivery", false, fmt.Sprint(err))
+	}
+
+	// Queue group split across the gateway: exactly 20, no 21st.
+	q1, err := appPub.QueueSubscribeSync("xjobs", "workers")
+	check("gateway queue node1", err)
+	q2, err := appSub.QueueSubscribeSync("xjobs", "workers")
+	check("gateway queue node2", err)
+	_ = appPub.Flush()
+	_ = appSub.Flush()
+	time.Sleep(300 * time.Millisecond)
+	for i := 0; i < 20; i++ {
+		_ = appPub.Publish("xjobs", []byte("x"))
+	}
+	_ = appPub.Flush()
+	total := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for total < 20 && time.Now().Before(deadline) {
+		if _, err := q1.NextMsg(100 * time.Millisecond); err == nil {
+			total++
+			continue
+		}
+		if _, err := q2.NextMsg(100 * time.Millisecond); err == nil {
+			total++
+		}
+	}
+	expect("gateway queue total == 20", total == 20, fmt.Sprintf("got %d", total))
+	time.Sleep(300 * time.Millisecond)
+	extra := false
+	if _, err := q1.NextMsg(100 * time.Millisecond); err == nil {
+		extra = true
+	}
+	if _, err := q2.NextMsg(100 * time.Millisecond); err == nil {
+		extra = true
+	}
+	expect("gateway queue no extra delivery", !extra, "got a 21st message")
+}
+
 func main() {
 	addr := flag.String("addr", "nats://127.0.0.1:4222", "server URL")
 	addr2 := flag.String("addr2", "", "second server URL (cluster mode)")
-	mode := flag.String("mode", "basic", "basic|auth|cluster|js|imports|mirror|genjwt|jwt")
+	user := flag.String("user", "", "username for cluster mode")
+	pass := flag.String("pass", "", "password for cluster mode")
+	mode := flag.String("mode", "basic", "basic|auth|cluster|js|imports|mirror|genjwt|jwt|gateway")
 	flag.Parse()
+	clusterUser, clusterPass = *user, *pass
 	switch *mode {
 	case "basic":
 		basic(*addr)
@@ -386,6 +498,8 @@ func main() {
 		genjwtMode()
 	case "jwt":
 		jwtMode(*addr)
+	case "gateway":
+		gateway(*addr, *addr2)
 	default:
 		fmt.Println("unknown mode:", *mode)
 		os.Exit(2)

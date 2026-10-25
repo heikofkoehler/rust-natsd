@@ -156,6 +156,7 @@ fn varz(shared: &Shared) -> Value {
     let stats = &shared.stats;
     let routes = shared.routes.lock().unwrap().len();
     let leafs = shared.leafs.lock().unwrap().len();
+    let gateways = shared.gateways.lock().unwrap().len();
     let conns = shared.conns.lock().unwrap().len();
     let subs = shared.sublist.read().unwrap().len();
     let mut body = json!({
@@ -188,6 +189,7 @@ fn varz(shared: &Shared) -> Value {
         "total_connections": stats.total_connections.load(Ordering::Relaxed),
         "routes": routes,
         "leafnodes": leafs,
+        "gateways": gateways,
         "in_msgs": stats.in_msgs.load(Ordering::Relaxed),
         "out_msgs": stats.out_msgs.load(Ordering::Relaxed),
         "in_bytes": stats.in_bytes.load(Ordering::Relaxed),
@@ -326,9 +328,99 @@ fn accounz(shared: &Shared) -> Value {
     json!({ "total": total, "accounts": accounts })
 }
 
-/// No gateways are implemented, so the list is always empty.
+/// Gateway connections in Go's `/gatewayz` shape (Phase 33):
+/// `outbound_gateways` maps a peer gateway name to one connection
+/// (with `configured` true only for explicitly configured
+/// solicitations, false for implicit ones), and `inbound_gateways`
+/// maps a peer gateway name to a list of connections (Go's shape;
+/// a single-server gateway has at most one per name here, but the
+/// list shape is kept so a multi-server peer gateway reads the
+/// same). This replaces the pre-Phase-33 `{"gateways": []}` shape;
+/// with no gateways both maps are empty objects. The `name` is the
+/// gateway name when one is configured, else the server name.
 fn gatewayz(shared: &Shared) -> Value {
-    json!({ "name": shared.config.name, "gateways": [] })
+    let gateway_name = shared
+        .config
+        .gateway
+        .as_ref()
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| shared.config.name.clone());
+    let (host, port) = match shared.gateway_addr {
+        Some(a) => (a.ip().to_string(), a.port()),
+        None => (
+            shared
+                .config
+                .gateway
+                .as_ref()
+                .map(|g| g.host.clone())
+                .unwrap_or_default(),
+            shared.config.gateway.as_ref().map(|g| g.port).unwrap_or(0),
+        ),
+    };
+    let gateways = shared.gateways.lock().unwrap();
+    let subs = shared.gateway_subs.lock().unwrap();
+    let infos = shared.conn_info.lock().unwrap();
+    let mut outbound = serde_json::Map::new();
+    let mut inbound: serde_json::Map<String, Value> = serde_json::Map::new();
+    for (gid, gateway) in gateways.iter() {
+        let info = infos.get(gid);
+        let (ip, port) = match info
+            .map(|i| i.addr.clone())
+            .unwrap_or_default()
+            .rsplit_once(':')
+        {
+            Some((ip, port)) => (ip.to_string(), port.parse::<u16>().unwrap_or(0)),
+            None => (String::new(), 0),
+        };
+        let start = info
+            .map(|i| {
+                SystemTime::now()
+                    .checked_sub(i.started.elapsed())
+                    .unwrap_or(SystemTime::UNIX_EPOCH)
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let subscriptions = subs.get(gid).map(|m| m.len()).unwrap_or(0);
+        let connection = json!({
+            "cid": gid,
+            "kind": "Gateway",
+            "ip": ip,
+            "port": port,
+            "start": rfc3339(start),
+            "uptime": go_duration(info.map(|i| i.started.elapsed()).unwrap_or_default()),
+            "idle": 0,
+            "pending_bytes": gateway.handle.pending_bytes.load(Ordering::Relaxed),
+            "in_msgs": gateway.handle.in_msgs.load(Ordering::Relaxed),
+            "out_msgs": gateway.handle.out_msgs.load(Ordering::Relaxed),
+            "in_bytes": gateway.handle.in_bytes.load(Ordering::Relaxed),
+            "out_bytes": gateway.handle.out_bytes.load(Ordering::Relaxed),
+            "subscriptions": subscriptions,
+            "name": gateway.peer_id.lock().unwrap().clone().unwrap_or_default(),
+        });
+        if gateway.outbound {
+            outbound.insert(
+                gateway.peer_gateway.clone(),
+                json!({ "configured": gateway.configured, "connection": connection }),
+            );
+        } else {
+            inbound
+                .entry(gateway.peer_gateway.clone())
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "configured": gateway.configured, "connection": connection }));
+        }
+    }
+    json!({
+        "server_id": shared.server_id,
+        "name": gateway_name,
+        "host": host,
+        "port": port,
+        "outbound_gateways": outbound,
+        "inbound_gateways": inbound,
+    })
 }
 
 fn subz(shared: &Shared) -> Value {
@@ -364,6 +456,17 @@ fn subz(shared: &Shared) -> Value {
                 "queue": queue,
                 "sid": Value::Null,
                 "cid": lid,
+                "account": account,
+            }));
+        }
+    }
+    for (gid, interests) in shared.gateway_subs.lock().unwrap().iter() {
+        for (account, subject, queue) in interests.keys() {
+            subscriptions.push(json!({
+                "subject": subject,
+                "queue": queue,
+                "sid": Value::Null,
+                "cid": gid,
                 "account": account,
             }));
         }

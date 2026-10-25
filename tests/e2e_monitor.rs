@@ -211,10 +211,11 @@ async fn monitor_phase16_varz_accounz_gatewayz_connz_filters() {
     assert_eq!(by_name("B")["connections"], 1);
     assert_eq!(by_name("$G")["connections"], 0);
 
-    // gatewayz: no gateways, empty list.
+    // gatewayz: no gateways, empty Go-shape maps (Phase 33).
     let (status, gatewayz) = get(&srv, "/gatewayz").await;
     assert_eq!(status, 200);
-    assert_eq!(gatewayz["gateways"], serde_json::json!([]));
+    assert_eq!(gatewayz["outbound_gateways"], serde_json::json!({}));
+    assert_eq!(gatewayz["inbound_gateways"], serde_json::json!({}));
 
     // connz filters: acc, limit/offset, state, and per-connection fields.
     let (status, connz) = get(&srv, "/connz?acc=A").await;
@@ -264,10 +265,11 @@ async fn monitor_subz_routez_leafz_gatewayz_shapes() {
     assert_eq!(status, 200);
     assert_eq!(leafz["num_leafnodes"], 0);
     assert_eq!(leafz["leafnodes"], serde_json::json!([]));
-    // Gateways are not implemented: always the empty shape, never 404.
+    // No gateways connected: the empty Go shape, never 404.
     let (status, gatewayz) = get(&srv, "/gatewayz").await;
     assert_eq!(status, 200);
-    assert_eq!(gatewayz["gateways"], serde_json::json!([]));
+    assert_eq!(gatewayz["outbound_gateways"], serde_json::json!({}));
+    assert_eq!(gatewayz["inbound_gateways"], serde_json::json!({}));
     srv.shutdown().await.expect("shutdown");
 }
 

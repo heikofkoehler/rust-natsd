@@ -12,6 +12,10 @@
 //! - `leafnodes { port, tls {...}, remotes [{url, tls {...}}],
 //!   authorization { user, password } }`
 //! - `jetstream` (boolean, or a block with `store_dir`)
+//! - `gateway { name, host, port, tls {...},
+//!   gateways: [{ name, urls: [...], tls {...} }] }` (Phase 33; the
+//!   solicitation key is `gateways`, not `remotes` — Go rejects
+//!   `remotes` as unknown, probed in Phase 24)
 //! - `tls { cert_file, key_file, ca_file, verify, verify_and_map }`
 //!   (client listener; `verify_and_map` maps a client certificate to
 //!   a user by SAN/CN/DN)
@@ -32,14 +36,14 @@
 //!   working directory.
 //!
 //! Not supported (ignored or, for `include`, rejected): `include`,
-//! logging, limits, websocket/mqtt/gateway sections. A config using
-//! those will load, but the features stay off — the README says so.
+//! logging, limits, websocket/mqtt sections. A config using those
+//! will load, but the features stay off — the README says so.
 
 use std::collections::HashMap;
 
 use crate::config::{
-    parse_duration, parse_size, Account, AccountUser, Config, Export, Import, ImportKind,
-    Permissions, TlsSettings,
+    parse_duration, parse_size, Account, AccountUser, Config, Export, GatewayRemote, Import,
+    ImportKind, Permissions, TlsSettings,
 };
 
 /// A parsed config value.
@@ -848,6 +852,55 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
                 cfg.leaf_pass = Some(p.to_string());
             }
         }
+    }
+    if let Some(v) = lookup(&top, "gateway") {
+        let map = map_of(&v).ok_or("gateway must be a block")?;
+        let mut gw = cfg.gateway.clone().unwrap_or_default();
+        if let Some(n) = map.get("name").and_then(|v| v.as_str()) {
+            gw.name = n.to_string();
+        }
+        if let Some(h) = map.get("host").and_then(|v| v.as_str()) {
+            gw.host = h.to_string();
+        }
+        if let Some(p) = map.get("port") {
+            gw.port = as_u16(p, "gateway port")?;
+        }
+        if let Some(t) = map.get("tls") {
+            gw.tls = Some(parse_tls_block(t, gw.tls.clone().unwrap_or_default()));
+        }
+        if let Some(r) = map.get("gateways") {
+            match r {
+                Value::List(items) => {
+                    let mut remotes = Vec::new();
+                    for item in items {
+                        let m = map_of(item).ok_or("gateway entry must be a block")?;
+                        let name = m
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .ok_or("gateway entry requires a name")?;
+                        let urls = m
+                            .get("urls")
+                            .map(|v| as_string_list(v))
+                            .transpose()?
+                            .unwrap_or_default();
+                        let tls = m
+                            .get("tls")
+                            .map(|t| parse_tls_block(t, TlsSettings::default()));
+                        remotes.push(GatewayRemote {
+                            name: name.to_string(),
+                            urls,
+                            tls,
+                        });
+                    }
+                    gw.remotes = remotes;
+                }
+                _ => return Err("gateway gateways must be a list".to_string()),
+            }
+        }
+        // Unknown gateway keys are ignored, like other .conf sections:
+        // Go's `remotes` key (rejected by Go itself) is simply not
+        // read here, so a config using it loads without soliciting.
+        cfg.gateway = Some(gw);
     }
     if let Some(v) = lookup(&top, "tls") {
         let tls = parse_tls_block(&v, cfg.tls.clone().unwrap_or_default());

@@ -94,11 +94,11 @@ rust-natsd does; it replaces the older support table.
 | Monitoring `/leafz` | Implemented | Field naming differs from Go (count vs list shape); counts compared in the parity suite |
 | Monitoring `/jsz` | Implemented | |
 | Monitoring `/accounz` | Implemented | Rust superset: Go 2.15.1 answers 404 here |
-| Monitoring `/gatewayz` | Partial | Empty response only; no gateway protocol is implemented (see Phase 24 remainder note) |
+| Monitoring `/gatewayz` | Implemented | Go shape: `outbound_gateways` / `inbound_gateways` with real connection states and `configured` flags (Phase 33) |
 | Monitoring `/healthz` | Implemented | |
 | Config files (`.conf`) | Partial | nats-server `.conf` subset via `-c` (CLI wins over file); unknown keys ignored |
 | `INFO` completeness | Partial | Omits Go-only fields by design: `git_commit`, `go`, `xkey`, and `api_lvl` (Go's JetStream API level — advertising 5 would gate clients into JS features Rust does not implement). All other fields match Go, including omitempty semantics |
-| Gateways (super-cluster) | Not implemented | Remainder, not implemented — design note in PLAN Phase 24, with the Go 2.15.1 gateway handshake, RS+/RMSG framing, and account scoping probed on the wire; no gateway protocol code, no accepting stub |
+| Gateways (super-cluster) | Implemented | INFO-first handshake, cmd 2/3 per account, accepter→dialer RS+ only (dialer RS+ is a Go protocol violation), account-token scoping, implicit back-connects, gateway reply-subject return path, implicit mTLS; verified Go↔Rust both seed directions + TLS (Phase 33, design note Phase 24) |
 | MQTT / WebSocket gateways | Not implemented | Non-goal |
 
 See [PLAN.md](PLAN.md) for the phased plan and design notes.
@@ -186,13 +186,14 @@ identical per-member queue distribution: both are compared on
 supported fields / totals only, by design.
 
 **Scope — what mainline does that rust-natsd deliberately does not.**
-Gateways (super-cluster) and JetStream clustering/replication are
-documented remainders (design notes in PLAN Phases 24–25, not
-implemented, not planned-imminent); cross-node mirroring/sourcing,
+JetStream clustering/replication is a documented remainder
+(design note in PLAN Phase 25, not implemented, not
+planned-imminent); cross-node mirroring/sourcing,
 MQTT/WebSocket gateways,
 and XKeys are non-goals. JetStream
 clustering/replication is still single-node only, but mirroring/sourcing
-and account imports now work across routes/leafs too (Phase 32).
+and account imports now work across routes/leafs too (Phase 32), and
+gateways (super-cluster) are implemented since Phase 33.
 Conversely, rust-natsd is a superset in
 exactly one place: it implements `/subz` and `/accounz`, which Go
 2.15.1 answers with 404.
@@ -312,14 +313,19 @@ tests in the suite.
   available), though claim shapes were verified against the JWT
   library source.
 - **Scope limits (also the out-of-scope list, kept identical in
-  PLAN.md and `parity/KNOWN_DIFFS.md`):** gateways, JetStream
+  PLAN.md and `parity/KNOWN_DIFFS.md`):** JetStream
   clustering/Raft/WAL, MQTT/WebSocket, JWT imports
   across routes/leafs, XKeys, cert-to-user mapping on route/leaf
   connections (CA verification only there), and Go-only INFO
   fields (`git_commit`, `go`, `xkey`, `api_lvl` — advertising
   Go's JS API level would gate clients into unimplemented JS
   features). Per-account `jetstream: enabled` in `.conf` is
-  enforced since Phase 28C (see above).
+  enforced since Phase 28C (see above). Gateways are implemented
+  since Phase 33; JetStream API and stream-import interest are not
+  advertised over gateways, and a gateway TLS listener without
+  `verify` and no CA does not require a client certificate where
+  Go's does (Go dialers always present one, so interop is
+  unaffected).
 
 ## Tests
 
@@ -329,6 +335,7 @@ bash scripts/e2e-go-advanced.sh # Go client imports, mirror, JWT minting (JWT mo
 bash scripts/e2e-go.sh        # Go client core e2e
 bash scripts/e2e-go-cluster.sh  # Go <-> Rust route interop, both seed directions
 bash scripts/e2e-go-leaf.sh     # Go <-> Rust leaf interop, both directions
+bash scripts/e2e-go-gateway.sh  # Go <-> Rust gateway interop, 4-direction matrix + implicit + account + queue + TLS
 bash scripts/e2e-go-js.sh       # Go JetStream interop (nats.go JS client)
 bash scripts/e2e-go-route-leaf-tls.sh  # Go <-> Rust route/leaf TLS interop, both directions
 ```

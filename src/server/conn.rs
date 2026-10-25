@@ -113,6 +113,31 @@ pub(crate) struct LeafConn {
     pub(crate) account: String,
 }
 
+/// A gateway connection (either side: accepter-side inbound, or
+/// solicited outbound — one connection per direction, not one shared
+/// socket, as Go's supercluster forms them). Unlike leafs, a gateway
+/// connection is multi-account: every RS+/RMSG frame carries its
+/// account token, and accounts are matched by name across gateways.
+/// `configured` mirrors Go's `/gatewayz`: true only for an explicitly
+/// configured solicitation; inbound connections and implicit
+/// solicitations report false.
+pub(crate) struct GatewayConn {
+    pub(crate) handle: Arc<ConnHandle>,
+    /// The peer gateway's name (from its CONNECT/INFO `gateway`).
+    pub(crate) peer_gateway: String,
+    /// The peer server's id (from its INFO `server_id`).
+    pub(crate) peer_id: Mutex<Option<String>>,
+    /// True for solicited (outbound) connections, false for inbound.
+    pub(crate) outbound: bool,
+    pub(crate) configured: bool,
+    /// Accounts the peer has announced via cmd 2 (informational;
+    /// forwarding is interest-driven regardless).
+    pub(crate) announced_accounts: Mutex<Vec<String>>,
+    /// Accounts the peer has marked interest-only via cmd 3
+    /// (informational; see gateway.rs on the inference).
+    pub(crate) interest_only_accounts: Mutex<Vec<String>>,
+}
+
 /// Connection metadata for the monitoring endpoint.
 #[derive(Debug, Clone)]
 pub struct ConnInfo {

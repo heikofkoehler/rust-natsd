@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -124,6 +125,12 @@ pub enum Origin {
     Local(u64, bool),
     Route(u64),
     Leaf(u64),
+    /// A message arriving on a gateway connection. Delivered locally
+    /// only, like Route/Leaf origin: never forwarded back to any
+    /// gateway (loop prevention), and never to routes/leafs either,
+    /// since each node holds its own gateway connections to the
+    /// peer cluster and route-forwarding would duplicate it.
+    Gateway(u64),
     Internal,
 }
 
@@ -239,6 +246,36 @@ pub fn deliver(
                 forwarded = true;
             }
         }
+        // Phase 33: gateway plain interest, same route framing with
+        // the account token (queue selection does not apply to the
+        // route_via path: it is a single consumer delivery).
+        for (gid, handle, plain, _) in gateway_interest_full(shared, &msg.subject, &msg.account) {
+            if !plain {
+                continue;
+            }
+            let frame = match &msg.headers {
+                Some(h) => encode_route_hmsg(
+                    &msg.account,
+                    &msg.subject,
+                    msg.reply_to.as_deref(),
+                    h,
+                    &msg.payload,
+                ),
+                None => encode_rmsg(
+                    &msg.account,
+                    &msg.subject,
+                    msg.reply_to.as_deref(),
+                    &[],
+                    &msg.payload,
+                ),
+            };
+            if try_send(&handle, frame) {
+                forwarded = true;
+            } else {
+                eprintln!("rust-natsd: slow gateway {gid}, closing (consumer delivery)");
+                close_gateway(shared, gid);
+            }
+        }
         return forwarded;
     }
 
@@ -247,9 +284,12 @@ pub fn deliver(
         _ => (u64::MAX, true),
     };
 
-    // Messages arriving on a route/leaf are delivered locally only
-    // (full mesh / hub-and-spoke loop prevention).
-    if matches!(origin, Origin::Route(_) | Origin::Leaf(_)) {
+    // Messages arriving on a route/leaf/gateway are delivered locally
+    // only (full mesh / hub-and-spoke / supercluster loop prevention).
+    if matches!(
+        origin,
+        Origin::Route(_) | Origin::Leaf(_) | Origin::Gateway(_)
+    ) {
         // Phase 32: a service-import reply arriving over a route/leaf
         // is claimed by the node that minted its mapping, if any, and
         // delivered to the importer's original reply subject; a reply
@@ -285,7 +325,7 @@ pub fn deliver(
         let result = {
             let mut sl = shared.sublist.write().unwrap();
             match origin {
-                Origin::Route(_) | Origin::Leaf(_) => {
+                Origin::Route(_) | Origin::Leaf(_) | Origin::Gateway(_) => {
                     // Filtered queue selection for remote-origin messages.
                     let gm = sl.match_groups(
                         &msg.subject,
@@ -328,6 +368,18 @@ pub fn deliver(
         if !msg.service_translated && super::imports::deliver_stream_imports(shared, msg) {
             delivered = true;
         }
+        // Phase 33: a reply arriving on a gateway whose subject is
+        // itself a recorded reply subject (a request that passed
+        // through this node earlier) is forwarded onward over the
+        // recorded connection — the multi-hop return path. The
+        // connection it arrived on is excluded (it already got it).
+        if let Origin::Gateway(gid) = origin {
+            let mut sent = std::collections::HashSet::new();
+            sent.insert(gid);
+            if forward_gateway_reply(shared, msg, &sent) {
+                delivered = true;
+            }
+        }
         return delivered;
     }
 
@@ -356,8 +408,9 @@ pub fn deliver(
     }
 
     // Local / internal origin: global queue selection across local
-    // members, routes, and leafs (weighted by member count), so a queue
-    // group spanning nodes still delivers exactly once per message.
+    // members, routes, leafs, and gateways (weighted by member
+    // count), so a queue group spanning nodes still delivers exactly
+    // once per message.
     let gm = {
         let sl = shared.sublist.read().unwrap();
         sl.match_groups(
@@ -369,15 +422,18 @@ pub fn deliver(
     };
     let route_full = route_interest_full(shared, &msg.subject, &msg.account);
     let leaf_full = leaf_interest_full(shared, &msg.subject, &msg.account);
+    let gateway_full = gateway_interest_full(shared, &msg.subject, &msg.account);
 
     enum Dest {
         Local(crate::sublist::Delivery),
         Route(u64),
         Leaf(u64),
+        Gateway(u64),
     }
     let mut local_deliveries: Vec<crate::sublist::Delivery> = gm.plain;
     let mut route_selected: HashMap<u64, Vec<String>> = HashMap::new();
     let mut leaf_selected: HashMap<u64, Vec<String>> = HashMap::new();
+    let mut gateway_selected: HashMap<u64, Vec<String>> = HashMap::new();
     for (group, members) in &gm.groups {
         let mut dests: Vec<Dest> = members.iter().map(|m| Dest::Local(m.clone())).collect();
         for (rid, _, _, counts) in &route_full {
@@ -390,6 +446,11 @@ pub fn deliver(
                 dests.push(Dest::Leaf(*lid));
             }
         }
+        for (gid, _, _, counts) in &gateway_full {
+            for _ in 0..counts.get(group).copied().unwrap_or(0) {
+                dests.push(Dest::Gateway(*gid));
+            }
+        }
         if dests.is_empty() {
             continue;
         }
@@ -398,6 +459,10 @@ pub fn deliver(
             Dest::Local(d) => local_deliveries.push(d.clone()),
             Dest::Route(rid) => route_selected.entry(*rid).or_default().push(group.clone()),
             Dest::Leaf(lid) => leaf_selected.entry(*lid).or_default().push(group.clone()),
+            Dest::Gateway(gid) => gateway_selected
+                .entry(*gid)
+                .or_default()
+                .push(group.clone()),
         }
     }
     let expired = {
@@ -411,14 +476,16 @@ pub fn deliver(
         .out_msgs
         .fetch_add(local_deliveries.len() as u64, Ordering::Relaxed);
 
-    // No-responders accounting is computed before the route/leaf loops
-    // consume route_full/leaf_full: any local delivery, plain route/leaf
-    // interest, or selected queue group counts as a responder.
+    // No-responders accounting is computed before the route/leaf/
+    // gateway loops consume those vectors: any local delivery, plain
+    // remote interest, or selected queue group counts as a responder.
     let mut has_delivery = !local_deliveries.is_empty()
         || route_selected.values().any(|v| !v.is_empty())
         || leaf_selected.values().any(|v| !v.is_empty())
+        || gateway_selected.values().any(|v| !v.is_empty())
         || route_full.iter().any(|(_, _, plain, _)| *plain)
-        || leaf_full.iter().any(|(_, _, plain, _)| *plain);
+        || leaf_full.iter().any(|(_, _, plain, _)| *plain)
+        || gateway_full.iter().any(|(_, _, plain, _)| *plain);
 
     // Routes: one frame per route with plain interest and/or a selected
     // queue group. The queues list on the frame is exactly the groups
@@ -471,6 +538,44 @@ pub fn deliver(
             eprintln!("rust-natsd: slow leaf {lid}, closing");
             close_leaf(shared, lid);
         }
+    }
+    // Gateways: route framing with the account token, one frame per
+    // gateway with plain interest and/or a selected queue group.
+    let mut gateway_sent: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for (gid, handle, plain, _counts) in gateway_full {
+        let selected = gateway_selected.get(&gid).cloned().unwrap_or_default();
+        if !plain && selected.is_empty() {
+            continue;
+        }
+        let frame = match &msg.headers {
+            Some(h) => encode_route_hmsg(
+                &msg.account,
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                h,
+                &msg.payload,
+            ),
+            None => encode_rmsg(
+                &msg.account,
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                &selected,
+                &msg.payload,
+            ),
+        };
+        if try_send(&handle, frame) {
+            gateway_sent.insert(gid);
+        } else {
+            eprintln!("rust-natsd: slow gateway {gid}, closing");
+            close_gateway(shared, gid);
+        }
+    }
+    // Phase 33: a publish to a recorded gateway reply subject (a
+    // reply to a request that arrived over a gateway) flows back
+    // over that connection even without RS+ interest — Go's shadow
+    // mechanism, since gateways do not propagate `_INBOX` subs.
+    if forward_gateway_reply(shared, msg, &gateway_sent) {
+        has_delivery = true;
     }
 
     // Stream imports (local/internal publishes only, same node):
@@ -591,6 +696,39 @@ pub(crate) fn forward_remote_import_reply(shared: &Arc<Shared>, msg: &Message) {
             ),
         };
         let _ = try_send(&handle, frame);
+    }
+    // Gateways: route framing with the account token, claimed on
+    // arrival by the gateway-origin `_RIMPORT` branch of `deliver`
+    // (same as the route branch).
+    let gateway_handles: Vec<(u64, Arc<ConnHandle>)> = shared
+        .gateways
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, g)| !g.handle.is_closed())
+        .map(|(id, g)| (*id, g.handle.clone()))
+        .collect();
+    for (gid, handle) in gateway_handles {
+        let frame = match &msg.headers {
+            Some(h) => encode_route_hmsg(
+                &msg.account,
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                h,
+                &msg.payload,
+            ),
+            None => encode_rmsg(
+                &msg.account,
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                &[],
+                &msg.payload,
+            ),
+        };
+        if !try_send(&handle, frame) {
+            eprintln!("rust-natsd: slow gateway {gid}, closing (import reply)");
+            close_gateway(shared, gid);
+        }
     }
 }
 
@@ -715,6 +853,12 @@ pub(crate) fn has_interest(shared: &Arc<Shared>, account: &str, subject: &str) -
             return true;
         }
     }
+    for subs in shared.gateway_subs.lock().unwrap().values() {
+        let (plain, counts) = interest_of(subs, subject, account);
+        if plain || !counts.is_empty() {
+            return true;
+        }
+    }
     false
 }
 
@@ -762,7 +906,29 @@ pub(crate) fn leaf_interest_full(
         .collect()
 }
 
-/// Broadcast a local subscription change to all routes and leafs.
+pub(crate) fn gateway_interest_full(
+    shared: &Arc<Shared>,
+    subject: &str,
+    account: &str,
+) -> InterestTargets {
+    let subs = shared.gateway_subs.lock().unwrap();
+    shared
+        .gateways
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, g)| !g.handle.is_closed())
+        .map(|(id, g)| {
+            let (plain, counts) = subs
+                .get(id)
+                .map(|m| interest_of(m, subject, account))
+                .unwrap_or((false, HashMap::new()));
+            (*id, g.handle.clone(), plain, counts)
+        })
+        .collect()
+}
+
+/// Broadcast a local subscription change to all routes, leafs, and gateways.
 pub(crate) fn propagate_local_sub(
     shared: &Arc<Shared>,
     account: &str,
@@ -806,6 +972,25 @@ pub(crate) fn propagate_local_sub(
         .collect();
     for handle in leaf_handles {
         let _ = try_send(&handle, lframe.clone());
+    }
+    // Gateway frames are route frames with the account token, and
+    // they go ONLY to gateway connections this server accepted
+    // (inbound): Go's directional rule (see gateway.rs) is that the
+    // accepter sends RS+ and the dialer never does — a dialer that
+    // sends RS+ gets its connection closed with a protocol
+    // violation. Solicited (outbound) connections therefore never
+    // carry RS+ from this side; the peer's interest on those
+    // connections arrives as the accepter's RS+ instead.
+    let gateway_handles: Vec<Arc<ConnHandle>> = shared
+        .gateways
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|g| !g.outbound && !g.handle.is_closed())
+        .map(|g| g.handle.clone())
+        .collect();
+    for handle in gateway_handles {
+        let _ = try_send(&handle, rframe.clone());
     }
 }
 
@@ -918,6 +1103,281 @@ pub(crate) fn close_route(shared: &Arc<Shared>, id: u64) {
     shared.conn_info.lock().unwrap().remove(&id);
     if let Some(r) = removed {
         r.handle.mark_closed();
+    }
+}
+
+/// Record a gateway reply-subject mapping: a message that arrived
+/// on gateway `gid` carried `reply_to`, so a later publish to that
+/// subject must flow back over `gid` even without RS+ interest.
+/// Expired entries (> 60 s) are pruned on insert.
+pub(crate) fn record_gateway_reply(shared: &Arc<Shared>, reply_to: &str, gid: u64) {
+    let mut map = shared.gateway_replies.lock().unwrap();
+    map.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(60));
+    map.insert(reply_to.to_string(), (gid, std::time::Instant::now()));
+}
+
+/// Forward a message whose subject is a recorded gateway reply
+/// subject back over the connection the request arrived on, unless
+/// that connection already received this message (`already_sent`).
+/// Returns true when a frame was sent. Expired mappings are dropped.
+pub(crate) fn forward_gateway_reply(
+    shared: &Arc<Shared>,
+    msg: &Message,
+    already_sent: &std::collections::HashSet<u64>,
+) -> bool {
+    let gid = {
+        let mut map = shared.gateway_replies.lock().unwrap();
+        map.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(60));
+        match map.get(&msg.subject) {
+            Some((gid, _)) => *gid,
+            None => return false,
+        }
+    };
+    if already_sent.contains(&gid) {
+        return false;
+    }
+    let handle = shared
+        .gateways
+        .lock()
+        .unwrap()
+        .get(&gid)
+        .filter(|g| !g.handle.is_closed())
+        .map(|g| g.handle.clone());
+    let Some(handle) = handle else {
+        return false;
+    };
+    let frame = match &msg.headers {
+        Some(h) => encode_route_hmsg(
+            &msg.account,
+            &msg.subject,
+            msg.reply_to.as_deref(),
+            h,
+            &msg.payload,
+        ),
+        None => encode_rmsg(
+            &msg.account,
+            &msg.subject,
+            msg.reply_to.as_deref(),
+            &[],
+            &msg.payload,
+        ),
+    };
+    if !try_send(&handle, frame) {
+        eprintln!("rust-natsd: slow gateway {gid}, closing (reply)");
+        close_gateway(shared, gid);
+        return false;
+    }
+    true
+}
+
+pub(crate) fn close_gateway(shared: &Arc<Shared>, id: u64) {
+    let removed = shared.gateways.lock().unwrap().remove(&id);
+    shared.gateway_subs.lock().unwrap().remove(&id);
+    shared.conn_info.lock().unwrap().remove(&id);
+    if let Some(g) = removed {
+        g.handle.mark_closed();
+    }
+}
+
+/// Send every local subscription to one gateway connection as RS+
+/// frames (all accounts; the account token scopes each frame).
+/// Called ONLY for connections this server accepted: per Go's
+/// directional rule the accepter sends RS+ and the dialer never
+/// does (see gateway.rs). Unlike routes, no JetStream or
+/// stream-import interest is advertised over gateways in Phase 33:
+/// JetStream is single-node and cross-gateway imports are not part
+/// of the verified matrix (documented in PLAN Phase 33).
+pub(crate) fn send_gateway_interest(shared: &Arc<Shared>, handle: &ConnHandle) {
+    let subs: Vec<(String, String, Option<String>)> = {
+        let sl = shared.sublist.read().unwrap();
+        sl.patterns()
+    };
+    for (account, subject, queue) in subs {
+        let _ = try_send(handle, encode_rs_plus(&account, &subject, queue.as_deref()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gateways
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn gateway_read_loop<R: AsyncReadExt + Unpin>(
+    reader: &mut BufReader<R>,
+    shared: &Arc<Shared>,
+    id: u64,
+    handle: &Arc<ConnHandle>,
+    tx: &mpsc::Sender<Bytes>,
+) {
+    let mut parser = RouteParser::new(shared.config.max_payload);
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        if handle.is_closed() {
+            break;
+        }
+        let n = tokio::select! {
+            _ = handle.close.notified() => break,
+            _ = shared.shutdown.notified() => break,
+            r = reader.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            },
+        };
+        parser.feed(&buf[..n]);
+        let mut close = false;
+        loop {
+            match parser.next_op() {
+                Ok(Some(op)) => {
+                    if !process_gateway_op(op, shared, id, handle, tx).await {
+                        close = true;
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(encode_err(&e.to_string())).await;
+                    close = true;
+                    break;
+                }
+            }
+        }
+        if close {
+            break;
+        }
+    }
+}
+
+/// Process one gateway operation. Gateway ops are route ops plus
+/// INFO frames carrying `gateway_cmd` (handled here) or a peer INFO
+/// update (ignored: the handshake INFOs are consumed before this
+/// loop starts, and Go sends no other INFO on a live gateway
+/// connection). Returns false when the connection must close.
+pub(crate) async fn process_gateway_op(
+    op: RouteOp,
+    shared: &Arc<Shared>,
+    id: u64,
+    handle: &Arc<ConnHandle>,
+    tx: &mpsc::Sender<Bytes>,
+) -> bool {
+    match op {
+        RouteOp::Info(json) => {
+            if let Some(info) = crate::gateway::parse_gateway_info(&json) {
+                if let (Some(cmd), Some(account)) = (info.gateway_cmd, info.gateway_cmd_account) {
+                    let gateways = shared.gateways.lock().unwrap();
+                    if let Some(g) = gateways.get(&id) {
+                        let mut list = match cmd {
+                            2 => g.announced_accounts.lock().unwrap(),
+                            3 => g.interest_only_accounts.lock().unwrap(),
+                            _ => return true,
+                        };
+                        if !list.contains(&account) {
+                            list.push(account);
+                        }
+                    }
+                }
+            }
+            true
+        }
+        RouteOp::Connect(_) | RouteOp::Pong => true,
+        RouteOp::Ping => {
+            let _ = tx.send(Bytes::from("PONG\r\n")).await;
+            true
+        }
+        RouteOp::RsPlus {
+            account,
+            subject,
+            queue,
+            ..
+        } => {
+            // Go's directional rule, enforced symmetrically: RS+
+            // arrives only from the accepter, i.e. on connections
+            // this server solicited (outbound). RS+ arriving on a
+            // connection this server accepted means the dialer sent
+            // it — Go closes that connection with a protocol
+            // violation, and so does this server.
+            let inbound = shared
+                .gateways
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|g| !g.outbound);
+            if inbound {
+                let _ = tx.send(encode_err("Protocol Violation")).await;
+                return false;
+            }
+            let mut subs = shared.gateway_subs.lock().unwrap();
+            if let Some(m) = subs.get_mut(&id) {
+                bump_interest(m, &account, &subject, queue.as_deref(), 1);
+            }
+            true
+        }
+        RouteOp::RsMinus {
+            account,
+            subject,
+            queue,
+            ..
+        } => {
+            let inbound = shared
+                .gateways
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|g| !g.outbound);
+            if inbound {
+                let _ = tx.send(encode_err("Protocol Violation")).await;
+                return false;
+            }
+            let mut subs = shared.gateway_subs.lock().unwrap();
+            if let Some(m) = subs.get_mut(&id) {
+                bump_interest(m, &account, &subject, queue.as_deref(), -1);
+            }
+            true
+        }
+        RouteOp::RMsg {
+            account,
+            subject,
+            reply_to,
+            queues,
+            headers,
+            payload,
+            ..
+        } => {
+            handle.in_msgs.fetch_add(1, Ordering::Relaxed);
+            handle.in_bytes.fetch_add(
+                (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
+                Ordering::Relaxed,
+            );
+            shared.stats.in_msgs.fetch_add(1, Ordering::Relaxed);
+            shared.stats.in_bytes.fetch_add(
+                (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
+                Ordering::Relaxed,
+            );
+            // HMSG frames carry no queue list: deliver to all matching
+            // groups. RMSG frames restrict to the listed groups.
+            // NOTE: the account token is the whole boundary here —
+            // no subject filtering, so `$SYS` traffic crosses exactly
+            // like any other account's (Phase 24 probe).
+            let filter = if headers.is_some() {
+                None
+            } else {
+                Some(queues.as_slice())
+            };
+            // Phase 33: remember the reply subject's return path
+            // (see forward_gateway_reply) before delivering.
+            if let Some(reply) = &reply_to {
+                record_gateway_reply(shared, reply, id);
+            }
+            deliver(
+                shared,
+                &Message::new(&subject, reply_to, headers, payload).with_account(&account),
+                Origin::Gateway(id),
+                filter,
+            );
+            true
+        }
+        RouteOp::Err(e) => {
+            eprintln!("rust-natsd: gateway {id} error: {e}");
+            false
+        }
     }
 }
 

@@ -144,8 +144,15 @@ a claim that they match Go.
 ## Deliberately out of scope (unchanged, and identical to the
 README Known issues list and PLAN's Future work list)
 
-- Gateways (super-cluster): Rust returns an empty `/gatewayz`; no
-  gateway protocol is implemented (design note: PLAN Phase 24).
+- Gateways (super-cluster): implemented in Phase 33 (design note:
+  PLAN Phase 24) and verified Go↔Rust in both seed directions
+  plus TLS via `scripts/e2e-go-gateway.sh`; `/gatewayz` now
+  returns Go's `inbound/outbound_gateways` shape. The parity
+  suite's no-gateway run still compares empty inbound/outbound
+  maps. Known gateway deviations: JetStream API and stream-import
+  interest are not advertised over gateways, and a gateway TLS
+  listener without `verify` and no CA does not require a client
+  certificate where Go's does (see PLAN Phase 33).
 - JetStream clustering/replication: single-node only (design note:
   PLAN Phase 25). Mirroring/sourcing and imports/exports are
   implemented same-node and cross-node (Phase 32); the remaining

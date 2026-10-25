@@ -12,12 +12,13 @@ publish, subscribe, request/reply, cluster, and use JetStream against
 it.
 
 Explicitly out of scope (see end, and kept identical in README and
-`parity/KNOWN_DIFFS.md`): gateways, JetStream clustering/replication
+`parity/KNOWN_DIFFS.md`): JetStream clustering/replication
 (Raft/WAL), MQTT/WebSocket gateways, cross-node mirroring/sourcing,
 cross-node imports/exports, JWT imports across routes/leafs, XKeys,
 cert-to-user mapping on route/leaf connections, and Go-only INFO
 fields. File persistence is **in** scope (Phases 15, 19) — an earlier
 version of this plan listed it out of scope, which was superseded.
+Gateways were out of scope until Phase 33 implemented them.
 
 ## Status (2026-10-25)
 
@@ -30,16 +31,17 @@ file support, plus the gap areas 1–3 (trie sublist, RwLock sublist,
 parser copy audit — Phase 18a) and the slow-consumer fix (Phase 18).
 All are implemented and verified against the unmodified official Go
 (`nats.go` v1.55.0) and Rust (`async-nats` 0.38) clients, plus
-raw-wire protocol tests. **229 Rust tests green, 0 ignored**
-(measured in the Phase 31 full run; the Phase 26 ignored tests no
-longer exist in the tree); Go interop scripts green in both
-directions (routes, leafs, JetStream, route/leaf TLS, imports,
-mirroring). Parity suite green in default and strict mode
-(53 probes, 52 pass + 1 documented KV-gate exception, 0 fail).
+raw-wire protocol tests. **256 Rust tests green, 0 failed**
+(measured in the Phase 33 full run); Go interop scripts green in
+both directions (routes, leafs, gateways, JetStream, route/leaf/
+gateway TLS, imports, mirroring). Parity suite green in default
+and strict mode (53 probes, 52 pass + 1 documented KV-gate
+exception, 0 fail).
 
-Remaining items: gateways and JetStream clustering/replication are
-**documented remainders, not implemented** — each has a design note
-below (Phase 24, Phase 25) and no code. Still non-goals:
+Remaining items: JetStream clustering/replication is a
+**documented remainder, not implemented** — it has a design note
+below (Phase 25) and no code. Gateways were a remainder in Phase
+24 and are implemented in Phase 33. Still non-goals:
 cross-node mirroring/sourcing, cross-node imports/exports, JWT
 imports across routes/leafs, MQTT/WebSocket gateways, XKeys,
 cert-to-user mapping on route/leaf connections, and the
@@ -1593,9 +1595,141 @@ for current behaviour.
   commit message's verification block (fmt, clippy, cargo test,
   e2e-go.sh, parity.sh).
 
+### Phase 33 — Gateways (super-cluster) (renumbered from plan Phase 32)
+- Task renumbering: the plan's Phase 32 (this work) became Phase
+  33 because the cross-node imports/mirroring phase landed as
+  Phase 32 first; the existing PLAN.md entries for Phases 27–32
+  were not overwritten, this entry is appended. This phase
+  implements the Phase 24 design note — it does not edit it.
+- Config (`src/config.rs`, `src/conf.rs`): `gateway { name,
+  host, port, tls {...}, gateways: [{ name, urls: [...], tls
+  {...} }] }`. The solicitation key is `gateways`, confirmed
+  against live Go 2.15.1 (Go rejects `remotes` as unknown; a
+  rust-natsd config using `remotes` loads but solicits nothing,
+  covered by a test). Unknown gateway keys are ignored like other
+  `.conf` sections. CLI: `--gateway-name/--gateway-host/
+  --gateway-port` (solicitations are `.conf`-only, like leaf
+  remotes). A `gateway {}` block with a port now binds a listener;
+  it is no longer silently ignored.
+- Wire (`src/gateway.rs`, reusing `src/route.rs` framing — no new
+  wire language): INFO-first handshake exactly as probed in
+  Phase 24 (accepter INFO with `gateway`, `gateway_urls`,
+  `gateway_url`, `gateway_nrp`, `gateway_iom`; dialer CONNECT
+  with echo/verbose/pedantic/headers false, name = dialer server
+  id, gateway = dialer gateway name, then dialer INFO; accepter
+  cmd 2 per account (base64 account name), RS+ interest, cmd 3
+  per account). Cmd semantics as in Phase 24: cmd numbers and
+  payloads are probed fact; cmd 2 = announce account and cmd 3 =
+  switch to interest-only mode is the ordering-plus-log-line
+  inference, and this implementation treats cmd 3 as a marker
+  only — all forwarding is already interest-driven, so
+  interest-only mode cannot leak traffic even if the inference
+  is wrong. Accounts announced: `$SYS`, configured accounts in
+  config order, `$G`.
+- The directional rule (the finding that made the first Go-interop
+  run fail, then fixed it): on one gateway connection, interest
+  flows exactly one way and messages exactly the other way. The
+  ACCEPTER sends RS+/RS-; the DIALER sends RMSG/HMSG. Go closes
+  a connection whose dialer sends RS+ with `Received RS+ from
+  gateway on inbound connection` / `Protocol Violation` (observed
+  in Go's log when rust-natsd's dialer sent its initial RS+
+  burst). rust-natsd therefore never sends RS+ on a solicited
+  connection (neither the initial burst nor later propagations —
+  `propagate_local_sub` sends gateway RS+ to inbound connections
+  only), and symmetrically closes an inbound connection that
+  receives RS+/RS- with `-ERR 'Protocol Violation'`. Both traffic
+  directions work only because the supercluster forms one
+  connection per direction (the implicit back-connect, below):
+  each side is accepter on one connection and dialer on the other.
+- Account scoping: accounts matched by name; the account token on
+  every RS+/RMSG frame enforces the boundary (APP delivers, OTHER
+  does not — tested explicitly, both Rust-Rust and Go-Rust).
+  `$SYS` traffic is not filtered out (no subject filtering on the
+  gateway path; the account token is the whole boundary). Queue
+  subscriptions cross with their weight, and local publishes run
+  global queue selection across local, route, leaf, and gateway
+  destinations, so a queue group spanning a gateway delivers
+  exactly once.
+- Loop prevention (`src/server/delivery.rs`, `Origin::Gateway`):
+  a message arriving on a gateway is delivered locally only —
+  never back to any gateway, and never to routes/leafs (each node
+  holds its own gateway connections to the peer cluster, so
+  route-forwarding would duplicate it). Gateway-origin messages
+  get the same service-import reply and stream-import handling as
+  route/leaf-origin messages.
+- Reply subjects (the second Go-interop finding): Go gateways do
+  not propagate `_INBOX` subscriptions as RS+. When a request
+  crosses a gateway, the receiving side records its reply subject
+  -> gateway connection (60 s TTL, pruned on insert/lookup, same
+  shape as the import-reply mappings), and a later publish to
+  that subject flows back over the recorded connection even
+  without RS+ interest; a reply arriving on a gateway whose
+  subject is itself recorded is forwarded onward (the multi-hop
+  return path). Without this, Go-requester/Rust-responder
+  request/reply timed out while plain pub/sub both ways passed.
+- Implicit gateways: on learning a peer from its INFO
+  `gateway_urls`, the accepter solicits back (one connection per
+  direction), deduped by peer gateway name and by URL against
+  explicitly configured gateways, existing outbound connections,
+  and already-spawned implicit loops. Solicitation retry/backoff
+  reuses the route pattern (1 s, doubling to 5 s). The advertised
+  URL uses the gateway block's host when it names a real
+  interface, else the listener IP, with 0.0.0.0 replaced by
+  127.0.0.1 — a documented simplification of Go's external-IP
+  detection (Go advertises 198.19.0.2 in this sandbox when bound
+  to 0.0.0.0, which is why the Phase 24 probe's back-connect died
+  in a middlebox; binding the gateway host to 127.0.0.1 makes the
+  advertisement loopback and the back-connect work).
+- Gateway TLS (probed against Go 2.15.1 in this phase, not
+  guessed): implicit TLS, like routes — the server handshake
+  comes first, no plaintext INFO on a TLS gateway port; the
+  dialer carries `tls: { cert_file, key_file, ca_file }` in its
+  gateways entry, and Go's TLS gateway server requires a
+  CA-verified client certificate (a dialer presenting no
+  certificate fails the handshake even with `verify: false` on
+  the server block). rust-natsd implements the same shape
+  (gateway listener `tls {}`, per-remote `tls {}`, implicit
+  solicitations inheriting the listener's TLS settings — Go's
+  implicit dial from a TLS server to a plain peer fails the same
+  way). One documented deviation: rust-natsd's TLS listener uses
+  the shared TLS builder, so with `verify` unset and no CA it
+  does not require a client certificate where Go does; Go dialers
+  always present a certificate, so Go interop is unaffected.
+- Monitoring (`src/monitor.rs`): `/gatewayz` now returns Go's
+  shape — `outbound_gateways` (map name -> `{configured,
+  connection}`) and `inbound_gateways` (map name -> list of the
+  same), with `configured` true only for explicitly configured
+  solicitations (implicit outbound and all inbound report
+  false). This replaces the pre-Phase-33 `{"gateways": []}`
+  shape; the two monitor tests that asserted the old shape were
+  updated to the new empty maps, and the parity probe's
+  no-gateway check (empty inbound and outbound) passes
+  unchanged. `/varz` gains a `gateways` count; `/subz` lists
+  gateway interest.
+- Not advertised over gateways in this phase: JetStream API
+  interest (`$JS.API.>`, `$JS.ACK.>`) and stream-import interest
+  (routes/leafs keep both). JetStream is single-node, and
+  cross-gateway imports are not part of the verified matrix.
+- Verified: `tests/e2e_gateway.rs` (10 tests: raw-wire both
+  directions, pub/sub both directions, headers + request/reply,
+  account scoping, queue exactly-once, implicit back-connect +
+  configured flags, `$SYS` subject not filtered, `.conf` parsing
+  including the `remotes`-ignored case, TLS implicit-mTLS both
+  directions) and `scripts/e2e-go-gateway.sh` against Go 2.15.1:
+  (1) Go seed + Rust solicits, Go→Rust; (2) same seed, Rust→Go;
+  (3) Rust seed + Go solicits, Go→Rust; (4) same seed, Rust→Go —
+  each via nats.go cluster mode (both directions, queue,
+  request/reply, headers) plus the account/queue gateway mode,
+  plus `/gatewayz` configured-flag checks for the implicit
+  back-connect in both seed directions, plus a Go↔Rust TLS
+  scenario (cluster mode both directions under implicit mTLS).
+  Full verification numbers in the commit message's
+  verification block (fmt, clippy, cargo test, e2e-go.sh,
+  parity.sh).
+
 ## Future work (not in this plan)
-- Gateways (Phase 24) and JetStream clustering/replication
-  (Phase 25): documented remainders with design notes, not
+- JetStream clustering/replication
+  (Phase 25): documented remainder with a design note, not
   implemented, not planned-imminent — no code, no accepting stub.
 - JWT imports across routes/leafs, MQTT/WebSocket gateways,
   XKeys, cert-to-user mapping on route/leaf connections,

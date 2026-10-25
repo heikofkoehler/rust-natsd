@@ -229,6 +229,40 @@ pub struct TlsSettings {
     pub verify_and_map: bool,
 }
 
+/// One solicited gateway (a remote gateway in the supercluster).
+/// The `.conf` shape is Go's: `gateways: [{ name, urls: [...] }]`
+/// inside the outer `gateway {}` block (Phase 24 found Go rejects
+/// `remotes` as unknown). `tls` is the per-remote TLS block Go
+/// accepts in a gateways entry; when absent, a solicitation uses
+/// the local gateway listener's TLS settings if any (Go's implicit
+/// solicitations do exactly that, probed in Phase 33).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GatewayRemote {
+    pub name: String,
+    pub urls: Vec<String>,
+    pub tls: Option<TlsSettings>,
+}
+
+/// This server's gateway (supercluster) configuration. `None` means
+/// no gateway listener and no solicitations (the pre-Phase-33 state:
+/// `gateway {}` sections were ignored).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GatewayConfig {
+    pub name: String,
+    /// Gateway listener host; used as the advertised host in INFO
+    /// `gateway_urls` (Go advertises its gateway listener address;
+    /// with host 127.0.0.1 the advertisement is 127.0.0.1:port, which
+    /// is what makes implicit back-connects work on loopback).
+    pub host: String,
+    pub port: u16,
+    /// TLS for the gateway listener (implicit TLS, probed against Go
+    /// 2.15.1: the server handshake comes first, no plaintext INFO;
+    /// Go's server requires a CA-verified client certificate when a
+    /// `tls {}` block is present).
+    pub tls: Option<TlsSettings>,
+    pub remotes: Vec<GatewayRemote>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub host: String,
@@ -295,6 +329,8 @@ pub struct Config {
     /// Username that credential-less connections map to, if configured
     /// (must name a configured user; otherwise they are rejected).
     pub no_auth_user: Option<String>,
+    /// Gateway (supercluster) configuration; None disables gateways.
+    pub gateway: Option<GatewayConfig>,
     /// Server-initiated PING interval (Go default 2m).
     pub ping_interval: std::time::Duration,
     /// Missed PONGs before closing with `-ERR 'Stale Connection'`
@@ -332,6 +368,7 @@ impl Default for Config {
             operator: None,
             system_account: None,
             no_auth_user: None,
+            gateway: None,
             ping_interval: std::time::Duration::from_secs(120),
             ping_max: 2,
         }
@@ -591,6 +628,20 @@ impl Config {
                 "--leaf-tlsverify" => {
                     cfg.leaf_tls.get_or_insert_with(TlsSettings::default).verify = true;
                 }
+                "--gateway-name" => {
+                    let name = next(&mut i)?;
+                    cfg.gateway.get_or_insert_with(GatewayConfig::default).name = name;
+                }
+                "--gateway-host" => {
+                    let host = next(&mut i)?;
+                    cfg.gateway.get_or_insert_with(GatewayConfig::default).host = host;
+                }
+                "--gateway-port" => {
+                    let port = next(&mut i)?
+                        .parse()
+                        .map_err(|_| "invalid gateway port".to_string())?;
+                    cfg.gateway.get_or_insert_with(GatewayConfig::default).port = port;
+                }
                 "-h" | "--help" => return Err(Self::usage()),
                 other => return Err(format!("unknown argument: {other}\n\n{}", Self::usage())),
             }
@@ -611,6 +662,23 @@ impl Config {
             }
             if t.verify_and_map && t.ca_file.is_none() {
                 return Err("--tlsverify-and-map requires --tlscacert".to_string());
+            }
+        }
+        if let Some(gw) = &cfg.gateway {
+            if gw.port != 0 && gw.name.is_empty() {
+                return Err("gateway listener requires a name".to_string());
+            }
+            if let Some(t) = &gw.tls {
+                if t.cert_file.is_empty() || t.key_file.is_empty() {
+                    return Err("gateway TLS requires a cert and key".to_string());
+                }
+            }
+            for remote in &gw.remotes {
+                if let Some(t) = &remote.tls {
+                    if t.ca_file.is_none() {
+                        return Err("gateway remote TLS requires a CA file".to_string());
+                    }
+                }
             }
         }
         for (what, tls) in [
@@ -672,6 +740,9 @@ impl Config {
          \x20   --leaf-tlskey <FILE>    Leaf TLS private key (PEM)\n\
          \x20   --leaf-tlscacert <FILE> Leaf TLS CA file\n\
          \x20   --leaf-tlsverify        Verify leaf peer certificates\n\
+         \x20   --gateway-name <NAME>   Gateway name (enables gateway listener with --gateway-port)\n\
+         \x20   --gateway-host <HOST>   Gateway listener host (default 0.0.0.0)\n\
+         \x20   --gateway-port <PORT>   Gateway listener port, 0 disables\n\
          \x20   -c, --config <FILE>     Config file (nats-server .conf subset)\n\
          \x20   -h, --help              Show this help"
             .to_string()
