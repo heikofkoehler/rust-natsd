@@ -652,7 +652,7 @@ impl Config {
          \x20   --leaf-user <USER>      Username for solicited leaf connections\n\
          \x20   --leaf-pass <PASS>      Password for solicited leaf connections\n\
          \x20   --jetstream             Enable JetStream (in-memory)\n\
-         \x20   --js-store-dir <DIR>    JetStream store dir (reserved)\n\
+         \x20   --js-store-dir <DIR>    JetStream store dir (file persistence)\n\
          \x20   --http-port <PORT>      Monitoring HTTP port, 0 disables (default 0)\n\
          \x20   --tls                   Require TLS on the client port\n\
          \x20   --tlscert <FILE>        TLS server certificate (PEM)\n\
