@@ -91,11 +91,14 @@ usable through nats.go itself when rust-natsd's own version reaches
 ## Deliberately out of scope (unchanged)
 
 - Gateways (super-cluster): Rust returns an empty `/gatewayz`; no
-  gateway protocol is implemented.
-- JetStream clustering/replication, mirroring/sourcing: single-node only.
-- MQTT/WebSocket gateways, JWT operator mode, route/leaf TLS, TLS
-  client-certificate-to-user mapping: not implemented in rust-natsd
-  (see README non-goals); not probed.
+  gateway protocol is implemented (design note: PLAN Phase 24).
+- JetStream clustering/replication: single-node only (design note:
+  PLAN Phase 25). Mirroring/sourcing are implemented same-node only;
+  cross-node mirroring/sourcing remain out of scope.
+- MQTT/WebSocket: not implemented in rust-natsd (see README
+  non-goals); not probed. JWT operator mode, route/leaf TLS, and TLS
+  client-certificate-to-user mapping are now implemented (see
+  README/PLAN) and are no longer in this out-of-scope list.
 - Byte-identical monitoring JSON: compared on supported fields only.
 - Exact per-member queue distribution: compared on totals only (Go
   random-ish, Rust round-robin, both exactly once).
