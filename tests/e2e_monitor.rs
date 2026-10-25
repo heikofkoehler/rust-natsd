@@ -239,3 +239,89 @@ async fn monitor_phase16_varz_accounz_gatewayz_connz_filters() {
     drop(bob);
     srv.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn monitor_subz_routez_leafz_gatewayz_shapes() {
+    let (srv, client) = start(false).await;
+    let _sub = client
+        .subscribe("mon.subz".to_string())
+        .await
+        .expect("subscribe");
+    client.flush().await.expect("flush sub");
+    let (status, subz) = get(&srv, "/subz").await;
+    assert_eq!(status, 200);
+    let subs = subz["subscriptions"].as_array().expect("subz array");
+    assert!(
+        subs.iter().any(|s| s["subject"] == "mon.subz"),
+        "subz must list the subscription: {subz}"
+    );
+    // No routes or leafs connected: counts are zero, shapes stable.
+    let (status, routez) = get(&srv, "/routez").await;
+    assert_eq!(status, 200);
+    assert_eq!(routez["num_routes"], 0);
+    assert_eq!(routez["routes"], serde_json::json!([]));
+    let (status, leafz) = get(&srv, "/leafz").await;
+    assert_eq!(status, 200);
+    assert_eq!(leafz["num_leafnodes"], 0);
+    assert_eq!(leafz["leafnodes"], serde_json::json!([]));
+    // Gateways are not implemented: always the empty shape, never 404.
+    let (status, gatewayz) = get(&srv, "/gatewayz").await;
+    assert_eq!(status, 200);
+    assert_eq!(gatewayz["gateways"], serde_json::json!([]));
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn monitor_varz_reports_configured_limits() {
+    let srv = server::start(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        cluster_port: 0,
+        http_port: free_port(),
+        max_pending: 1024 * 1024,
+        ping_interval: std::time::Duration::from_millis(200),
+        ping_max: 3,
+        ..Default::default()
+    })
+    .await
+    .expect("server starts");
+    let (status, varz) = get(&srv, "/varz").await;
+    assert_eq!(status, 200);
+    assert_eq!(varz["max_pending"], 1024 * 1024);
+    assert_eq!(varz["ping_interval"], 200_000_000);
+    assert_eq!(varz["ping_max"], 3);
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn monitor_jsz_disabled_and_unknown_path_404() {
+    let (srv, _client) = start(false).await;
+    let (status, jsz) = get(&srv, "/jsz").await;
+    assert_eq!(status, 404);
+    assert!(jsz.get("error").is_some(), "jsz disabled must error: {jsz}");
+    let (status, body) = get(&srv, "/bogus").await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"], "unknown endpoint");
+    srv.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn monitor_connz_state_open_and_offset_pagination() {
+    let (srv, c1) = start(false).await;
+    let c2 = async_nats::connect(format!("nats://{}", srv.addr))
+        .await
+        .expect("second client connects");
+    let (status, connz) = get(&srv, "/connz?state=open").await;
+    assert_eq!(status, 200);
+    assert_eq!(connz["total"], 2);
+    let (status, connz) = get(&srv, "/connz?offset=1").await;
+    assert_eq!(status, 200);
+    assert_eq!(connz["total"], 2, "total is pre-pagination");
+    assert_eq!(connz["connections"].as_array().unwrap().len(), 1);
+    let (status, connz) = get(&srv, "/connz?offset=99").await;
+    assert_eq!(status, 200);
+    assert_eq!(connz["connections"], serde_json::json!([]));
+    drop(c1);
+    drop(c2);
+    srv.shutdown().await.expect("shutdown");
+}
