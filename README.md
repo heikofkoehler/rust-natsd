@@ -69,8 +69,8 @@ rust-natsd does; it replaces the older support table.
 | Multi-account + pub/sub allow/deny | Implemented | `accounts {}` in `.conf` (per-user `permissions` or account-level `authorization`), `system_account`, `no_auth_user`; subscriptions/deliveries/routes/leafs/JetStream scoped per account; Go's exact permission-violation `-ERR` text, connection stays alive |
 | Account imports/exports (service + stream) | Implemented (same node) | `accounts { NAME { exports: [{service\|stream: "subj", accounts: ["B"]}], imports: [{service\|stream: {account: A, subject: "subj"}, to: "local"}] } }` — Go v2.15.1 `.conf` shape probed (`to`, not `local_subject`; the older spelling is accepted as an alias). Service requests are rewritten into the exporting account with a synthetic `_RIMPORT.<seq>` reply subject that routes replies back; stream publishes are copied to the importer's local subject. Unauthorized imports (account not listed, remote pattern not covered by the export) are dropped, never delivered; the importing account's publish allow/deny is checked on the local subject and the responder's subscribe allow/deny on the exported subject. Same-node only: imports do not cross routes/leafs, and route/leaf-origin messages do not fan out to stream importers. Reply mappings are retained for the server lifetime (Go's `_R_.` mappings expire by TTL) |
 | TLS client connections | Implemented | `--tls/--tlscert/--tlskey/--tlsverify/--tlscacert`, `tls {}` in `.conf`, `tls_required` in `INFO`; STARTTLS order (plaintext `INFO` first, then upgrade), matching Go |
-| Route/leaf TLS | Not implemented | Non-goal |
-| TLS client-certificate-to-user mapping | Not implemented | Non-goal (CA verification only, via `--tlsverify`) |
+| Route/leaf TLS | Implemented | Route TLS is implicit TLS (no plaintext first, unlike client STARTTLS); leaf TLS is INFO-first then upgrade (hub sends plaintext `INFO` with `tls_required`, then TLS). Both directions interop with Go 2.15.1 (see `scripts/e2e-go-route-leaf-tls.sh`); `--cluster-tls*` / `--leaf-tls*` flags, `cluster { tls {} }` / `leafnodes { tls {} }` / remote `tls {}` in `.conf` |
+| TLS client-certificate-to-user mapping | Implemented | `tls { verify_and_map: true }` (also `--tlsverify-and-map`): the client certificate's identity — email SANs, then DNS SANs, then URI SANs, then CN, then full DN — is matched against configured user names (a superset of Go's DN-only match, so both `alice` and `CN=alice` users work); no mapping entry means rejection even with a valid password, and a mapped user is still subject to that user's publish/subscribe allow/deny. Certificate identities are parsed from DER by hand (no new dependency) |
 | XKeys | Not implemented | Non-goal |
 | Routes / clustering | Implemented | Full mesh, solicitation with retry, RS+/RS-, RMSG/HMSG, duplicate resolution |
 | Leaf nodes | Implemented | Hub accept + solicited leaf, LS+/LS-, LMSG/HMSG, reconnect |
@@ -128,7 +128,7 @@ supported fields / totals only, by design.
 **Scope — what mainline does that rust-natsd deliberately does not.**
 Gateways (super-cluster), JetStream clustering/replication,
 cross-node mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
-route/leaf TLS, TLS certificate-to-user mapping, and XKeys. JetStream
+and XKeys. JetStream
 here is single-node only (mirroring/sourcing and account imports work
 on the same node).
 Conversely, rust-natsd is a superset in

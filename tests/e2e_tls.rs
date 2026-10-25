@@ -128,6 +128,7 @@ fn tls_config(certs: &Certs, verify: bool) -> Config {
             key_file: certs.server_key.to_str().unwrap().into(),
             ca_file: Some(certs.ca.to_str().unwrap().into()),
             verify,
+            verify_and_map: false,
         }),
         ..Default::default()
     }

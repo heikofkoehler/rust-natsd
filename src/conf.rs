@@ -8,10 +8,13 @@
 //! Supported keys (unknown keys are ignored, leniently):
 //! - `port`, `host`, `server_name`, `http_port`, `max_payload`
 //! - `authorization { user, password, token }`
-//! - `cluster { name, host, port, routes }`
-//! - `leafnodes { port, remotes, authorization { user, password } }`
+//! - `cluster { name, host, port, routes, tls {...} }`
+//! - `leafnodes { port, tls {...}, remotes [{url, tls {...}}],
+//!   authorization { user, password } }`
 //! - `jetstream` (boolean, or a block with `store_dir`)
-//! - `tls { cert_file, key_file, ca_file, verify }` (client listener only)
+//! - `tls { cert_file, key_file, ca_file, verify, verify_and_map }`
+//!   (client listener; `verify_and_map` maps a client certificate to
+//!   a user by SAN/CN/DN)
 //! - `accounts { NAME { users [...], permissions/authorization {...},
 //!   jetstream: enabled, exports [...], imports [...] } }`,
 //!   `system_account`, `no_auth_user`
@@ -495,6 +498,33 @@ fn parse_account(name: &str, v: &Value) -> Option<Account> {
     Some(account)
 }
 
+/// Parse a `tls { cert_file, key_file, ca_file, verify,
+/// verify_and_map }` block into `TlsSettings` (missing fields keep
+/// the default/previous value when `base` is given).
+fn parse_tls_block(v: &Value, mut tls: TlsSettings) -> TlsSettings {
+    if let Some(map) = map_of(v) {
+        if let Some(c) = map.get("cert_file").and_then(|v| v.as_str()) {
+            tls.cert_file = c.to_string();
+        }
+        if let Some(k) = map.get("key_file").and_then(|v| v.as_str()) {
+            tls.key_file = k.to_string();
+        }
+        if let Some(ca) = map.get("ca_file").and_then(|v| v.as_str()) {
+            tls.ca_file = Some(ca.to_string());
+        }
+        if let Some(b) = map.get("verify") {
+            tls.verify = matches!(b, Value::Bool(true));
+        }
+        if let Some(b) = map.get("verify_and_map") {
+            tls.verify_and_map = matches!(b, Value::Bool(true));
+            if tls.verify_and_map {
+                tls.verify = true;
+            }
+        }
+    }
+    tls
+}
+
 fn as_string_list(v: &Value) -> Result<Vec<String>, String> {
     match v {
         Value::List(items) => {
@@ -630,11 +660,20 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
         if let Some(r) = map.get("routes") {
             cfg.routes = as_string_list(r)?;
         }
+        if let Some(t) = map.get("tls") {
+            cfg.cluster_tls = Some(parse_tls_block(
+                t,
+                cfg.cluster_tls.clone().unwrap_or_default(),
+            ));
+        }
     }
     if let Some(v) = lookup(&top, "leafnodes") {
         let map = map_of(&v).ok_or("leafnodes must be a block")?;
         if let Some(p) = map.get("port") {
             cfg.leaf_port = as_u16(p, "leaf port")?;
+        }
+        if let Some(t) = map.get("tls") {
+            cfg.leaf_tls = Some(parse_tls_block(t, cfg.leaf_tls.clone().unwrap_or_default()));
         }
         if let Some(r) = map.get("remotes") {
             match r {
@@ -646,6 +685,12 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
                                 let m = map_of(item).unwrap_or_default();
                                 if let Some(u) = m.get("url").and_then(|v| v.as_str()) {
                                     urls.push(u.to_string());
+                                    if let Some(t) = m.get("tls") {
+                                        cfg.leaf_remote_tls.insert(
+                                            u.to_string(),
+                                            parse_tls_block(t, TlsSettings::default()),
+                                        );
+                                    }
                                 }
                             }
                             Value::Str(s) => urls.push(s.clone()),
@@ -668,20 +713,7 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
         }
     }
     if let Some(v) = lookup(&top, "tls") {
-        let map = map_of(&v).ok_or("tls must be a block")?;
-        let mut tls: TlsSettings = cfg.tls.clone().unwrap_or_default();
-        if let Some(c) = map.get("cert_file").and_then(|v| v.as_str()) {
-            tls.cert_file = c.to_string();
-        }
-        if let Some(k) = map.get("key_file").and_then(|v| v.as_str()) {
-            tls.key_file = k.to_string();
-        }
-        if let Some(ca) = map.get("ca_file").and_then(|v| v.as_str()) {
-            tls.ca_file = Some(ca.to_string());
-        }
-        if let Some(b) = map.get("verify") {
-            tls.verify = matches!(b, Value::Bool(true));
-        }
+        let tls = parse_tls_block(&v, cfg.tls.clone().unwrap_or_default());
         cfg.tls = Some(tls);
     }
     if let Some(v) = lookup(&top, "jetstream") {

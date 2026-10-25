@@ -294,6 +294,7 @@ fn parse_route_line(
 }
 
 /// Route INFO JSON for this server (cluster listener address).
+#[allow(clippy::too_many_arguments)]
 pub fn route_info_json(
     server_id: &str,
     server_name: &str,
@@ -302,6 +303,7 @@ pub fn route_info_json(
     cluster_port: u16,
     max_payload: usize,
     client_addr: std::net::SocketAddr,
+    tls_required: bool,
 ) -> String {
     serde_json::json!({
         "server_id": server_id,
@@ -316,17 +318,19 @@ pub fn route_info_json(
         "cluster": cluster_name,
         "connect_urls": [client_addr.to_string()],
         "ip": format!("nats-route://{cluster_host}:{cluster_port}/"),
+        "tls_required": tls_required,
     })
     .to_string()
 }
 
 /// Route CONNECT JSON (dialer sends this first; name is the server id).
-pub fn route_connect_json(server_id: &str, cluster_name: &str) -> String {
+/// `tls_required` reflects whether this connection itself uses TLS.
+pub fn route_connect_json(server_id: &str, cluster_name: &str, tls_required: bool) -> String {
     serde_json::json!({
         "echo": true,
         "verbose": false,
         "pedantic": false,
-        "tls_required": false,
+        "tls_required": tls_required,
         "headers": true,
         "name": server_id,
         "cluster": cluster_name,

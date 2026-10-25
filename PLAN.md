@@ -23,7 +23,7 @@ scripts green in both directions (routes, leafs, JetStream).
 
 Remaining non-goals: gateways, JetStream clustering/replication,
 cross-node mirroring/sourcing, MQTT/WebSocket gateways, JWT operator
-mode, route/leaf TLS, TLS client-certificate-to-user mapping, and the
+mode, and the
 KV/object-store client helpers (their server-side primitives exist).
 
 ## Phases
@@ -353,10 +353,78 @@ KV/object-store client helpers (their server-side primitives exist).
   mean 74 µs vs 196 µs; JS 21,735 vs 8,019 — run-to-run noise, all
   at or above baseline).
 
+### Phase 22 — Route/leaf TLS + cert-to-user mapping (gap area 7)
+- Go handshake order probed first against nats-server v2.15.1:
+  route TLS is implicit TLS (a plaintext connect to a Go cluster
+  TLS port gets nothing; a TLS wrap succeeds, then fails on the
+  missing client cert when verify is on). Leaf TLS is
+  INFO-first-then-upgrade: the hub sends a plaintext INFO with
+  `tls_required`/`tls_verify`/`info_on_connect`, a plaintext
+  CONNECT after it is closed silently, and the leaf INFO + CONNECT
+  travel inside TLS.
+- Go `verify_and_map` probed: the certificate is the credential
+  (no password needed); Go matches email SANs, then DNS SANs, then
+  URI SANs, then the subject DN in RFC 2253 form against the user
+  list (a user named `alice` with a CN=alice cert is rejected;
+  a user named `CN=alice` authenticates). Rust reuses the
+  `verify_and_map` key but accepts a superset of identities —
+  email/DNS/URI SANs, then CN, then full DN — so both `alice` and
+  `CN=alice` users work; an unmapped cert is rejected even with a
+  valid password, and a mapped cert authenticates even with a wrong
+  password (mapping is the credential); a mapped user's
+  publish/subscribe allow/deny still applies.
+- Implementation: `TlsSettings.verify_and_map` (implies verify) in
+  `src/config.rs`, plus `cluster_tls`/`leaf_tls`/
+  `leaf_remote_tls` and CLI flags `--tlsverify-and-map`,
+  `--cluster-tls*`, `--leaf-tls*`; `.conf` parsing in
+  `src/conf.rs` (`cluster { tls {} }`, `leafnodes { tls {} }`,
+  remote `tls {}`). `src/tls.rs` gains `build_client_config` and a
+  hand-rolled DER certificate identity parser (no new dependency:
+  SANs by tag, CN + full DN from the subject, BMPString/T61/
+  Printable/IA5/UTF8 string forms). `src/server.rs` generalizes
+  the route/leaf handlers over plain vs TLS halves: implicit-TLS
+  route accept/solicit, leaf accept STARTTLS dance (plaintext
+  INFO, peek for 0x16, silent close otherwise, then TLS accept),
+  and leaf solicitation that reads the hub INFO on the unsplit
+  socket before upgrading (hub advertisement drives the upgrade;
+  a missing remote TLS config for a TLS-advertising hub logs and
+  retries).
+- The hard-won detail: a Go leaf soliciting a hub that sets
+  `info_on_connect` arms a 2s timer when it sends CONNECT and
+  only cancels it on a hub INFO with `connect_info: true`
+  (nats-server v2.15.1 leafNodeResumeConnectProcess /
+  leafNodeFinishConnectProcess, confirmed against the v2.15.1
+  source after a TLS-intercepting proxy showed Go hubs send a
+  second INFO inside TLS). Without it the Go leaf dies at exactly
+  2s with `-ERR 'Stale Leaf Node Connection - Closing'` — which
+  is what the first version of this phase did. The hub now sends
+  a `connect_info: true` INFO when the leaf sends INFO first
+  (reply, before CONNECT) and when a TLS hub receives CONNECT
+  straight away (after CONNECT parsing); plain hubs, whose INFO
+  sets no `info_on_connect`, send nothing extra, matching Go.
+  `leaf_info_json` gained a `connect_info` parameter for this.
+- Verified: 9 new tests in `tests/e2e_route_leaf_tls.rs`
+  (Rust-to-Rust route and leaf over TLS both directions, plain
+  route peer rejected, CN mapping without password + allow/deny
+  enforced, unmapped CN rejected, DN-form user, SAN-over-CN
+  priority, mapping beating a wrong password, `.conf`/CLI shape);
+  `scripts/e2e-go-route-leaf-tls.sh` green on all 4 interop
+  scenarios (Go seed + Rust solicits route TLS; Rust seed + Go
+  solicits route TLS; Go hub + Rust leaf TLS; Rust hub + Go leaf
+  TLS — the last one required the `connect_info` fix above);
+  cargo test 133 green; parity GREEN (52 pass + 1 exception,
+  unchanged); bench no regression vs 86edbe8 (pub/sub median
+  413,764/310,341 vs 418,910/226,910 — 256 B within run-to-run
+  noise; req/reply mean 81 µs vs 196 µs; JS 22,160 vs 8,019).
+- Remainder of this area: none for the required scope. Known
+  limitations carried forward: leaf TLS verification uses the
+  configured CA only (no `verify_and_map` on leaf/route
+  connections — mapping applies to client connections); imports
+  still do not cross routes/leafs (Phase 21 remainder).
+
 ## Future work (not in this plan)
 - Gateways, JetStream clustering/replication, cross-node
   mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
-  route/leaf TLS, TLS client-certificate-to-user mapping,
   KV/object-store client-helper verification.
 
 ## Design notes

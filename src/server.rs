@@ -266,6 +266,17 @@ pub struct Shared {
     pub(crate) http_addr: Option<SocketAddr>,
     /// TLS acceptor for client connections; None means plain text.
     pub(crate) tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+    /// TLS acceptor for route connections (implicit TLS); None means
+    /// plain text on the route port.
+    pub(crate) route_tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+    /// TLS connector for solicited routes (from `cluster_tls`).
+    pub(crate) route_tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
+    /// TLS acceptor for the leafnode listener (INFO first, then
+    /// upgrade); None means plain text on the leaf port.
+    pub(crate) leaf_tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+    /// TLS connectors for solicited leaf remotes, keyed by remote URL.
+    pub(crate) leaf_remote_connectors:
+        std::collections::HashMap<String, std::sync::Arc<tokio_rustls::TlsConnector>>,
     pub(crate) server_id: String,
     pub(crate) started: Instant,
     /// Wall-clock start time, for the monitoring endpoint's `start` field.
@@ -375,6 +386,33 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         ))),
         None => None,
     };
+    let route_tls_acceptor = match &config.cluster_tls {
+        Some(settings) => Some(Arc::new(tokio_rustls::TlsAcceptor::from(
+            crate::tls::build_server_config(settings).map_err(io::Error::other)?,
+        ))),
+        None => None,
+    };
+    let route_tls_connector = match &config.cluster_tls {
+        Some(settings) => Some(Arc::new(tokio_rustls::TlsConnector::from(
+            crate::tls::build_client_config(settings).map_err(io::Error::other)?,
+        ))),
+        None => None,
+    };
+    let leaf_tls_acceptor = match &config.leaf_tls {
+        Some(settings) => Some(Arc::new(tokio_rustls::TlsAcceptor::from(
+            crate::tls::build_server_config(settings).map_err(io::Error::other)?,
+        ))),
+        None => None,
+    };
+    let mut leaf_remote_connectors = std::collections::HashMap::new();
+    for (url, settings) in &config.leaf_remote_tls {
+        leaf_remote_connectors.insert(
+            url.clone(),
+            Arc::new(tokio_rustls::TlsConnector::from(
+                crate::tls::build_client_config(settings).map_err(io::Error::other)?,
+            )),
+        );
+    }
     let shared = Arc::new(Shared {
         config,
         listen_addr: addr,
@@ -382,6 +420,10 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
         leaf_addr,
         http_addr,
         tls_acceptor,
+        route_tls_acceptor,
+        route_tls_connector,
+        leaf_tls_acceptor,
+        leaf_remote_connectors,
         server_id: gen_server_id(),
         started: Instant::now(),
         started_wall: std::time::SystemTime::now(),
@@ -528,6 +570,24 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                                 }
                                 match acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
+                                        // Peer certificate identity for
+                                        // verify_and_map: the first
+                                        // peer certificate's SAN/CN/DN
+                                        // candidates, in Go's lookup
+                                        // order. No certificate (or an
+                                        // unparsable one) means no
+                                        // candidates — mapping then
+                                        // rejects the connection.
+                                        let cert_candidates = tls_stream
+                                            .get_ref()
+                                            .1
+                                            .peer_certificates()
+                                            .and_then(|certs| certs.first())
+                                            .and_then(|cert| {
+                                                crate::tls::parse_cert_identity(cert.as_ref())
+                                            })
+                                            .map(|id| id.candidates())
+                                            .unwrap_or_default();
                                         let (reader, writer) = tokio::io::split(tls_stream);
                                         handle_conn(
                                             reader,
@@ -537,6 +597,7 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                                             peer.ip().to_string(),
                                             nonce,
                                             true,
+                                            cert_candidates,
                                         )
                                         .await;
                                     }
@@ -556,6 +617,7 @@ async fn client_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                                     peer.ip().to_string(),
                                     gen_nonce(),
                                     false,
+                                    Vec::new(),
                                 )
                                 .await;
                             }
@@ -597,6 +659,23 @@ fn gen_nonce() -> String {
     s
 }
 
+/// SNI / server name for a TLS route/leaf dial: IP literals use the
+/// IP-address form, hostnames the DNS form; loopback hosts use
+/// `localhost` (test certificates carry DNS:localhost / IP:127.0.0.1
+/// SANs, and Go interop certificates do the same).
+fn tls_server_name(host: &str) -> Option<rustls::pki_types::ServerName<'static>> {
+    use rustls::pki_types::ServerName;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(ServerName::IpAddress(ip.into()));
+    }
+    let name = if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        "localhost"
+    } else {
+        host
+    };
+    ServerName::try_from(name.to_string()).ok()
+}
+
 async fn route_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     loop {
         tokio::select! {
@@ -604,7 +683,29 @@ async fn route_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             res = listener.accept() => match res {
                 Ok((stream, _peer)) => {
                     let _ = stream.set_nodelay(true);
-                    tokio::spawn(handle_route_accepted(stream, shared.clone()));
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        match &shared.route_tls_acceptor {
+                            // Implicit TLS (Go's probed route order):
+                            // the peer's ClientHello comes first; no
+                            // plaintext is ever sent on this port.
+                            Some(acceptor) => {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        let (reader, writer) = tokio::io::split(tls_stream);
+                                        handle_route_accepted(reader, writer, shared, true).await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("rust-natsd: route TLS handshake failed: {e}");
+                                    }
+                                }
+                            }
+                            None => {
+                                let (reader, writer) = stream.into_split();
+                                handle_route_accepted(reader, writer, shared, false).await;
+                            }
+                        }
+                    });
                 }
                 Err(e) => eprintln!("rust-natsd: route accept error: {e}"),
             },
@@ -619,7 +720,65 @@ async fn leaf_accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             res = listener.accept() => match res {
                 Ok((stream, _peer)) => {
                     let _ = stream.set_nodelay(true);
-                    tokio::spawn(handle_leaf_accepted(stream, shared.clone()));
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        match &shared.leaf_tls_acceptor {
+                            // STARTTLS-like leaf order (Go, probed):
+                            // INFO goes out in plaintext first; the
+                            // leaf then upgrades the same socket to
+                            // TLS and sends CONNECT inside it. A
+                            // plain CONNECT after INFO is closed
+                            // silently, like Go.
+                            Some(acceptor) => {
+                                use tokio::io::AsyncWriteExt;
+                                let client_id =
+                                    shared.next_conn_id.fetch_add(1, Ordering::Relaxed);
+                                let mut stream = stream;
+                                if stream
+                                    .write_all(
+                                        format!(
+                                            "INFO {}\r\n",
+                                            leaf_info_text(&shared, client_id, false)
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let mut first = [0u8; 1];
+                                match stream.peek(&mut first).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(_) => {}
+                                }
+                                if first[0] != 0x16 {
+                                    return;
+                                }
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        let (reader, writer) = tokio::io::split(tls_stream);
+                                        handle_leaf_accepted(
+                                            reader, writer, shared, client_id, true, true,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("rust-natsd: leaf TLS handshake failed: {e}");
+                                    }
+                                }
+                            }
+                            None => {
+                                let (reader, writer) = stream.into_split();
+                                let client_id =
+                                    shared.next_conn_id.fetch_add(1, Ordering::Relaxed);
+                                handle_leaf_accepted(
+                                    reader, writer, shared, client_id, false, false,
+                                )
+                                .await;
+                            }
+                        }
+                    });
                 }
                 Err(e) => eprintln!("rust-natsd: leaf accept error: {e}"),
             },
@@ -1453,6 +1612,10 @@ struct ConnState {
     permissions: crate::config::Permissions,
     /// Per-connection INFO nonce (nkey clients sign this).
     nonce: String,
+    /// Peer certificate identity candidates (SAN/CN/DN) when the
+    /// connection used TLS; empty otherwise. Used only when
+    /// `verify_and_map` is configured.
+    cert_candidates: Vec<String>,
 }
 
 /// Build the client INFO for one connection. The nonce is a per-connection
@@ -1483,6 +1646,7 @@ fn client_info(shared: &Shared, client_id: u64, peer_ip: &str, nonce: &str) -> S
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn<R, W>(
     mut reader: R,
     writer: W,
@@ -1491,6 +1655,7 @@ async fn handle_conn<R, W>(
     peer_ip: String,
     nonce: String,
     info_sent: bool,
+    cert_candidates: Vec<String>,
 ) where
     R: AsyncReadExt + Unpin + Send,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -1555,6 +1720,7 @@ async fn handle_conn<R, W>(
         account: "$G".to_string(),
         permissions: crate::config::Permissions::default(),
         nonce: nonce.clone(),
+        cert_candidates,
     };
     let mut parser = Parser::new(shared.config.max_payload);
     let mut buf = vec![0u8; 16 * 1024];
@@ -1625,7 +1791,11 @@ async fn process_op(
     match op {
         ClientOp::Connect(info) => {
             let nonce = state.nonce.as_bytes();
-            let Some(outcome) = shared.config.authenticate(&info, Some(nonce)) else {
+            let Some(outcome) =
+                shared
+                    .config
+                    .authenticate_with_cert(&info, Some(nonce), &state.cert_candidates)
+            else {
                 let _ = tx.send(encode_err("Authorization Violation")).await;
                 return false;
             };
@@ -1894,8 +2064,17 @@ fn json_u64(json: &str, field: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// Read one CRLF-terminated line from a buffered reader.
-async fn read_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> io::Result<String> {
+fn json_bool(json: &str, field: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get(field)?
+        .as_bool()
+}
+
+/// Read one CRLF-terminated line from a buffered reader. Generic over
+/// the read half so plain TCP and TLS streams share the route/leaf
+/// handshake and read loops.
+async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut BufReader<R>) -> io::Result<String> {
     let mut buf = Vec::new();
     let n = reader.read_until(b'\n', &mut buf).await?;
     if n == 0 {
@@ -1920,11 +2099,15 @@ fn route_info_text(shared: &Arc<Shared>) -> String {
         port,
         shared.config.max_payload,
         shared.listen_addr,
+        shared.config.cluster_tls.is_some(),
     )
 }
 
-async fn handle_route_accepted(stream: TcpStream, shared: Arc<Shared>) {
-    let (reader, writer) = stream.into_split();
+async fn handle_route_accepted<R, W>(reader: R, writer: W, shared: Arc<Shared>, tls: bool)
+where
+    R: AsyncReadExt + Unpin + Send,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(reader);
     let (handle, tx) = spawn_writer(writer, shared.clone());
     // Accepter sends INFO first.
@@ -1999,7 +2182,7 @@ async fn handle_route_accepted(stream: TcpStream, shared: Arc<Shared>) {
             started: Instant::now(),
             account: "$G".to_string(),
             user: None,
-            tls: false,
+            tls,
         },
     );
     send_local_interest(&shared, &handle, true, None);
@@ -2086,7 +2269,44 @@ async fn solicit_route_loop(url: String, shared: Arc<Shared>) {
             Ok(stream) => {
                 backoff = Duration::from_secs(1);
                 let _ = stream.set_nodelay(true);
-                handle_route_solicited(stream, shared.clone(), target.clone()).await;
+                match &shared.route_tls_connector {
+                    // Implicit TLS (Go's probed route order): the
+                    // ClientHello goes first, inside which CONNECT
+                    // and INFO then flow.
+                    Some(connector) => {
+                        let Some(name) = tls_server_name(&host) else {
+                            eprintln!("rust-natsd: invalid route TLS server name: {host}");
+                            continue;
+                        };
+                        match connector.connect(name, stream).await {
+                            Ok(tls_stream) => {
+                                let (reader, writer) = tokio::io::split(tls_stream);
+                                handle_route_solicited(
+                                    reader,
+                                    writer,
+                                    shared.clone(),
+                                    target.clone(),
+                                    true,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                eprintln!("rust-natsd: route TLS handshake failed: {e}");
+                            }
+                        }
+                    }
+                    None => {
+                        let (reader, writer) = stream.into_split();
+                        handle_route_solicited(
+                            reader,
+                            writer,
+                            shared.clone(),
+                            target.clone(),
+                            false,
+                        )
+                        .await;
+                    }
+                }
             }
             Err(_) => {
                 tokio::time::sleep(backoff).await;
@@ -2097,12 +2317,24 @@ async fn solicit_route_loop(url: String, shared: Arc<Shared>) {
     }
 }
 
-async fn handle_route_solicited(stream: TcpStream, shared: Arc<Shared>, target: String) {
-    let (reader, writer) = stream.into_split();
+async fn handle_route_solicited<R, W>(
+    reader: R,
+    writer: W,
+    shared: Arc<Shared>,
+    target: String,
+    tls: bool,
+) where
+    R: AsyncReadExt + Unpin + Send,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(reader);
     let (handle, tx) = spawn_writer(writer, shared.clone());
     // Dialer sends CONNECT first, then reads peer INFO, then sends INFO.
-    let connect = route_connect_json(&shared.server_id, &shared.config.effective_cluster_name());
+    let connect = route_connect_json(
+        &shared.server_id,
+        &shared.config.effective_cluster_name(),
+        tls,
+    );
     if tx
         .send(Bytes::from(format!("CONNECT {connect}\r\n")))
         .await
@@ -2163,7 +2395,7 @@ async fn handle_route_solicited(stream: TcpStream, shared: Arc<Shared>, target: 
             started: Instant::now(),
             account: "$G".to_string(),
             user: None,
-            tls: false,
+            tls,
         },
     );
     send_local_interest(&shared, &handle, true, None);
@@ -2171,8 +2403,8 @@ async fn handle_route_solicited(stream: TcpStream, shared: Arc<Shared>, target: 
     close_route(&shared, id);
 }
 
-async fn route_read_loop(
-    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+async fn route_read_loop<R: AsyncReadExt + Unpin>(
+    reader: &mut BufReader<R>,
     shared: &Arc<Shared>,
     id: u64,
     handle: &Arc<ConnHandle>,
@@ -2299,7 +2531,7 @@ async fn process_route_op(
 // Leaf nodes
 // ---------------------------------------------------------------------------
 
-fn leaf_info_text(shared: &Arc<Shared>, client_id: u64) -> String {
+fn leaf_info_text(shared: &Arc<Shared>, client_id: u64, connect_info: bool) -> String {
     let (host, port) = match shared.leaf_addr {
         Some(a) => (a.ip().to_string(), a.port()),
         None => (shared.config.host.clone(), shared.config.leaf_port),
@@ -2308,6 +2540,10 @@ fn leaf_info_text(shared: &Arc<Shared>, client_id: u64) -> String {
     // (leafnode_urls) in the hub INFO, else it closes with
     // "attempted to connect to wrong port".
     let urls = shared.leaf_addr.map(|a| format!("{}:{}", a.ip(), a.port()));
+    let (tls_required, tls_verify) = match &shared.config.leaf_tls {
+        Some(t) => (true, t.verify || t.verify_and_map),
+        None => (false, false),
+    };
     leaf_info_json(
         &shared.server_id,
         &shared.config.name,
@@ -2318,48 +2554,102 @@ fn leaf_info_text(shared: &Arc<Shared>, client_id: u64) -> String {
         &shared.config.effective_cluster_name(),
         client_id,
         urls.as_deref(),
+        tls_required,
+        tls_verify,
+        connect_info,
     )
 }
 
-async fn handle_leaf_accepted(stream: TcpStream, shared: Arc<Shared>) {
-    let (reader, writer) = stream.into_split();
+async fn handle_leaf_accepted<R, W>(
+    reader: R,
+    writer: W,
+    shared: Arc<Shared>,
+    client_id: u64,
+    info_sent: bool,
+    tls: bool,
+) where
+    R: AsyncReadExt + Unpin + Send,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(reader);
     let (handle, tx) = spawn_writer(writer, shared.clone());
-    // Hub sends INFO first.
-    let client_id = shared.next_conn_id.fetch_add(1, Ordering::Relaxed);
-    if tx
-        .send(Bytes::from(format!(
-            "INFO {}\r\n",
-            leaf_info_text(&shared, client_id)
-        )))
-        .await
-        .is_err()
+    // Hub sends INFO first — unless the accept loop already sent it
+    // in plaintext for a TLS upgrade (see leaf_accept_loop).
+    if !info_sent
+        && tx
+            .send(Bytes::from(format!(
+                "INFO {}\r\n",
+                leaf_info_text(&shared, client_id, false)
+            )))
+            .await
+            .is_err()
     {
         return;
     }
     // Then expects leaf CONNECT, optionally preceded by leaf INFO (Go
-    // sends its INFO only when the hub INFO sets info_on_connect; our
-    // INFO does not, so a Go leaf sends CONNECT straight away).
+    // sends its INFO when the hub INFO sets info_on_connect, which
+    // ours does for TLS hubs; plain hubs get CONNECT straight away).
+    // When the leaf does send INFO, the hub replies with its own INFO
+    // (with connect_info: true) on the same connection before
+    // reading CONNECT: a Go hub does this (captured via a
+    // TLS-intercepting proxy against Go nats-server v2.15.1). A Go
+    // leaf arms a 2s timer when it sends CONNECT and only cancels
+    // it on a hub INFO with connect_info: true; without one it
+    // closes the connection with
+    // `-ERR 'Stale Leaf Node Connection - Closing'`. The reply is
+    // sent on the same stream the leaf INFO arrived on, so for TLS
+    // hubs it is inside TLS.
     let first_line = match read_line(&mut reader).await {
         Ok(l) => l,
         Err(_) => return,
     };
-    let (peer_id, connect_json) = if let Some(info_json) = first_line.strip_prefix("INFO ") {
-        let peer_id = json_str(info_json, "server_id").unwrap_or_default();
-        let connect_line = match read_line(&mut reader).await {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        let Some(connect_json) = connect_line.strip_prefix("CONNECT ") else {
+    let (peer_id, connect_json, sent_connect_info) =
+        if let Some(info_json) = first_line.strip_prefix("INFO ") {
+            let peer_id = json_str(info_json, "server_id").unwrap_or_default();
+            if tx
+                .send(Bytes::from(format!(
+                    "INFO {}\r\n",
+                    leaf_info_text(&shared, client_id, true)
+                )))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let connect_line = match read_line(&mut reader).await {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            let Some(connect_json) = connect_line.strip_prefix("CONNECT ") else {
+                return;
+            };
+            (peer_id, connect_json.to_string(), true)
+        } else if let Some(connect_json) = first_line.strip_prefix("CONNECT ") {
+            let peer_id = json_str(connect_json, "server_id").unwrap_or_default();
+            (peer_id, connect_json.to_string(), false)
+        } else {
             return;
         };
-        (peer_id, connect_json.to_string())
-    } else if let Some(connect_json) = first_line.strip_prefix("CONNECT ") {
-        let peer_id = json_str(connect_json, "server_id").unwrap_or_default();
-        (peer_id, connect_json.to_string())
-    } else {
+    // A Go leaf that sent CONNECT straight away (it does this when
+    // the hub's pre-TLS INFO differs from Go's in the field that
+    // triggers leaf-INFO-first) still waits for a hub INFO with
+    // connect_info: true to cancel its 2s connect timer — but only
+    // when the first INFO set info_on_connect, which ours does for
+    // TLS hubs (info_sent). Plain hubs set no info_on_connect, so
+    // the leaf already finished on the first INFO and gets nothing
+    // extra here.
+    if info_sent
+        && !sent_connect_info
+        && tx
+            .send(Bytes::from(format!(
+                "INFO {}\r\n",
+                leaf_info_text(&shared, client_id, true)
+            )))
+            .await
+            .is_err()
+    {
         return;
-    };
+    }
     if !leaf_connect_authorized(&shared, &connect_json) {
         let _ = tx.send(encode_err("Authorization Violation")).await;
         return;
@@ -2388,7 +2678,7 @@ async fn handle_leaf_accepted(stream: TcpStream, shared: Arc<Shared>) {
             started: Instant::now(),
             account: leaf_account.clone(),
             user: None,
-            tls: false,
+            tls,
         },
     );
     send_local_interest(&shared, &handle, false, Some(&leaf_account));
@@ -2449,7 +2739,51 @@ async fn solicit_leaf_loop(url: String, shared: Arc<Shared>) {
             Ok(stream) => {
                 backoff = Duration::from_secs(1);
                 let _ = stream.set_nodelay(true);
-                handle_leaf_solicited(stream, shared.clone()).await;
+                // Hub INFO first (plaintext, even for TLS hubs).
+                // Read it on the unsplit socket so a TLS upgrade
+                // afterwards cannot lose buffered bytes: after its
+                // INFO the hub sends nothing until the leaf upgrades
+                // (TLS) or sends INFO+CONNECT (plain), so the read
+                // buffer must be empty here.
+                let mut pre = BufReader::new(stream);
+                let info_line = match read_line(&mut pre).await {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let Some(hub_info) = info_line.strip_prefix("INFO ") else {
+                    continue;
+                };
+                let hub_tls = json_bool(hub_info, "tls_required").unwrap_or(false);
+                if hub_tls {
+                    let Some(connector) = shared.leaf_remote_connectors.get(&url).cloned() else {
+                        eprintln!(
+                            "rust-natsd: leaf hub {url} requires TLS but no tls block is configured for this remote"
+                        );
+                        continue;
+                    };
+                    if !pre.buffer().is_empty() {
+                        continue;
+                    }
+                    let tcp = pre.into_inner();
+                    let Some(name) = tls_server_name(&host) else {
+                        eprintln!("rust-natsd: invalid leaf TLS server name: {host}");
+                        continue;
+                    };
+                    match connector.connect(name, tcp).await {
+                        Ok(tls_stream) => {
+                            let (reader, writer) = tokio::io::split(tls_stream);
+                            handle_leaf_solicited_after_info(reader, writer, shared.clone(), true)
+                                .await;
+                        }
+                        Err(e) => {
+                            eprintln!("rust-natsd: leaf TLS handshake failed: {e}");
+                        }
+                    }
+                } else {
+                    let tcp = pre.into_inner();
+                    let (reader, writer) = tcp.into_split();
+                    handle_leaf_solicited_after_info(reader, writer, shared.clone(), false).await;
+                }
             }
             Err(_) => {
                 tokio::time::sleep(backoff).await;
@@ -2460,23 +2794,25 @@ async fn solicit_leaf_loop(url: String, shared: Arc<Shared>) {
     }
 }
 
-async fn handle_leaf_solicited(stream: TcpStream, shared: Arc<Shared>) {
-    let (reader, writer) = stream.into_split();
+/// Solicited leaf after the hub INFO has been consumed: the leaf sends
+/// its INFO + CONNECT (inside TLS when `tls` is true), then runs the
+/// leaf read loop.
+async fn handle_leaf_solicited_after_info<R, W>(
+    reader: R,
+    writer: W,
+    shared: Arc<Shared>,
+    tls: bool,
+) where
+    R: AsyncReadExt + Unpin + Send,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(reader);
     let (handle, tx) = spawn_writer(writer, shared.clone());
-    // Hub INFO first, then leaf sends INFO + CONNECT.
-    let info_line = match read_line(&mut reader).await {
-        Ok(l) => l,
-        Err(_) => return,
-    };
-    let Some(_hub_info) = info_line.strip_prefix("INFO ") else {
-        return;
-    };
     let client_id = shared.next_conn_id.fetch_add(1, Ordering::Relaxed);
     if tx
         .send(Bytes::from(format!(
             "INFO {}\r\n",
-            leaf_info_text(&shared, client_id)
+            leaf_info_text(&shared, client_id, false)
         )))
         .await
         .is_err()
@@ -2537,7 +2873,7 @@ async fn handle_leaf_solicited(stream: TcpStream, shared: Arc<Shared>) {
             started: Instant::now(),
             account: leaf_account.clone(),
             user: None,
-            tls: false,
+            tls,
         },
     );
     send_local_interest(&shared, &handle, false, Some(&leaf_account));
@@ -2545,8 +2881,8 @@ async fn handle_leaf_solicited(stream: TcpStream, shared: Arc<Shared>) {
     close_leaf(&shared, id);
 }
 
-async fn leaf_read_loop(
-    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+async fn leaf_read_loop<R: AsyncReadExt + Unpin>(
+    reader: &mut BufReader<R>,
     shared: &Arc<Shared>,
     id: u64,
     handle: &Arc<ConnHandle>,

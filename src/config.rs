@@ -216,6 +216,15 @@ pub struct TlsSettings {
     pub key_file: String,
     pub ca_file: Option<String>,
     pub verify: bool,
+    /// Client-certificate-to-user mapping (Go's `verify_and_map`):
+    /// when true, a verified client certificate is the credential —
+    /// its SANs (email, then DNS, then URI), then its CN, then its
+    /// full distinguished name are tried in order against configured
+    /// user names, and the first match authenticates as that user
+    /// (with that user's permissions). No mapping entry means the
+    /// connection is rejected, even if a password would match.
+    /// Implies `verify` (a client certificate is required).
+    pub verify_and_map: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -254,6 +263,22 @@ pub struct Config {
     pub http_port: u16,
     /// TLS for client connections; None means plain text.
     pub tls: Option<TlsSettings>,
+    /// TLS for route (cluster) connections; None means plain text.
+    /// When set, the route listener requires implicit TLS (the peer's
+    /// ClientHello comes first — no plaintext INFO, matching Go's
+    /// probed route order), and solicited routes dial with TLS using
+    /// this certificate/CA.
+    pub cluster_tls: Option<TlsSettings>,
+    /// TLS for the leafnode listener; None means plain text. When set,
+    /// the hub sends its INFO in plaintext first (with
+    /// `tls_required`), then upgrades the connection to TLS before
+    /// reading CONNECT — Go's probed leaf order (STARTTLS-like, unlike
+    /// routes). Solicited leafs use per-remote TLS settings
+    /// (`leaf_remote_tls`, from `leafnodes { remotes: [{url, tls}] }`).
+    pub leaf_tls: Option<TlsSettings>,
+    /// Per-remote TLS settings for solicited leaf connections, keyed
+    /// by the remote URL string as configured.
+    pub leaf_remote_tls: std::collections::HashMap<String, TlsSettings>,
     /// Multi-account model; empty means the legacy single-account mode
     /// (global --user/--pass/--auth-token as account `$G`).
     pub accounts: Vec<Account>,
@@ -293,6 +318,9 @@ impl Default for Config {
             js_store_dir: None,
             http_port: 0,
             tls: None,
+            cluster_tls: None,
+            leaf_tls: None,
+            leaf_remote_tls: std::collections::HashMap::new(),
             accounts: Vec::new(),
             system_account: None,
             no_auth_user: None,
@@ -496,9 +524,64 @@ impl Config {
                 "--tlsverify" => {
                     cfg.tls.get_or_insert_with(TlsSettings::default).verify = true;
                 }
+                "--tlsverify-and-map" => {
+                    let tls = cfg.tls.get_or_insert_with(TlsSettings::default);
+                    tls.verify = true;
+                    tls.verify_and_map = true;
+                }
                 "--tlscacert" => {
                     let path = next(&mut i)?;
                     cfg.tls.get_or_insert_with(TlsSettings::default).ca_file = Some(path);
+                }
+                "--cluster-tls" => {
+                    cfg.cluster_tls.get_or_insert_with(TlsSettings::default);
+                }
+                "--cluster-tlscert" => {
+                    let path = next(&mut i)?;
+                    cfg.cluster_tls
+                        .get_or_insert_with(TlsSettings::default)
+                        .cert_file = path;
+                }
+                "--cluster-tlskey" => {
+                    let path = next(&mut i)?;
+                    cfg.cluster_tls
+                        .get_or_insert_with(TlsSettings::default)
+                        .key_file = path;
+                }
+                "--cluster-tlscacert" => {
+                    let path = next(&mut i)?;
+                    cfg.cluster_tls
+                        .get_or_insert_with(TlsSettings::default)
+                        .ca_file = Some(path);
+                }
+                "--cluster-tlsverify" => {
+                    cfg.cluster_tls
+                        .get_or_insert_with(TlsSettings::default)
+                        .verify = true;
+                }
+                "--leaf-tls" => {
+                    cfg.leaf_tls.get_or_insert_with(TlsSettings::default);
+                }
+                "--leaf-tlscert" => {
+                    let path = next(&mut i)?;
+                    cfg.leaf_tls
+                        .get_or_insert_with(TlsSettings::default)
+                        .cert_file = path;
+                }
+                "--leaf-tlskey" => {
+                    let path = next(&mut i)?;
+                    cfg.leaf_tls
+                        .get_or_insert_with(TlsSettings::default)
+                        .key_file = path;
+                }
+                "--leaf-tlscacert" => {
+                    let path = next(&mut i)?;
+                    cfg.leaf_tls
+                        .get_or_insert_with(TlsSettings::default)
+                        .ca_file = Some(path);
+                }
+                "--leaf-tlsverify" => {
+                    cfg.leaf_tls.get_or_insert_with(TlsSettings::default).verify = true;
                 }
                 "-h" | "--help" => return Err(Self::usage()),
                 other => return Err(format!("unknown argument: {other}\n\n{}", Self::usage())),
@@ -517,6 +600,22 @@ impl Config {
             }
             if t.verify && t.ca_file.is_none() {
                 return Err("--tlsverify requires --tlscacert".to_string());
+            }
+            if t.verify_and_map && t.ca_file.is_none() {
+                return Err("--tlsverify-and-map requires --tlscacert".to_string());
+            }
+        }
+        for (what, tls) in [
+            ("cluster TLS", &cfg.cluster_tls),
+            ("leaf TLS", &cfg.leaf_tls),
+        ] {
+            if let Some(t) = tls {
+                if t.cert_file.is_empty() || t.key_file.is_empty() {
+                    return Err(format!("{what} requires a cert and key"));
+                }
+                if t.verify && t.ca_file.is_none() {
+                    return Err(format!("{what} verify requires a CA file"));
+                }
             }
         }
         Ok(cfg)
@@ -553,7 +652,18 @@ impl Config {
          \x20   --tlscert <FILE>        TLS server certificate (PEM)\n\
          \x20   --tlskey <FILE>         TLS server private key (PEM)\n\
          \x20   --tlsverify             Require and verify client certificates\n\
+         \x20   --tlsverify-and-map     Map a verified client certificate to a user (SAN/CN/DN)\n\
          \x20   --tlscacert <FILE>      CA file for client-certificate verification\n\
+         \x20   --cluster-tls           Require (implicit) TLS on the route port\n\
+         \x20   --cluster-tlscert <FILE> Route TLS certificate (PEM)\n\
+         \x20   --cluster-tlskey <FILE> Route TLS private key (PEM)\n\
+         \x20   --cluster-tlscacert <FILE> Route TLS CA file\n\
+         \x20   --cluster-tlsverify     Verify route peer certificates\n\
+         \x20   --leaf-tls              Require TLS on the leafnode port (INFO first, then upgrade)\n\
+         \x20   --leaf-tlscert <FILE>   Leaf TLS certificate (PEM)\n\
+         \x20   --leaf-tlskey <FILE>    Leaf TLS private key (PEM)\n\
+         \x20   --leaf-tlscacert <FILE> Leaf TLS CA file\n\
+         \x20   --leaf-tlsverify        Verify leaf peer certificates\n\
          \x20   -c, --config <FILE>     Config file (nats-server .conf subset)\n\
          \x20   -h, --help              Show this help"
             .to_string()
@@ -747,6 +857,58 @@ impl Config {
             user: info.user.clone(),
             permissions: Permissions::default(),
         })
+    }
+
+    /// Authenticate a CONNECT, with the peer certificate's identity
+    /// candidates (SANs, CN, DN — see `crate::tls::CertIdentity`)
+    /// when the connection used TLS. When `verify_and_map` is on and
+    /// a certificate was presented, certificate mapping is the only
+    /// credential: a candidate matching a configured user name
+    /// authenticates as that user (passwords are ignored), and no
+    /// match rejects the connection even if a password would match —
+    /// matching Go's probed `verify_and_map` behaviour, except that
+    /// Go matches the DN only while rust-natsd also accepts a bare
+    /// CN or SAN equal to the user name (documented in README).
+    pub fn authenticate_with_cert(
+        &self,
+        info: &crate::protocol::ConnectInfo,
+        nonce: Option<&[u8]>,
+        cert_candidates: &[String],
+    ) -> Option<AuthOutcome> {
+        let mapping_on = self.tls.as_ref().is_some_and(|t| t.verify_and_map);
+        if mapping_on {
+            // Legacy single-user mode: the mapped name must equal the
+            // configured user.
+            if self.accounts.is_empty() {
+                if let Some(user) = &self.user {
+                    if cert_candidates.iter().any(|c| c == user) {
+                        return Some(AuthOutcome {
+                            account: "$G".to_string(),
+                            user: Some(user.clone()),
+                            permissions: Permissions::default(),
+                        });
+                    }
+                }
+                return None;
+            }
+            // Candidates outer, users inner: a SAN match wins over
+            // a CN match when both name different users.
+            for candidate in cert_candidates {
+                for account in &self.accounts {
+                    for user in &account.users {
+                        if !user.name.is_empty() && &user.name == candidate {
+                            return Some(AuthOutcome {
+                                account: account.name.clone(),
+                                user: Some(user.name.clone()),
+                                permissions: user.permissions.fallback(&account.permissions),
+                            });
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        self.authenticate(info, nonce)
     }
 
     /// Check a client's CONNECT credentials against the configured auth.

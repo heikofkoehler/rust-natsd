@@ -344,7 +344,15 @@ fn parse_leaf_line(
     }
 }
 
-/// Leaf INFO JSON for this server.
+/// Leaf INFO JSON for this server. `tls_required`/`tls_verify`
+/// describe this node's leaf listener TLS (Go's hub INFO carries
+/// both when TLS is configured; a soliciting leaf uses
+/// `tls_required` to decide whether to upgrade before CONNECT).
+/// `connect_info` marks the INFO as completing a leaf connect: a
+/// Go soliciting leaf arms a 2s timer when it sends CONNECT and
+/// only cancels it when it processes a hub INFO with
+/// `connect_info: true` (nats-server v2.15.1
+/// leafNodeResumeConnectProcess/leafNodeFinishConnectProcess).
 #[allow(clippy::too_many_arguments)]
 pub fn leaf_info_json(
     server_id: &str,
@@ -356,8 +364,11 @@ pub fn leaf_info_json(
     cluster_name: &str,
     client_id: u64,
     leafnode_urls: Option<&str>,
+    tls_required: bool,
+    tls_verify: bool,
+    connect_info: bool,
 ) -> String {
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "server_id": server_id,
         "server_name": server_name,
         "version": env!("CARGO_PKG_VERSION"),
@@ -375,8 +386,19 @@ pub fn leaf_info_json(
         // confirm the remote is a leaf listener, not a client port.
         "client_id": client_id,
         "leafnode_urls": leafnode_urls.map(|u| vec![u.to_string()]),
-    })
-    .to_string()
+    });
+    if tls_required {
+        obj["tls_required"] = serde_json::Value::Bool(true);
+        obj["tls_verify"] = serde_json::Value::Bool(tls_verify);
+        // Go's hub INFO sets info_on_connect, telling the leaf to
+        // send its INFO before CONNECT (which rust-natsd's solicited
+        // leaf already does).
+        obj["info_on_connect"] = serde_json::Value::Bool(true);
+    }
+    if connect_info {
+        obj["connect_info"] = serde_json::Value::Bool(true);
+    }
+    obj.to_string()
 }
 
 /// Leaf CONNECT JSON (leaf sends this to the hub; hub: false).
