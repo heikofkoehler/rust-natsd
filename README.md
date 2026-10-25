@@ -83,7 +83,7 @@ rust-natsd does; it replaces the older support table.
 | JetStream: deliver policies `all` / `last` (filter-aware) / `new` / `by_start_sequence` | Implemented | |
 | JetStream persistence | Implemented | Whole-engine JSON snapshot after every mutation, reloaded on startup — including per-consumer pending ack state (in-flight stream seqs, delivery counts, wall-clock delivery times), ack floors, redelivery counts, and pull redelivery queues (snapshot v2; v1 snapshots load with empty ack state). Restart preserves the remaining ack window (Go v2.15.1 semantics, probed): unacked messages redeliver once the window expires with delivered count incremented, acked messages never redeliver, push redelivery defers while the deliver subject has no interest; waiting pulls are not persisted (dead reply inbox) |
 | JetStream clustering / replication | Not implemented | Single-node only; non-goal |
-| JetStream mirroring / sourcing | Not implemented | Non-goal |
+| JetStream mirroring / sourcing | Implemented (same node) | `mirror` / `sources` in STREAM.CREATE (`name`, `filter_subject`, `opt_start_seq`, `opt_start_time`); backfill at creation then live copies via the capture hook (atomic under the engine lock: no loss, no duplicates); mirror copies are exact, source copies add a `Nats-Stream-Source` header; origin delete keeps copies but kills the link permanently, purge leaves the mirror untouched. Cross-node mirroring/sourcing (routes/leafs, `external`) is NOT implemented and is rejected at creation. One deliberate deviation from Go: a mirror/source of a nonexistent stream is rejected with 404/10059 instead of Go's accept-and-leave-empty |
 | JetStream `$JS.API` routing across routes/leafs (`$JS.API.>` interest) | Implemented | |
 | KV / object store as client helpers | Partial | Stream primitives exist (`KV_<bucket>` streams, `last_by_subj`); raw `$KV` traffic matches Go (parity probe `kv_raw`), but the nats.go/async-nats KV helpers apply a version gate (see below) and are not verified end-to-end |
 | Monitoring `/varz` | Implemented | Real `http_port`, `mem`, `slow_consumers`, configured ping values |
@@ -126,9 +126,10 @@ supported fields / totals only, by design.
 
 **Scope — what mainline does that rust-natsd deliberately does not.**
 Gateways (super-cluster), JetStream clustering/replication,
-mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
+cross-node mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
 route/leaf TLS, TLS certificate-to-user mapping, and XKeys. JetStream
-here is single-node only. Conversely, rust-natsd is a superset in
+here is single-node only (mirroring/sourcing work on the same node).
+Conversely, rust-natsd is a superset in
 exactly one place: it implements `/subz` and `/accounz`, which Go
 2.15.1 answers with 404.
 

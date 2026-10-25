@@ -22,8 +22,8 @@ clients, plus raw-wire protocol tests. 97 Rust tests green; Go interop
 scripts green in both directions (routes, leafs, JetStream).
 
 Remaining non-goals: gateways, JetStream clustering/replication,
-mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
-route/leaf TLS, TLS client-certificate-to-user mapping, and the
+cross-node mirroring/sourcing, MQTT/WebSocket gateways, JWT operator
+mode, route/leaf TLS, TLS client-certificate-to-user mapping, and the
 KV/object-store client helpers (their server-side primitives exist).
 
 ## Phases
@@ -260,10 +260,51 @@ KV/object-store client helpers (their server-side primitives exist).
   restart); cargo test 110 green; parity GREEN (52 pass + 1
   exception); bench no regression vs 86edbe8.
 
+### Phase 20 — JetStream mirroring/sourcing, same node (gap area 5)
+- `STREAM.CREATE` accepts `mirror` and `sources` (each: `name`,
+  `filter_subject`, `opt_start_seq`, `opt_start_time`; wire shape
+  and honoured fields probed first against Go v2.15.1 with nats.go
+  and raw `$JS.API` MSG.GET). Backfill at creation — sources in
+  config order, from `opt_start_seq` / `opt_start_time` when given,
+  honouring `filter_subject` — then live copies hooked into
+  `capture()` under the engine lock, so backfill + link
+  registration are atomic (no loss, no duplicates, no polling
+  loop). Chains propagate (mirror of a mirror, source of a source)
+  via recursion with a visited guard. Mirror copies are exact
+  (origin subject, fresh mirror sequence, original headers and
+  timestamp preserved); source copies add a `Nats-Stream-Source:
+  <origin> <origin_seq> <filter|">"> <subject> <origin_token>`
+  header (Go's trailing token is a per-origin-stream id; here a
+  per-stream token generated at creation and persisted in the
+  snapshot). Mirror streams are normal streams (MSG.GET,
+  consumers, INFO with `mirror`/`sources` in config all work).
+- Validation, matching Go where probed: mirror with subjects and
+  mirror with sources are rejected, as are config-graph cycles
+  (transitive, counting dead links — Go rejects recreating a
+  stream that would close a loop through a deleted stream's
+  config). One deliberate deviation, required by the task: a
+  mirror/source of a nonexistent stream is rejected with
+  404/10059, where Go accepts it and leaves the stream empty.
+  `external` and `subject_transforms` are rejected: cross-node
+  mirroring/sourcing is out of scope and is not faked.
+- Origin lifecycle (probed): deleting an origin keeps the mirror's
+  copies but kills the live link permanently — recreating a
+  same-named origin does not revive it (the `live` flag on each
+  link is persisted, so restarts do not revive dead links either);
+  purging an origin leaves the mirror untouched. Backfill is
+  synchronous here where Go's is asynchronous; the final state
+  matches. A sourced stream may also carry subjects (direct
+  publishes are then captured as well as source copies, as Go does).
+- Verified: 6 new tests in `tests/e2e_js_mirror.rs` (backfill +
+  live, two origins, filter + start_seq, nonexistent rejection,
+  config validation, delete/no-resume, restart + live resume);
+  cargo test 116 green; parity GREEN (52 pass + 1 exception);
+  bench no regression vs 86edbe8.
+
 ## Future work (not in this plan)
-- Gateways, JetStream clustering/replication, mirroring/sourcing,
-  MQTT/WebSocket gateways, JWT operator mode, route/leaf TLS,
-  TLS client-certificate-to-user mapping,
+- Gateways, JetStream clustering/replication, cross-node
+  mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
+  route/leaf TLS, TLS client-certificate-to-user mapping,
   KV/object-store client-helper verification.
 
 ## Design notes

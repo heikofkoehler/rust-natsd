@@ -35,7 +35,30 @@
 //! - Retention: limits and workqueue (deleted after first ack; ack
 //!   policy All deletes only the acked message, not the whole floor).
 //! - Consumer deliver_policy: all, last (filter-aware), new, and
-//!   by_start_sequence. No replication, no mirroring/sourcing.
+//!   by_start_sequence. No replication.
+//! - Mirroring/sourcing (same node only): a stream whose config
+//!   carries `mirror` or `sources` copies messages from origin
+//!   stream(s) on the same node — backfill at creation (from
+//!   `opt_start_seq` / `opt_start_time` when given, honouring
+//!   `filter_subject`), then live copies on every origin publish
+//!   (hooked into capture, under the engine lock, so backfill +
+//!   link registration are atomic: no loss, no duplicates).
+//!   Mirror copies are exact (origin subject, new mirror sequence,
+//!   original headers and timestamp preserved); source copies add a
+//!   `Nats-Stream-Source: <origin> <origin_seq> <filter|>> >
+//!   <subject> <origin_token>` header (Go v2.15.1 shape, probed;
+//!   Go's trailing token is a per-origin-stream id, replicated here
+//!   as a per-stream token generated at creation and persisted).
+//!   Mirror streams must not carry subjects or other sources (Go
+//!   rejects both); a mirror/source of a nonexistent stream is
+//!   rejected with 404/10059 (stricter than Go, which accepts it
+//!   and leaves the stream empty — see PLAN Phase 20); cycles in
+//!   the config graph are rejected. Deleting an origin keeps the
+//!   mirror's copies but kills the live link permanently, even if a
+//!   same-named origin is recreated later (Go behaviour, probed);
+//!   purging an origin does not touch the mirror. Cross-node
+//!   mirroring/sourcing (routes/leafs, `external`) is NOT
+//!   implemented and is rejected at creation.
 //! - KV is not a separate implementation: a KV bucket is a plain stream
 //!   named `KV_<bucket>` with subjects `$KV.<bucket>.>`; the primitives
 //!   KV needs (headers on stored messages, `MSG.GET` with `last_by_subj`)
@@ -229,6 +252,21 @@ struct StoredMsg {
     time_ns: u64,
 }
 
+/// One mirror/source link in a stream's config. `live` is the
+/// runtime link state: true while the origin exists and the link
+/// copies, false after the origin was deleted (the config is kept,
+/// the copies are kept, but the link never revives — even if a
+/// same-named origin is created later, matching Go). `live` is
+/// persisted so a restart does not revive a dead link.
+#[derive(Clone)]
+struct SourceCfg {
+    name: String,
+    filter_subject: Option<String>,
+    start_seq: u64,
+    start_time_ns: u64,
+    live: bool,
+}
+
 struct Stream {
     name: String,
     /// Account that owns this stream; capture and API lookups are
@@ -253,6 +291,16 @@ struct Stream {
     base_seq: u64,
     msg_ids: HashMap<String, (u64, Instant)>,
     consumers: HashMap<String, Consumer>,
+    /// Mirror config (at most one; never combined with sources or
+    /// with subjects — validated at creation).
+    mirror: Option<SourceCfg>,
+    /// Source configs, backfilled and live-copied in config order.
+    sources: Vec<SourceCfg>,
+    /// Opaque per-stream id used as the trailing token of the
+    /// `Nats-Stream-Source` header on source copies (Go's token is a
+    /// per-origin-stream id; this one is generated at creation and
+    /// persisted).
+    source_token: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -365,7 +413,138 @@ pub(crate) fn rfc3339(time_ns: u64) -> String {
     )
 }
 
-/// Case-insensitive header lookup on a message's raw header block.
+/// Parse an RFC3339 UTC timestamp (`2026-10-24T01:23:45.123Z`) back
+/// to unix nanos. Inverse of `rfc3339`; only the `Z` form (which is
+/// what Go and async-nats emit for `opt_start_time`) is supported.
+fn parse_rfc3339_ns(s: &str) -> Option<u64> {
+    let t = s.strip_suffix('Z')?;
+    let main = t;
+    let frac = "";
+    let (date, time) = main.split_once('T')?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    let (time, frac) = match time.split_once('.') {
+        Some((t, f)) => (t, f),
+        None => (time, frac),
+    };
+    let mut t = time.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let min: i64 = t.next()?.parse().ok()?;
+    let sec: i64 = t.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // days_from_civil (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let mut nanos: u64 =
+        ((days * 86_400 + hour * 3600 + min * 60 + sec) as u64).checked_mul(1_000_000_000)?;
+    if !frac.is_empty() {
+        let mut f = frac.to_string();
+        while f.len() < 9 {
+            f.push('0');
+        }
+        f.truncate(9);
+        nanos += f.parse::<u64>().ok()?;
+    }
+    Some(nanos)
+}
+
+/// Opaque per-stream token (8 chars) for the `Nats-Stream-Source`
+/// header. Derived from the stream name and creation time; it only
+/// needs to be stable for the stream's lifetime (it is persisted).
+fn make_source_token(name: &str, now: u64) -> String {
+    const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes().iter().chain(&now.to_le_bytes()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    let mut out = String::with_capacity(8);
+    let mut v = h;
+    for _ in 0..8 {
+        out.push(ALPH[(v % 62) as usize] as char);
+        v /= 62;
+    }
+    out
+}
+
+/// Parse one mirror/source config object from a STREAM.CREATE body:
+/// `{"name", "filter_subject"?, "opt_start_seq"?, "opt_start_time"?}`.
+/// Returns None when `name` is missing/empty. `opt_start_time` may be
+/// an RFC3339 string (Go/async-nats) or a unix-nanos number (tolerant
+/// raw clients). `external` and `subject_transforms` are rejected by
+/// the caller, not here.
+fn parse_source_cfg(v: &Value) -> Option<SourceCfg> {
+    let name = v.get("name")?.as_str()?;
+    if name.is_empty() {
+        return None;
+    }
+    let start_time_ns = match v.get("opt_start_time") {
+        None => 0,
+        Some(Value::String(s)) => parse_rfc3339_ns(s)?,
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+        Some(_) => return None,
+    };
+    Some(SourceCfg {
+        name: name.to_string(),
+        filter_subject: v
+            .get("filter_subject")
+            .and_then(|f| f.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
+        start_seq: v.get("opt_start_seq").and_then(|n| n.as_u64()).unwrap_or(0),
+        start_time_ns,
+        live: true,
+    })
+}
+
+fn source_cfg_json(cfg: &SourceCfg) -> Value {
+    json!({
+        "name": cfg.name,
+        "filter_subject": cfg.filter_subject,
+        "opt_start_seq": cfg.start_seq,
+        "opt_start_time": if cfg.start_time_ns == 0 { Value::Null } else { Value::String(rfc3339(cfg.start_time_ns)) },
+    })
+}
+
+/// Append a `Nats-Stream-Source` header line to a stored message's
+/// header block (creating the block when the message had none).
+/// Value shape, probed against Go v2.15.1:
+/// `<origin> <origin_seq> <filter|">"> <subject> <origin_token>`.
+fn append_source_header(
+    headers: Option<Bytes>,
+    origin: &str,
+    origin_seq: u64,
+    filter: Option<&str>,
+    subject: &str,
+    token: &str,
+) -> Bytes {
+    let line = format!(
+        "Nats-Stream-Source: {origin} {origin_seq} {} > {subject} {token}",
+        filter.unwrap_or(">")
+    );
+    match headers {
+        None => Bytes::from(format!("NATS/1.0\r\n{line}\r\n\r\n")),
+        Some(h) => {
+            let text = String::from_utf8_lossy(&h);
+            let body = text.trim_end_matches(['\r', '\n']);
+            let body = if body.starts_with("NATS/") {
+                body.to_string()
+            } else {
+                format!("NATS/1.0\r\n{body}")
+            };
+            Bytes::from(format!("{body}\r\n{line}\r\n\r\n"))
+        }
+    }
+}
 fn header_get(msg: &Message, name: &str) -> Option<String> {
     msg.header_map()
         .iter()
@@ -481,6 +660,8 @@ impl Stream {
                 "allow_rollup_hdrs": false,
                 "consumer_limits": {},
                 "allow_msg_ttl": false,
+                "mirror": self.mirror.as_ref().map(source_cfg_json),
+                "sources": self.sources.iter().map(source_cfg_json).collect::<Vec<_>>(),
             },
             "created": rfc3339(self.created_ns),
             "state": {
@@ -948,6 +1129,21 @@ impl Engine {
                     "messages": messages,
                     "msg_ids": msg_ids,
                     "consumers": consumers,
+                    "mirror": s.mirror.as_ref().map(|c| json!({
+                        "name": c.name,
+                        "filter_subject": c.filter_subject,
+                        "opt_start_seq": c.start_seq,
+                        "opt_start_time_ns": c.start_time_ns,
+                        "live": c.live,
+                    })),
+                    "sources": s.sources.iter().map(|c| json!({
+                        "name": c.name,
+                        "filter_subject": c.filter_subject,
+                        "opt_start_seq": c.start_seq,
+                        "opt_start_time_ns": c.start_time_ns,
+                        "live": c.live,
+                    })).collect::<Vec<_>>(),
+                    "source_token": s.source_token,
                 })
             })
             .collect();
@@ -972,6 +1168,38 @@ impl Engine {
             let get_s = |k: &str| sv.get(k).and_then(|v| v.as_str()).unwrap_or("");
             let get_i = |k: &str| sv.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
             let get_u = |k: &str| sv.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let parse_snap_cfg = |v: &Value| -> SourceCfg {
+                SourceCfg {
+                    name: v
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    filter_subject: v
+                        .get("filter_subject")
+                        .and_then(|f| f.as_str())
+                        .map(|s| s.to_string()),
+                    start_seq: v.get("opt_start_seq").and_then(|n| n.as_u64()).unwrap_or(0),
+                    start_time_ns: v
+                        .get("opt_start_time_ns")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0),
+                    live: v.get("live").and_then(|n| n.as_bool()).unwrap_or(true),
+                }
+            };
+            let mirror = sv.get("mirror").and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    Some(parse_snap_cfg(v))
+                }
+            });
+            let sources: Vec<SourceCfg> = sv
+                .get("sources")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(&parse_snap_cfg).collect())
+                .unwrap_or_default();
+            let created_ns = get_u("created_ns");
             let mut stream = Stream {
                 name: get_s("name").to_string(),
                 account: {
@@ -982,7 +1210,7 @@ impl Engine {
                         a.to_string()
                     }
                 },
-                created_ns: get_u("created_ns"),
+                created_ns,
                 subjects: sv
                     .get("subjects")
                     .and_then(|v| v.as_array())
@@ -1003,6 +1231,13 @@ impl Engine {
                 base_seq: get_u("base_seq"),
                 msg_ids: HashMap::new(),
                 consumers: HashMap::new(),
+                mirror,
+                sources,
+                source_token: sv
+                    .get("source_token")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| make_source_token(get_s("name"), created_ns)),
             };
             if stream.base_seq == 0 {
                 stream.base_seq = 1;
@@ -1265,6 +1500,274 @@ impl Engine {
         (false, actions)
     }
 
+    /// Append one message to a stream, enforcing its limits
+    /// (discard-old). Bypasses dedup/expected-sequence checks: it is
+    /// used for direct captures (after those checks) and for
+    /// mirror/source copies (which are internal, not publishes).
+    /// Returns the new sequence.
+    fn store_message(
+        stream: &mut Stream,
+        subject: &str,
+        headers: Option<Bytes>,
+        payload: Bytes,
+        time_ns: u64,
+    ) -> u64 {
+        let seq = stream.base_seq + stream.messages.len() as u64;
+        stream.messages.push_back(StoredMsg {
+            seq,
+            subject: subject.to_string(),
+            headers,
+            payload,
+            time_ns,
+        });
+        if stream.max_msgs > 0 {
+            while stream.live_count() as i64 > stream.max_msgs {
+                if let Some(front) = stream.messages.pop_front() {
+                    stream.deleted.remove(&front.seq);
+                }
+                stream.base_seq += 1;
+            }
+        }
+        if stream.max_bytes > 0 {
+            while stream.bytes() > stream.max_bytes as u64 {
+                if let Some(front) = stream.messages.pop_front() {
+                    stream.deleted.remove(&front.seq);
+                } else {
+                    break;
+                }
+                stream.base_seq += 1;
+            }
+        }
+        if stream.max_msgs_per_subject > 0 {
+            let limit = stream.max_msgs_per_subject as usize;
+            loop {
+                let count = stream
+                    .messages
+                    .iter()
+                    .filter(|m| m.subject == subject && !stream.deleted.contains(&m.seq))
+                    .count();
+                if count <= limit {
+                    break;
+                }
+                let front_is_match = stream
+                    .messages
+                    .front()
+                    .map(|m| m.subject == subject && !stream.deleted.contains(&m.seq))
+                    .unwrap_or(false);
+                if front_is_match {
+                    if let Some(front) = stream.messages.pop_front() {
+                        stream.deleted.remove(&front.seq);
+                    }
+                    stream.base_seq += 1;
+                } else if let Some(oldest) = stream
+                    .messages
+                    .iter()
+                    .find(|m| m.subject == subject && !stream.deleted.contains(&m.seq))
+                    .map(|m| m.seq)
+                {
+                    stream.deleted.insert(oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        seq
+    }
+
+    /// Fan out one stored message to a stream's push consumers and
+    /// waiting pulls.
+    fn fan_out(&mut self, stream_name: &str, account: &str, actions: &mut Vec<Action>) {
+        let push_names: Vec<String> = self
+            .streams
+            .get(stream_name)
+            .map(|s| {
+                s.consumers
+                    .values()
+                    .filter(|c| c.deliver_subject.is_some())
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for cname in push_names {
+            let stream = self.stream_for_mut(stream_name, account).unwrap();
+            drain_push(stream_name, stream, &cname, actions);
+        }
+        let pull_names: Vec<String> = self
+            .streams
+            .get(stream_name)
+            .map(|s| {
+                s.consumers
+                    .values()
+                    .filter(|c| c.deliver_subject.is_none() && !c.waiting_pulls.is_empty())
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for cname in pull_names {
+            let stream = self.stream_for_mut(stream_name, account).unwrap();
+            fulfill_pulls(stream_name, stream, &cname, actions);
+        }
+    }
+
+    /// Live-copy one origin message into every stream with a live
+    /// mirror/source link from this origin, then recurse so chains
+    /// (mirror of a mirror, source of a source) propagate. `visited`
+    /// guards against pathological cycles (creation-time cycle
+    /// rejection makes them unreachable, but a cheap guard beats a
+    /// stack overflow). Mirror copies are exact; source copies add
+    /// the `Nats-Stream-Source` header. Copies fan out to the
+    /// dependent's consumers, but never produce publish acks.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_to_dependents(
+        &mut self,
+        origin_name: &str,
+        account: &str,
+        subject: &str,
+        headers: &Option<Bytes>,
+        payload: &Bytes,
+        time_ns: u64,
+        origin_seq: u64,
+        actions: &mut Vec<Action>,
+        visited: &mut std::collections::HashSet<String>,
+    ) {
+        if !visited.insert(origin_name.to_string()) {
+            return;
+        }
+        let origin_token = self
+            .streams
+            .get(origin_name)
+            .map(|s| s.source_token.clone())
+            .unwrap_or_default();
+        // Plan first (immutable scan), then mutate: dependents in
+        // name order for deterministic action order.
+        let mut plan: Vec<(String, bool, SourceCfg)> = Vec::new();
+        let mut dep_names: Vec<String> = self
+            .streams
+            .values()
+            .filter(|s| s.account == account)
+            .map(|s| s.name.clone())
+            .collect();
+        dep_names.sort();
+        for dep in dep_names {
+            let Some(s) = self.streams.get(&dep) else {
+                continue;
+            };
+            if let Some(cfg) = &s.mirror {
+                if cfg.live && cfg.name == origin_name {
+                    plan.push((dep.clone(), true, cfg.clone()));
+                    continue;
+                }
+            }
+            for cfg in &s.sources {
+                if cfg.live && cfg.name == origin_name {
+                    plan.push((dep.clone(), false, cfg.clone()));
+                }
+            }
+        }
+        for (dep, is_mirror, cfg) in plan {
+            if let Some(filter) = &cfg.filter_subject {
+                if !subject_matches(filter, subject) {
+                    continue;
+                }
+            }
+            let headers2 = if is_mirror {
+                headers.clone()
+            } else {
+                Some(append_source_header(
+                    headers.clone(),
+                    origin_name,
+                    origin_seq,
+                    cfg.filter_subject.as_deref(),
+                    subject,
+                    &origin_token,
+                ))
+            };
+            let dep_seq = {
+                let stream = self.stream_for_mut(&dep, account).unwrap();
+                Self::store_message(stream, subject, headers2.clone(), payload.clone(), time_ns)
+            };
+            self.fan_out(&dep, account, actions);
+            self.copy_to_dependents(
+                &dep, account, subject, &headers2, payload, time_ns, dep_seq, actions, visited,
+            );
+        }
+    }
+
+    /// Backfill one mirror/source link at stream creation: copy the
+    /// origin's existing messages (from `opt_start_seq` /
+    /// `opt_start_time` when given, honouring `filter_subject`) into
+    /// the target, in origin order. No consumer fan-out: the target
+    /// is brand new, so no live link to it can exist yet.
+    fn backfill(&mut self, target: &str, account: &str, cfg: &SourceCfg, is_mirror: bool) {
+        let Some(origin) = self.stream_for(cfg.name.as_str(), account) else {
+            return;
+        };
+        let token = origin.source_token.clone();
+        let copied: Vec<StoredMsg> = origin
+            .messages
+            .iter()
+            .filter(|m| !origin.deleted.contains(&m.seq))
+            .filter(|m| cfg.start_seq == 0 || m.seq >= cfg.start_seq)
+            .filter(|m| cfg.start_time_ns == 0 || m.time_ns >= cfg.start_time_ns)
+            .filter(|m| match &cfg.filter_subject {
+                Some(f) => subject_matches(f, &m.subject),
+                None => true,
+            })
+            .map(|m| StoredMsg {
+                seq: m.seq,
+                subject: m.subject.clone(),
+                headers: m.headers.clone(),
+                payload: m.payload.clone(),
+                time_ns: m.time_ns,
+            })
+            .collect();
+        for m in copied {
+            let headers = if is_mirror {
+                m.headers.clone()
+            } else {
+                Some(append_source_header(
+                    m.headers.clone(),
+                    &cfg.name,
+                    m.seq,
+                    cfg.filter_subject.as_deref(),
+                    &m.subject,
+                    &token,
+                ))
+            };
+            let Some(stream) = self.stream_for_mut(target, account) else {
+                return;
+            };
+            Self::store_message(stream, &m.subject, headers, m.payload, m.time_ns);
+        }
+    }
+
+    /// Would adding `origins` to a new stream named `new_name`
+    /// close a cycle in the config graph? Follows mirror/sources
+    /// configs transitively by name (Go rejects the cycle even when
+    /// the intermediate stream was deleted, because its config still
+    /// names the stream — so dead links count here).
+    fn would_cycle(&self, new_name: &str, origins: &[String]) -> bool {
+        let mut stack: Vec<String> = origins.to_vec();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(name) = stack.pop() {
+            if name == new_name {
+                return true;
+            }
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(s) = self.streams.get(&name) {
+                if let Some(cfg) = &s.mirror {
+                    stack.push(cfg.name.clone());
+                }
+                for cfg in &s.sources {
+                    stack.push(cfg.name.clone());
+                }
+            }
+        }
+        false
+    }
+
     fn capture(&mut self, msg: &Message, actions: &mut Vec<Action>) {
         // Which streams match this subject?
         let matching: Vec<String> = self
@@ -1281,6 +1784,10 @@ impl Engine {
         }
         let mut stored: Vec<(String, u64, bool)> = Vec::new();
         let mut first_error: Option<(u16, u32, String)> = None;
+        // One timestamp for the whole publish, shared by the origin
+        // stores and their mirror/source copies (Go preserves the
+        // origin timestamp in copies).
+        let time_ns = now_ns();
         for name in &matching {
             let stream = self.stream_for_mut(name, &msg.account).unwrap();
             // Dedup by Nats-Msg-Id.
@@ -1326,73 +1833,19 @@ impl Engine {
                     continue;
                 }
             }
-            let seq = stream.base_seq + stream.messages.len() as u64;
-            let stored_msg = StoredMsg {
-                seq,
-                subject: msg.subject.clone(),
-                headers: msg.headers.clone(),
-                payload: msg.payload.clone(),
-                time_ns: now_ns(),
+            let seq = {
+                let stream = self.stream_for_mut(name, &msg.account).unwrap();
+                Self::store_message(
+                    stream,
+                    &msg.subject,
+                    msg.headers.clone(),
+                    msg.payload.clone(),
+                    time_ns,
+                )
             };
-            stream.messages.push_back(stored_msg);
+            let stream = self.stream_for_mut(name, &msg.account).unwrap();
             if let Some(id) = header_get(msg, "Nats-Msg-Id") {
                 stream.msg_ids.insert(id, (seq, Instant::now()));
-            }
-            // Enforce limits (discard-old policy). Popping from the
-            // front also drops any deleted marker for that sequence.
-            if stream.max_msgs > 0 {
-                while stream.live_count() as i64 > stream.max_msgs {
-                    if let Some(front) = stream.messages.pop_front() {
-                        stream.deleted.remove(&front.seq);
-                    }
-                    stream.base_seq += 1;
-                }
-            }
-            if stream.max_bytes > 0 {
-                while stream.bytes() > stream.max_bytes as u64 {
-                    if let Some(front) = stream.messages.pop_front() {
-                        stream.deleted.remove(&front.seq);
-                    } else {
-                        break;
-                    }
-                    stream.base_seq += 1;
-                }
-            }
-            if stream.max_msgs_per_subject > 0 {
-                let limit = stream.max_msgs_per_subject as usize;
-                loop {
-                    let count = stream
-                        .messages
-                        .iter()
-                        .filter(|m| m.subject == msg.subject && !stream.deleted.contains(&m.seq))
-                        .count();
-                    if count <= limit {
-                        break;
-                    }
-                    // Evict the oldest live message for this subject:
-                    // pop from the front when it is that subject, else
-                    // mark the oldest matching message deleted in place.
-                    let front_is_match = stream
-                        .messages
-                        .front()
-                        .map(|m| m.subject == msg.subject && !stream.deleted.contains(&m.seq))
-                        .unwrap_or(false);
-                    if front_is_match {
-                        if let Some(front) = stream.messages.pop_front() {
-                            stream.deleted.remove(&front.seq);
-                        }
-                        stream.base_seq += 1;
-                    } else if let Some(oldest) = stream
-                        .messages
-                        .iter()
-                        .find(|m| m.subject == msg.subject && !stream.deleted.contains(&m.seq))
-                        .map(|m| m.seq)
-                    {
-                        stream.deleted.insert(oldest);
-                    } else {
-                        break;
-                    }
-                }
             }
             stored.push((name.clone(), seq, false));
         }
@@ -1421,36 +1874,28 @@ impl Engine {
         // Fan out to push consumers and waiting pulls of every stream
         // that stored (or deduplicated) this message.
         for (name, _, _) in &stored {
-            let push_names: Vec<String> = self
-                .streams
-                .get(name)
-                .map(|s| {
-                    s.consumers
-                        .values()
-                        .filter(|c| c.deliver_subject.is_some())
-                        .map(|c| c.name.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            for cname in push_names {
-                let stream = self.stream_for_mut(name, &msg.account).unwrap();
-                drain_push(name, stream, &cname, actions);
+            self.fan_out(name, &msg.account, actions);
+        }
+        // Live-copy every freshly stored (non-duplicate) message into
+        // its mirrors/sources. Duplicates are not re-copied: the
+        // origin did not store a new message, and the mirror already
+        // holds the first copy.
+        for (name, seq, duplicate) in &stored {
+            if *duplicate {
+                continue;
             }
-            let pull_names: Vec<String> = self
-                .streams
-                .get(name)
-                .map(|s| {
-                    s.consumers
-                        .values()
-                        .filter(|c| c.deliver_subject.is_none() && !c.waiting_pulls.is_empty())
-                        .map(|c| c.name.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            for cname in pull_names {
-                let stream = self.stream_for_mut(name, &msg.account).unwrap();
-                fulfill_pulls(name, stream, &cname, actions);
-            }
+            let mut visited = std::collections::HashSet::new();
+            self.copy_to_dependents(
+                name,
+                &msg.account,
+                &msg.subject,
+                &msg.headers,
+                &msg.payload,
+                time_ns,
+                *seq,
+                actions,
+                &mut visited,
+            );
         }
     }
 
@@ -1725,7 +2170,97 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
-        if subjects.is_empty() {
+        // Mirror/source configs (same node only). A mirror must not
+        // carry subjects or other sources (Go rejects both); a
+        // sourced stream may carry subjects (it then also captures
+        // direct publishes, as Go does). `external` (cross-account /
+        // cross-node) and `subject_transforms` are rejected: same-node
+        // only in this implementation.
+        let mirror_raw = body.get("mirror").filter(|v| !v.is_null());
+        let sources_raw = body
+            .get("sources")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut reject = |desc: &str| {
+            api_error_action(account, reply, type_name, 400, 10002, desc, actions);
+        };
+        if mirror_raw.is_some() && !subjects.is_empty() {
+            reject("stream mirrors can not contain subjects");
+            return;
+        }
+        if mirror_raw.is_some() && !sources_raw.is_empty() {
+            reject("stream mirrors can not also contain other sources");
+            return;
+        }
+        let mut mirror: Option<SourceCfg> = None;
+        if let Some(raw) = mirror_raw {
+            if raw.get("external").is_some_and(|v| !v.is_null()) {
+                reject("cross-node/cross-account mirroring (external) is not supported");
+                return;
+            }
+            if raw
+                .get("subject_transforms")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty())
+            {
+                reject("subject transforms on mirrors are not supported");
+                return;
+            }
+            let Some(cfg) = parse_source_cfg(raw) else {
+                reject("mirror name is required");
+                return;
+            };
+            mirror = Some(cfg);
+        }
+        let mut sources: Vec<SourceCfg> = Vec::new();
+        for raw in &sources_raw {
+            if raw.get("external").is_some_and(|v| !v.is_null()) {
+                reject("cross-node/cross-account sourcing (external) is not supported");
+                return;
+            }
+            if raw
+                .get("subject_transforms")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty())
+            {
+                reject("subject transforms on sources are not supported");
+                return;
+            }
+            let Some(cfg) = parse_source_cfg(raw) else {
+                reject("source name is required");
+                return;
+            };
+            if sources.iter().any(|c: &SourceCfg| c.name == cfg.name) {
+                reject("duplicate source stream");
+                return;
+            }
+            sources.push(cfg);
+        }
+        // Every origin must exist in this account. Go accepts a
+        // mirror/source of a nonexistent stream and leaves it empty;
+        // this implementation rejects it instead (404/10059), so a
+        // typo cannot silently create an empty stream.
+        let mut origins: Vec<String> = Vec::new();
+        if let Some(cfg) = &mirror {
+            origins.push(cfg.name.clone());
+        }
+        origins.extend(sources.iter().map(|c| c.name.clone()));
+        for origin in &origins {
+            match self.stream_for(origin, account) {
+                Some(_) => {}
+                None => {
+                    let (code, err_code, desc) = err_not_found("stream");
+                    api_error_action(account, reply, type_name, code, err_code, &desc, actions);
+                    return;
+                }
+            }
+        }
+        if self.would_cycle(name, &origins) {
+            reject("detected cycle");
+            return;
+        }
+        if mirror.is_none() && sources.is_empty() && subjects.is_empty() {
             api_error_action(
                 account,
                 reply,
@@ -1771,10 +2306,11 @@ impl Engine {
             .and_then(|v| v.as_str())
             .unwrap_or("memory")
             .to_string();
+        let created_ns = now_ns();
         let stream = Stream {
             name: name.to_string(),
             account: account.to_string(),
-            created_ns: now_ns(),
+            created_ns,
             subjects,
             retention,
             max_msgs: body.get("max_msgs").and_then(|v| v.as_i64()).unwrap_or(0),
@@ -1790,9 +2326,22 @@ impl Engine {
             base_seq: 1,
             msg_ids: HashMap::new(),
             consumers: HashMap::new(),
+            mirror: mirror.clone(),
+            sources: sources.clone(),
+            source_token: make_source_token(name, created_ns),
         };
-        let info = stream.info_json();
         self.streams.insert(name.to_string(), stream);
+        // Backfill (synchronous, under the engine lock, before the
+        // create response: backfill + link registration are atomic
+        // with respect to publishes, so nothing is lost or doubled.
+        // Go backfills asynchronously; the final state matches.)
+        if let Some(cfg) = &mirror {
+            self.backfill(name, account, cfg, true);
+        }
+        for cfg in &sources {
+            self.backfill(name, account, cfg, false);
+        }
+        let info = self.streams.get(name).unwrap().info_json();
         api_response(account, reply, type_name, info, actions);
     }
 
@@ -1892,6 +2441,22 @@ impl Engine {
         actions: &mut Vec<Action>,
     ) {
         if self.stream_for(name, account).is_some() && self.streams.remove(name).is_some() {
+            // Deleting an origin kills live links to it permanently:
+            // dependents keep their config and their copies, but the
+            // link never revives, even if a same-named origin is
+            // created later (Go behaviour, probed against v2.15.1).
+            for s in self.streams.values_mut() {
+                if let Some(cfg) = &mut s.mirror {
+                    if cfg.name == name {
+                        cfg.live = false;
+                    }
+                }
+                for cfg in &mut s.sources {
+                    if cfg.name == name {
+                        cfg.live = false;
+                    }
+                }
+            }
             api_response(
                 account,
                 reply,
