@@ -305,7 +305,10 @@ handled in the implementation:
 - `src/subject.rs` — subject validation and wildcard matching.
 - `src/sublist.rs` — subscription registry; recipient resolution (fan-out,
   queue groups, auto-unsub accounting, echo filtering) happens under a
-  short lock, writes to sockets happen outside it.
+  short lock, writes to sockets happen outside it. Matching is a subject
+  trie (exact / `*` / `>` nodes) over insertion-ordered subscriptions,
+  not a linear scan; see `examples/sublist_bench.rs` for the 10k-subscription
+  harness (sparse-subject match ~0.3 µs vs ~350 µs linear, release).
 - `src/server.rs` — Tokio listener; one reader task and one writer task per
   connection connected by a byte-limited queue (default 64 MiB pending,
   the slow-consumer bound; the writer coalesces queued frames into

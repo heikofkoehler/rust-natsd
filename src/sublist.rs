@@ -1,9 +1,21 @@
 //! Subscription registry: stores all subscriptions, resolves the recipient
 //! set for a published message (fan-out + queue groups + auto-unsubscribe).
+//!
+//! Matching is a subject trie, not a linear scan over all subscriptions:
+//! trie nodes branch on exact tokens, a `*` child (exactly one token) and
+//! a `>` terminator (one or more remaining tokens, stored on the node the
+//! prefix ends at). Partial wildcards such as `foo*` or `f>o` are literal
+//! tokens, so they live in the exact-token map like any other token.
+//! Matching therefore visits only nodes reachable from the published
+//! subject's tokens, plus `>` terminators along the path.
+//!
+//! The public API and semantics are exactly the old linear-scan version's:
+//! subscriptions keep insertion order (a per-key sequence number restores
+//! it after trie collection), queue-group members are returned in insertion
+//! order, and `match_recipients` still picks one member per group in
+//! BTreeMap (sorted) group order with a cursor that advances per group.
 
-use std::collections::BTreeMap;
-
-use crate::subject::subject_matches;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Subscription {
@@ -60,9 +72,44 @@ pub struct GroupMatch {
     pub groups: BTreeMap<String, Vec<Delivery>>,
 }
 
+/// Key identifying one subscription: (connection, sid).
+type SubKey = (u64, String);
+
+/// (account, pattern, queue) triple, as returned by patterns().
+type PatternTriple = (String, String, Option<String>);
+
+/// One trie node. `subs` holds subscriptions whose pattern ends exactly
+/// at this node; `fwc` holds subscriptions whose pattern ends with `>`
+/// at this node (the `>` itself consumes the rest of the subject, so
+/// nothing is stored below it — a mid-pattern `>` behaves exactly like
+/// a trailing one, matching `subject_matches`, which returns as soon as
+/// it sees a whole-token `>`).
+#[derive(Debug, Default, PartialEq)]
+struct TrieNode {
+    exact: HashMap<String, TrieNode>,
+    star: Option<Box<TrieNode>>,
+    fwc: Vec<SubKey>,
+    subs: Vec<SubKey>,
+}
+
+impl TrieNode {
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.star.is_none() && self.fwc.is_empty() && self.subs.is_empty()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Sublist {
-    subs: Vec<Subscription>,
+    /// Subscription structs by key; the trie and the order map hold keys.
+    subs: HashMap<SubKey, Subscription>,
+    /// Insertion sequence per key (monotonic; never reused), used to
+    /// restore insertion order after trie collection.
+    seq: HashMap<SubKey, u64>,
+    next_seq: u64,
+    trie: TrieNode,
+    /// (account, pattern, queue) -> number of subscriptions using it,
+    /// so `has_pattern` is O(1) and survives duplicate patterns.
+    pattern_counts: HashMap<PatternTriple, usize>,
     /// Rotating cursor for queue-group member selection.
     queue_cursor: u64,
 }
@@ -84,91 +131,204 @@ impl Sublist {
     /// a later SUB with the same (conn_id, sid) is ignored entirely, so
     /// the original subject, queue, max, and delivery count all survive.
     pub fn add(&mut self, sub: Subscription) {
-        if self
-            .subs
-            .iter()
-            .any(|s| s.conn_id == sub.conn_id && s.sid == sub.sid)
-        {
+        let key: SubKey = (sub.conn_id, sub.sid.clone());
+        if self.subs.contains_key(&key) {
             return;
         }
-        self.subs.push(sub);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        *self
+            .pattern_counts
+            .entry((sub.account.clone(), sub.subject.clone(), sub.queue.clone()))
+            .or_insert(0) += 1;
+        Self::trie_insert(&mut self.trie, sub.subject.split('.'), &key);
+        self.seq.insert(key.clone(), seq);
+        self.subs.insert(key, sub);
+    }
+
+    fn trie_insert(node: &mut TrieNode, tokens: std::str::Split<'_, char>, key: &SubKey) {
+        let mut node = node;
+        for tok in tokens {
+            match tok {
+                ">" => {
+                    node.fwc.push(key.clone());
+                    return;
+                }
+                "*" => {
+                    node = node
+                        .star
+                        .get_or_insert_with(|| Box::new(TrieNode::default()));
+                }
+                _ => {
+                    node = node.exact.entry(tok.to_owned()).or_default();
+                }
+            }
+        }
+        node.subs.push(key.clone());
+    }
+
+    /// Remove one subscription by key. Returns whether it existed.
+    fn remove_key(&mut self, key: &SubKey) -> bool {
+        let Some(sub) = self.subs.remove(key) else {
+            return false;
+        };
+        self.seq.remove(key);
+        let count_key = (sub.account, sub.subject.clone(), sub.queue);
+        if let Some(count) = self.pattern_counts.get_mut(&count_key) {
+            *count -= 1;
+            if *count == 0 {
+                self.pattern_counts.remove(&count_key);
+            }
+        }
+        let tokens: Vec<&str> = sub.subject.split('.').collect();
+        Self::trie_remove(&mut self.trie, &tokens, key);
+        true
+    }
+
+    /// Remove `key` from the trie; returns true when the node is now
+    /// empty and the caller may prune it.
+    fn trie_remove(node: &mut TrieNode, tokens: &[&str], key: &SubKey) -> bool {
+        if tokens.is_empty() {
+            node.subs.retain(|k| k != key);
+            return node.is_empty();
+        }
+        match tokens[0] {
+            ">" => {
+                node.fwc.retain(|k| k != key);
+                node.is_empty()
+            }
+            "*" => {
+                let prune = match node.star.as_mut() {
+                    Some(child) => Self::trie_remove(child, &tokens[1..], key),
+                    None => false,
+                };
+                if prune {
+                    node.star = None;
+                }
+                node.is_empty()
+            }
+            tok => {
+                let prune = match node.exact.get_mut(tok) {
+                    Some(child) => Self::trie_remove(child, &tokens[1..], key),
+                    None => false,
+                };
+                if prune {
+                    node.exact.remove(tok);
+                }
+                node.is_empty()
+            }
+        }
     }
 
     pub fn remove(&mut self, conn_id: u64, sid: &str) -> bool {
-        let before = self.subs.len();
-        self.subs
-            .retain(|s| !(s.conn_id == conn_id && s.sid == sid));
-        self.subs.len() != before
+        self.remove_key(&(conn_id, sid.to_owned()))
     }
 
     pub fn remove_conn(&mut self, conn_id: u64) {
-        self.subs.retain(|s| s.conn_id != conn_id);
+        let keys: Vec<SubKey> = self
+            .subs
+            .keys()
+            .filter(|k| k.0 == conn_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.remove_key(&key);
+        }
     }
 
     /// Pattern+queue of one subscription, if it exists.
     pub fn pattern_of(&self, conn_id: u64, sid: &str) -> Option<(String, String, Option<String>)> {
         self.subs
-            .iter()
-            .find(|s| s.conn_id == conn_id && s.sid == sid)
+            .get(&(conn_id, sid.to_owned()))
             .map(|s| (s.account.clone(), s.subject.clone(), s.queue.clone()))
     }
 
     /// True when any subscription in `account` uses this exact
     /// pattern+queue.
     pub fn has_pattern(&self, subject: &str, queue: Option<&str>, account: &str) -> bool {
-        self.subs
-            .iter()
-            .any(|s| s.account == account && s.subject == subject && s.queue.as_deref() == queue)
+        self.pattern_counts.contains_key(&(
+            account.to_owned(),
+            subject.to_owned(),
+            queue.map(|q| q.to_owned()),
+        ))
     }
 
-    /// Distinct (account, pattern, queue) triples for one connection.
+    /// Distinct (account, pattern, queue) triples for one connection,
+    /// in first-subscription order.
     pub fn patterns_for_conn(&self, conn_id: u64) -> Vec<(String, String, Option<String>)> {
-        let mut out: Vec<(String, String, Option<String>)> = Vec::new();
-        for s in &self.subs {
-            if s.conn_id == conn_id {
-                let key = (s.account.clone(), s.subject.clone(), s.queue.clone());
-                if !out.contains(&key) {
-                    out.push(key);
-                }
-            }
-        }
-        out
+        let mut triples: Vec<(u64, PatternTriple)> = self
+            .subs
+            .values()
+            .filter(|s| s.conn_id == conn_id)
+            .map(|s| {
+                (
+                    self.seq
+                        .get(&(s.conn_id, s.sid.clone()))
+                        .copied()
+                        .unwrap_or(u64::MAX),
+                    (s.account.clone(), s.subject.clone(), s.queue.clone()),
+                )
+            })
+            .collect();
+        triples.sort_by_key(|(seq, _)| *seq);
+        dedup_triples(triples.into_iter().map(|(_, t)| t))
     }
 
     /// Distinct (pattern, queue) pairs currently subscribed, for
     /// RS+/LS+ interest sync to a newly connected route or leaf.
     /// All subscriptions (for /subz).
     pub fn subscriptions(&self) -> Vec<Subscription> {
-        self.subs.clone()
+        let mut subs: Vec<(u64, Subscription)> = self
+            .subs
+            .values()
+            .map(|s| {
+                (
+                    self.seq
+                        .get(&(s.conn_id, s.sid.clone()))
+                        .copied()
+                        .unwrap_or(u64::MAX),
+                    s.clone(),
+                )
+            })
+            .collect();
+        subs.sort_by_key(|(seq, _)| *seq);
+        subs.into_iter().map(|(_, s)| s).collect()
     }
 
     pub fn patterns(&self) -> Vec<(String, String, Option<String>)> {
-        let mut out: Vec<(String, String, Option<String>)> = Vec::new();
-        for s in &self.subs {
-            let key = (s.account.clone(), s.subject.clone(), s.queue.clone());
-            if !out.contains(&key) {
-                out.push(key);
-            }
-        }
-        out
+        let mut triples: Vec<(u64, PatternTriple)> = self
+            .subs
+            .values()
+            .map(|s| {
+                (
+                    self.seq
+                        .get(&(s.conn_id, s.sid.clone()))
+                        .copied()
+                        .unwrap_or(u64::MAX),
+                    (s.account.clone(), s.subject.clone(), s.queue.clone()),
+                )
+            })
+            .collect();
+        triples.sort_by_key(|(seq, _)| *seq);
+        dedup_triples(triples.into_iter().map(|(_, t)| t))
     }
 
     /// Set the auto-unsubscribe max for a subscription. If the subscription
     /// has already delivered at least `max` messages it is removed
     /// immediately and `true` is returned.
     pub fn set_max(&mut self, conn_id: u64, sid: &str, max: u64) -> bool {
-        if let Some(sub) = self
-            .subs
-            .iter_mut()
-            .find(|s| s.conn_id == conn_id && s.sid == sid)
-        {
-            if sub.delivered >= max {
-                self.remove(conn_id, sid);
-                return true;
+        let key: SubKey = (conn_id, sid.to_owned());
+        match self.subs.get(&key).map(|s| s.delivered >= max) {
+            Some(true) => {
+                self.remove_key(&key);
+                true
             }
-            sub.max_msgs = Some(max);
+            Some(false) => {
+                self.subs.get_mut(&key).expect("present").max_msgs = Some(max);
+                false
+            }
+            None => false,
         }
-        false
     }
 
     /// Resolve recipients for a message published to `subject` by
@@ -209,17 +369,25 @@ impl Sublist {
         publisher_echo: bool,
         account: Option<&str>,
     ) -> GroupMatch {
+        let tokens: Vec<&str> = subject.split('.').collect();
+        let mut keys: Vec<SubKey> = Vec::new();
+        Self::trie_collect(&self.trie, &tokens, 0, &mut keys);
+        // Trie traversal order is not insertion order, so restore it:
+        // plain deliveries and queue members must come out exactly as
+        // the old linear scan produced them.
+        keys.sort_by_key(|k| self.seq.get(k).copied().unwrap_or(u64::MAX));
+        keys.dedup();
         let mut out = GroupMatch::default();
-        for sub in &self.subs {
+        for key in keys {
+            let Some(sub) = self.subs.get(&key) else {
+                continue;
+            };
             if let Some(account) = account {
                 if sub.account != account {
                     continue;
                 }
             }
             if !publisher_echo && sub.conn_id == publisher_conn {
-                continue;
-            }
-            if !subject_matches(&sub.subject, subject) {
                 continue;
             }
             let d = Delivery {
@@ -234,16 +402,33 @@ impl Sublist {
         out
     }
 
+    /// Collect every subscription key whose pattern matches `tokens`,
+    /// following exact and `*` children and picking up `>` terminators
+    /// at each node while at least one token remains (a `>` needs at
+    /// least one remaining token, exactly as in `subject_matches`).
+    fn trie_collect(node: &TrieNode, tokens: &[&str], idx: usize, out: &mut Vec<SubKey>) {
+        if idx < tokens.len() {
+            out.extend(node.fwc.iter().cloned());
+        }
+        if idx == tokens.len() {
+            out.extend(node.subs.iter().cloned());
+            return;
+        }
+        let tok = tokens[idx];
+        if let Some(child) = node.exact.get(tok) {
+            Self::trie_collect(child, tokens, idx + 1, out);
+        }
+        if let Some(star) = &node.star {
+            Self::trie_collect(star, tokens, idx + 1, out);
+        }
+    }
+
     /// Record actual deliveries: bump counters, return subscriptions that
     /// hit their auto-unsubscribe max with this delivery.
     pub fn note_deliveries(&mut self, deliveries: &[Delivery]) -> Vec<(u64, String)> {
         let mut expired = Vec::new();
         for d in deliveries {
-            if let Some(sub) = self
-                .subs
-                .iter_mut()
-                .find(|s| s.conn_id == d.conn_id && s.sid == d.sid)
-            {
+            if let Some(sub) = self.subs.get_mut(&(d.conn_id, d.sid.clone())) {
                 sub.delivered += 1;
                 if let Some(max) = sub.max_msgs {
                     if sub.delivered >= max {
@@ -254,6 +439,17 @@ impl Sublist {
         }
         expired
     }
+}
+
+fn dedup_triples(triples: impl Iterator<Item = PatternTriple>) -> Vec<PatternTriple> {
+    let mut seen: HashSet<PatternTriple> = HashSet::new();
+    let mut out = Vec::new();
+    for t in triples {
+        if seen.insert(t.clone()) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -268,6 +464,33 @@ mod tests {
             queue.map(|q| q.into()),
             "$G".into(),
         )
+    }
+
+    fn sub_acct(
+        conn: u64,
+        sid: &str,
+        subject: &str,
+        queue: Option<&str>,
+        account: &str,
+    ) -> Subscription {
+        Subscription::new(
+            conn,
+            sid.into(),
+            subject.into(),
+            queue.map(|q| q.into()),
+            account.into(),
+        )
+    }
+
+    fn conns(sl: &mut Sublist, subject: &str) -> Vec<u64> {
+        let mut v: Vec<u64> = sl
+            .match_recipients(subject, 99, true, None)
+            .deliveries
+            .iter()
+            .map(|d| d.conn_id)
+            .collect();
+        v.sort_unstable();
+        v
     }
 
     #[test]
@@ -410,5 +633,149 @@ mod tests {
         assert_eq!(r.deliveries[0].conn_id, 2);
         let r = sl.match_recipients("foo", 1, true, None);
         assert_eq!(r.deliveries.len(), 2);
+    }
+
+    // --- trie-specific tests ---
+
+    #[test]
+    fn trie_deep_and_mid_wildcards() {
+        let mut sl = Sublist::new();
+        sl.add(sub(1, "1", "a.*.c.*", None));
+        sl.add(sub(2, "1", "a.b.c.d", None));
+        sl.add(sub(3, "1", "a.b.>", None));
+        sl.add(sub(4, "1", "*.b.c.d", None));
+        sl.add(sub(5, "1", "a.*.c.e", None));
+        // a.b.c.d matches all except the .e pattern.
+        assert_eq!(conns(&mut sl, "a.b.c.d"), vec![1, 2, 3, 4]);
+        // a.x.c.e matches only the *-mid patterns (1 and 5).
+        assert_eq!(conns(&mut sl, "a.x.c.e"), vec![1, 5]);
+        // Star matches exactly one token: a.b.c alone matches none of
+        // these (a.b.> needs a token after b; a.*.c.* needs four).
+        assert_eq!(conns(&mut sl, "a.b.c"), vec![3]);
+        assert!(conns(&mut sl, "a.b").is_empty());
+    }
+
+    #[test]
+    fn trie_fwc_at_root_and_partial_wildcards_are_literal() {
+        let mut sl = Sublist::new();
+        sl.add(sub(1, "1", ">", None));
+        sl.add(sub(2, "1", "foo*", None));
+        sl.add(sub(3, "1", "f>o", None));
+        assert_eq!(conns(&mut sl, "anything.at.all"), vec![1]);
+        // "foo*" as a subject token matches the literal pattern "foo*"
+        // plus ">", but not a bare "foobar" subject.
+        assert_eq!(conns(&mut sl, "foo*"), vec![1, 2]);
+        assert_eq!(conns(&mut sl, "foobar"), vec![1]);
+        assert_eq!(conns(&mut sl, "f>o"), vec![1, 3]);
+    }
+
+    #[test]
+    fn trie_many_subscriptions_fanout() {
+        let mut sl = Sublist::new();
+        for i in 0..1000u64 {
+            sl.add(sub(i, "1", &format!("svc.{i}.req"), None));
+        }
+        for i in 0..100u64 {
+            sl.add(sub(10_000 + i, "1", "svc.*.req", None));
+        }
+        // One exact + 100 star matches; the other 999 exacts are skipped.
+        assert_eq!(conns(&mut sl, "svc.42.req").len(), 101);
+        assert!(conns(&mut sl, "svc.42.other").is_empty());
+        assert_eq!(sl.len(), 1100);
+    }
+
+    #[test]
+    fn trie_queue_plus_wildcard_and_removal_prunes() {
+        let mut sl = Sublist::new();
+        sl.add(sub(1, "1", "jobs.*", Some("workers")));
+        sl.add(sub(2, "1", "jobs.*", Some("workers")));
+        sl.add(sub(3, "1", "jobs.*", None));
+        // Queue pick + plain, rotating across the two workers.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let r = sl.match_recipients("jobs.build", 99, true, None);
+            assert_eq!(r.deliveries.len(), 2);
+            assert!(r.deliveries.iter().any(|d| d.conn_id == 3));
+            seen.insert(
+                r.deliveries
+                    .iter()
+                    .find(|d| d.conn_id != 3)
+                    .unwrap()
+                    .conn_id,
+            );
+        }
+        assert_eq!(seen.len(), 2, "both workers picked over 4 messages");
+        // Removing the wildcard prunes it from the trie entirely.
+        sl.remove(1, "1");
+        sl.remove(2, "1");
+        sl.remove(3, "1");
+        assert!(sl.is_empty());
+        assert!(conns(&mut sl, "jobs.build").is_empty());
+        // And re-adding after prune still matches.
+        sl.add(sub(4, "1", "jobs.*", None));
+        assert_eq!(conns(&mut sl, "jobs.build"), vec![4]);
+    }
+
+    #[test]
+    fn trie_account_scoping_and_order_preserved() {
+        let mut sl = Sublist::new();
+        // Insert wildcard first, exact second: plain deliveries must
+        // still come out in insertion order, not trie traversal order.
+        sl.add(sub_acct(1, "1", "foo.>", None, "$G"));
+        sl.add(sub_acct(2, "1", "foo.bar", None, "$G"));
+        sl.add(sub_acct(3, "1", "foo.bar", None, "acct2"));
+        let g = sl.match_groups("foo.bar", 99, true, None);
+        assert_eq!(
+            g.plain.iter().map(|d| d.conn_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let g = sl.match_groups("foo.bar", 99, true, Some("$G"));
+        assert_eq!(
+            g.plain.iter().map(|d| d.conn_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let g = sl.match_groups("foo.bar", 99, true, Some("acct2"));
+        assert_eq!(
+            g.plain.iter().map(|d| d.conn_id).collect::<Vec<_>>(),
+            vec![3]
+        );
+        // subscriptions()/patterns() keep insertion order and dedup.
+        assert_eq!(
+            sl.subscriptions()
+                .iter()
+                .map(|s| s.conn_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        sl.add(sub_acct(4, "1", "foo.bar", None, "$G"));
+        assert_eq!(
+            sl.patterns().len(),
+            3,
+            "foo.>/$G, foo.bar/$G, foo.bar/acct2"
+        );
+        assert!(sl.has_pattern("foo.bar", None, "$G"));
+        sl.remove_conn(2);
+        assert!(
+            sl.has_pattern("foo.bar", None, "$G"),
+            "conn 4 still uses it"
+        );
+        sl.remove_conn(4);
+        assert!(!sl.has_pattern("foo.bar", None, "$G"));
+    }
+
+    #[test]
+    fn trie_duplicate_sid_ignored_and_auto_unsub_via_wildcard() {
+        let mut sl = Sublist::new();
+        sl.add(sub(1, "1", "foo.>", None));
+        sl.add(sub(1, "1", "other", None)); // ignored: keep-first
+        assert_eq!(conns(&mut sl, "foo.bar"), vec![1]);
+        assert!(conns(&mut sl, "other").is_empty());
+        let mut s = sub(2, "1", "foo.*", None);
+        s.max_msgs = Some(1);
+        sl.add(s);
+        let r = sl.match_recipients("foo.bar", 99, true, None);
+        assert_eq!(r.expired, vec![(2, "1".to_string())]);
+        sl.remove(2, "1");
+        assert_eq!(conns(&mut sl, "foo.bar"), vec![1]);
     }
 }

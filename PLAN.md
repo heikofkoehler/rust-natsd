@@ -48,6 +48,9 @@ KV/object-store client helpers (their server-side primitives exist).
 - Subscription registry (sublist): fan-out delivery, queue groups
   (one-of delivery per queue group per message), `UNSUB` with max-messages,
   auto-unsubscribe accounting, subscription cleanup on disconnect.
+  Matching is a subject trie (exact / `*` / `>` nodes, insertion order
+  restored after collection); the 10k-subscription harness in
+  `examples/sublist_bench.rs` measures it.
 - `echo` semantics from `CONNECT`; request/reply works via reply subjects
   (plain pub-sub, covered by e2e).
 - Unit + raw-protocol integration tests.
