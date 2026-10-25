@@ -81,7 +81,7 @@ rust-natsd does; it replaces the older support table.
 | JetStream: ack policies (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | Implemented | |
 | JetStream: workqueue retention, `max_msgs_per_subject` | Implemented | |
 | JetStream: deliver policies `all` / `last` (filter-aware) / `new` / `by_start_sequence` | Implemented | |
-| JetStream persistence | Partial | Whole-engine JSON snapshot after every mutation, reloaded on startup; pending ack state is NOT persisted (see `jetstream.rs` scope notes) |
+| JetStream persistence | Implemented | Whole-engine JSON snapshot after every mutation, reloaded on startup — including per-consumer pending ack state (in-flight stream seqs, delivery counts, wall-clock delivery times), ack floors, redelivery counts, and pull redelivery queues (snapshot v2; v1 snapshots load with empty ack state). Restart preserves the remaining ack window (Go v2.15.1 semantics, probed): unacked messages redeliver once the window expires with delivered count incremented, acked messages never redeliver, push redelivery defers while the deliver subject has no interest; waiting pulls are not persisted (dead reply inbox) |
 | JetStream clustering / replication | Not implemented | Single-node only; non-goal |
 | JetStream mirroring / sourcing | Not implemented | Non-goal |
 | JetStream `$JS.API` routing across routes/leafs (`$JS.API.>` interest) | Implemented | |

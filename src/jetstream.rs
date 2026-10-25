@@ -9,9 +9,24 @@
 //!   startup. Without a store dir the engine is purely in-memory and
 //!   data is lost on restart. A stream created with file storage but
 //!   no store dir is accepted but stays in-memory.
-//! - Pending ack state is NOT persisted: messages delivered but unacked
-//!   before a restart are not redelivered (consumers resume from their
-//!   next_stream_seq). Dedup ids are persisted (window restarts).
+//! - Pending ack state IS persisted (snapshot version 2): per-consumer
+//!   delivered-but-unacked entries (consumer seq, stream seq, delivery
+//!   count, wall-clock delivery time), the ack floor, the redelivery
+//!   count, and the pull redelivery queue. On reload, each pending
+//!   entry's deadline is recomputed as delivery_time + ack_wait, so a
+//!   restart preserves the remaining ack window (verified against Go
+//!   v2.15.1: unacked messages are NOT redelivered immediately after a
+//!   restart inside the window, and ARE redelivered — with delivery
+//!   count incremented and a fresh consumer seq — once the window
+//!   expires; acked messages are never redelivered). Pull redelivery
+//!   entries already past their deadline at load are queued at once.
+//!   Old (version 1) snapshots load with empty ack state, as before.
+//!   Push redelivery defers while the deliver subject has no interest
+//!   (local, route, or leaf) instead of burning a delivery cycle, so a
+//!   late subscriber still sees delivery count 2, as Go does.
+//!   Waiting pulls are NOT persisted: they belong to a dead
+//!   connection's reply inbox, and the client must re-issue Fetch.
+//!   Dedup ids are persisted (window restarts).
 //! - JetStream is per-node: streams capture messages published on the
 //!   hosting node, but `$JS.API` requests and `$JS.ACK` messages route
 //!   cluster-wide via the `$JS.API.>` interest the server advertises.
@@ -251,6 +266,18 @@ struct Pending {
     stream_seq: u64,
     delivered: u64,
     deadline: Instant,
+    /// Wall-clock delivery time (unix nanos), so the remaining ack
+    /// window survives a restart: on load, deadline is recomputed as
+    /// delivered_at_ns + ack_wait. `Instant` cannot be persisted.
+    delivered_at_ns: u64,
+}
+
+/// One pull redelivery queued for the next Fetch/MSG.NEXT: the stream
+/// sequence plus the delivery count the next delivery must carry
+/// (Go reports delivered=2 on first redelivery, not 1).
+struct Redeliver {
+    stream_seq: u64,
+    delivered: u64,
 }
 
 struct WaitingPull {
@@ -273,7 +300,7 @@ struct Consumer {
     next_stream_seq: u64,
     consumer_seq: u64,
     pending: HashMap<u64, Pending>,
-    redeliver: VecDeque<u64>,
+    redeliver: VecDeque<Redeliver>,
     waiting_pulls: VecDeque<WaitingPull>,
     ack_floor_stream_seq: u64,
     ack_floor_consumer_seq: u64,
@@ -585,13 +612,16 @@ fn err_not_found(what: &str) -> (u16, u32, String) {
 }
 
 /// Deliver one stored message to a consumer. Records the pending entry
-/// (unless ack policy is none).
+/// (unless ack policy is none). `delivered` is 1 for a fresh delivery
+/// and the incremented count for a redelivery; it is carried in the
+/// ack subject, which is how clients report `NumDelivered`.
 fn deliver_to_consumer(
     stream_name: &str,
     account: &str,
     consumer: &mut Consumer,
     msg: &StoredMsg,
     to_subject: &str,
+    delivered: u64,
     actions: &mut Vec<Action>,
 ) {
     if consumer.ack_policy == AckPolicy::None {
@@ -604,7 +634,7 @@ fn deliver_to_consumer(
     consumer.consumer_seq += 1;
     let cseq = consumer.consumer_seq;
     let pending_count = consumer.pending.len() + 1;
-    let reply = consumer.ack_subject(stream_name, 1, msg.seq, cseq, pending_count);
+    let reply = consumer.ack_subject(stream_name, delivered, msg.seq, cseq, pending_count);
     actions.push(Action::Deliver(
         Message::new(
             to_subject,
@@ -618,8 +648,9 @@ fn deliver_to_consumer(
         cseq,
         Pending {
             stream_seq: msg.seq,
-            delivered: 1,
+            delivered,
             deadline: Instant::now() + consumer.ack_wait,
+            delivered_at_ns: now_ns(),
         },
     );
 }
@@ -687,6 +718,7 @@ fn drain_push(
             consumer,
             &msg,
             &deliver_subject,
+            1,
             actions,
         );
         // Workqueue with ack policy none: no ack will ever come, so
@@ -731,23 +763,25 @@ fn fulfill_pulls(
             return;
         };
         // Pick the next sequence: redelivery first, else fresh.
-        let seq = {
+        // A redelivery carries its incremented delivery count; a fresh
+        // sequence carries 1.
+        let (seq, delivered) = {
             let next = stream.consumers.get(consumer_name).unwrap().next_stream_seq;
-            if let Some(s) = stream
+            if let Some(r) = stream
                 .consumers
                 .get_mut(consumer_name)
                 .unwrap()
                 .redeliver
                 .pop_front()
             {
-                Some(s)
+                (Some(r.stream_seq), r.delivered)
             } else if stream.get(next).is_some() {
                 stream
                     .consumers
                     .get_mut(consumer_name)
                     .unwrap()
                     .next_stream_seq = next + 1;
-                Some(next)
+                (Some(next), 1)
             } else if next <= stream.last_seq() {
                 // Deleted gap: skip it and retry for a live message.
                 stream
@@ -757,7 +791,7 @@ fn fulfill_pulls(
                     .next_stream_seq = next + 1;
                 continue;
             } else {
-                None
+                (None, 1)
             }
         };
         let Some(seq) = seq else {
@@ -787,7 +821,15 @@ fn fulfill_pulls(
         }
         let consumer = stream.consumers.get_mut(consumer_name).unwrap();
         let account = stream.account.clone();
-        deliver_to_consumer(stream_name, &account, consumer, &msg, &reply, actions);
+        deliver_to_consumer(
+            stream_name,
+            &account,
+            consumer,
+            &msg,
+            &reply,
+            delivered,
+            actions,
+        );
     }
 }
 
@@ -810,10 +852,11 @@ impl Engine {
     /// delivery, so it returns consumed=false.
     /// Serialize the whole engine: streams, messages (payloads and
     /// headers base64-encoded via the `base64` crate), dedup ids, and
-    /// consumer definitions with their positions. Pending ack state
-    /// is NOT persisted: messages delivered but unacked before a
-    /// restart are not redelivered (consumers resume from their
-    /// next_stream_seq).
+    /// consumer definitions with their positions, pending ack state
+    /// (consumer seq, stream seq, delivery count, wall-clock delivery
+    /// time), ack floors, redelivery counts, and pull redelivery
+    /// queues (snapshot version 2; version 1 snapshots, which lack
+    /// these fields, still load with empty ack state).
     fn snapshot_json(&self) -> Value {
         use base64::Engine as _;
         let enc = base64::engine::general_purpose::STANDARD;
@@ -839,6 +882,29 @@ impl Engine {
                     .consumers
                     .values()
                     .map(|c| {
+                        let mut pending: Vec<(&u64, &Pending)> = c.pending.iter().collect();
+                        pending.sort_by_key(|(cseq, _)| **cseq);
+                        let pending_json: Vec<Value> = pending
+                            .iter()
+                            .map(|(cseq, p)| {
+                                json!({
+                                    "consumer_seq": **cseq,
+                                    "stream_seq": p.stream_seq,
+                                    "delivered": p.delivered,
+                                    "delivered_at_ns": p.delivered_at_ns,
+                                })
+                            })
+                            .collect();
+                        let redeliver_json: Vec<Value> = c
+                            .redeliver
+                            .iter()
+                            .map(|r| {
+                                json!({
+                                    "stream_seq": r.stream_seq,
+                                    "delivered": r.delivered,
+                                })
+                            })
+                            .collect();
                         json!({
                             "name": c.name,
                             "deliver_subject": c.deliver_subject,
@@ -854,6 +920,11 @@ impl Engine {
                             "deliver_policy": c.deliver_policy,
                             "next_stream_seq": c.next_stream_seq,
                             "consumer_seq": c.consumer_seq,
+                            "ack_floor_stream_seq": c.ack_floor_stream_seq,
+                            "ack_floor_consumer_seq": c.ack_floor_consumer_seq,
+                            "num_redelivered": c.num_redelivered,
+                            "pending": pending_json,
+                            "redeliver": redeliver_json,
                         })
                     })
                     .collect();
@@ -880,7 +951,7 @@ impl Engine {
                 })
             })
             .collect();
-        json!({ "version": 1, "streams": streams })
+        json!({ "version": 2, "streams": streams })
     }
 
     /// Restore an engine from `snapshot_json` output. Deleted
@@ -1010,6 +1081,109 @@ impl Engine {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    // Ack wait of 0 in an old snapshot means "default"
+                    // (creation maps 0 to DEFAULT_ACK_WAIT); keep that
+                    // mapping here so restored deadlines are sane.
+                    let ack_wait_ns = cv.get("ack_wait_ns").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ack_wait = if ack_wait_ns == 0 {
+                        DEFAULT_ACK_WAIT
+                    } else {
+                        Duration::from_nanos(ack_wait_ns)
+                    };
+                    let is_push = cv.get("deliver_subject").and_then(|v| v.as_str()).is_some();
+                    let max_deliver = cv.get("max_deliver").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    // Restore pending ack state. Each entry's deadline
+                    // is recomputed from its wall-clock delivery time
+                    // plus ack_wait, preserving the remaining window
+                    // (Go behaviour, probed against v2.15.1). Entries
+                    // already past their deadline for a pull consumer
+                    // are queued for immediate redelivery (with the
+                    // incremented delivery count); push entries keep a
+                    // now deadline so the next tick redelivers them.
+                    // Max-deliver-exhausted entries are dropped.
+                    // Missing fields (version 1 snapshots) mean empty
+                    // ack state, exactly as before.
+                    let now = Instant::now();
+                    let now_wall = now_ns();
+                    let mut pending: HashMap<u64, Pending> = HashMap::new();
+                    // Entries already past their deadline are queued
+                    // after the persisted redelivery queue (which was
+                    // queued first, before the restart).
+                    let mut expired: Vec<Redeliver> = Vec::new();
+                    let mut num_redelivered = cv
+                        .get("num_redelivered")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if let Some(entries) = cv.get("pending").and_then(|v| v.as_array()) {
+                        let mut restored: Vec<(u64, u64, u64, u64)> = entries
+                            .iter()
+                            .filter_map(|pv| {
+                                Some((
+                                    pv.get("consumer_seq")?.as_u64()?,
+                                    pv.get("stream_seq")?.as_u64()?,
+                                    pv.get("delivered")?.as_u64()?,
+                                    pv.get("delivered_at_ns")?.as_u64()?,
+                                ))
+                            })
+                            .collect();
+                        // Redelivery order is stream order (Go).
+                        restored.sort_by_key(|(_, sseq, _, _)| *sseq);
+                        for (cseq, sseq, delivered, delivered_at_ns) in restored {
+                            if max_deliver > 0 && delivered >= max_deliver as u64 {
+                                continue;
+                            }
+                            let deadline_wall =
+                                delivered_at_ns.saturating_add(ack_wait.as_nanos() as u64);
+                            if deadline_wall <= now_wall {
+                                if is_push {
+                                    pending.insert(
+                                        cseq,
+                                        Pending {
+                                            stream_seq: sseq,
+                                            delivered,
+                                            deadline: now,
+                                            delivered_at_ns,
+                                        },
+                                    );
+                                } else {
+                                    expired.push(Redeliver {
+                                        stream_seq: sseq,
+                                        delivered: delivered + 1,
+                                    });
+                                    num_redelivered += 1;
+                                }
+                            } else {
+                                let remaining = Duration::from_nanos(deadline_wall - now_wall);
+                                pending.insert(
+                                    cseq,
+                                    Pending {
+                                        stream_seq: sseq,
+                                        delivered,
+                                        deadline: now + remaining,
+                                        delivered_at_ns,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    // Persisted pull redelivery queue (from NAKs or a
+                    // tick that queued before the restart) survives
+                    // verbatim, ahead of freshly expired pending.
+                    let mut redeliver: VecDeque<Redeliver> = VecDeque::new();
+                    if let Some(entries) = cv.get("redeliver").and_then(|v| v.as_array()) {
+                        for rv in entries {
+                            if let (Some(sseq), Some(delivered)) = (
+                                rv.get("stream_seq").and_then(|v| v.as_u64()),
+                                rv.get("delivered").and_then(|v| v.as_u64()),
+                            ) {
+                                redeliver.push_back(Redeliver {
+                                    stream_seq: sseq,
+                                    delivered,
+                                });
+                            }
+                        }
+                    }
+                    redeliver.extend(expired);
                     stream.consumers.insert(
                         name.clone(),
                         Consumer {
@@ -1024,13 +1198,8 @@ impl Engine {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                             ack_policy,
-                            ack_wait: Duration::from_nanos(
-                                cv.get("ack_wait_ns").and_then(|v| v.as_u64()).unwrap_or(0),
-                            ),
-                            max_deliver: cv
-                                .get("max_deliver")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(-1),
+                            ack_wait,
+                            max_deliver,
                             max_ack_pending: cv
                                 .get("max_ack_pending")
                                 .and_then(|v| v.as_i64())
@@ -1048,12 +1217,18 @@ impl Engine {
                                 .get("consumer_seq")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0),
-                            pending: HashMap::new(),
-                            redeliver: VecDeque::new(),
+                            pending,
+                            redeliver,
                             waiting_pulls: VecDeque::new(),
-                            ack_floor_stream_seq: 0,
-                            ack_floor_consumer_seq: 0,
-                            num_redelivered: 0,
+                            ack_floor_stream_seq: cv
+                                .get("ack_floor_stream_seq")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            ack_floor_consumer_seq: cv
+                                .get("ack_floor_consumer_seq")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            num_redelivered,
                         },
                     );
                 }
@@ -1356,13 +1531,17 @@ impl Engine {
                                     stream_seq: sseq,
                                     delivered,
                                     deadline: Instant::now() + consumer.ack_wait,
+                                    delivered_at_ns: now_ns(),
                                 },
                             );
                             consumer.num_redelivered += 1;
                         }
                     }
                 } else {
-                    consumer.redeliver.push_back(sseq);
+                    consumer.redeliver.push_back(Redeliver {
+                        stream_seq: sseq,
+                        delivered: pending.delivered + 1,
+                    });
                     consumer.num_redelivered += 1;
                 }
             }
@@ -1376,6 +1555,7 @@ impl Engine {
                         stream_seq: sseq,
                         delivered: pending.delivered,
                         deadline: Instant::now() + consumer.ack_wait,
+                        delivered_at_ns: now_ns(),
                     },
                 );
             }
@@ -2155,25 +2335,25 @@ impl Engine {
         // Deliver what is available right now.
         let mut delivered = 0usize;
         while delivered < batch {
-            let seq = {
+            let (seq, delivered_count) = {
                 let next = stream.consumers.get(consumer_name).unwrap().next_stream_seq;
-                if let Some(s) = stream
+                if let Some(r) = stream
                     .consumers
                     .get_mut(consumer_name)
                     .unwrap()
                     .redeliver
                     .pop_front()
                 {
-                    Some(s)
+                    (Some(r.stream_seq), r.delivered)
                 } else if stream.get(next).is_some() {
                     stream
                         .consumers
                         .get_mut(consumer_name)
                         .unwrap()
                         .next_stream_seq = next + 1;
-                    Some(next)
+                    (Some(next), 1)
                 } else {
-                    None
+                    (None, 1)
                 }
             };
             let Some(seq) = seq else {
@@ -2197,7 +2377,15 @@ impl Engine {
             }
             let consumer = stream.consumers.get_mut(consumer_name).unwrap();
             let account = stream.account.clone();
-            deliver_to_consumer(stream_name, &account, consumer, &m, reply, actions);
+            deliver_to_consumer(
+                stream_name,
+                &account,
+                consumer,
+                &m,
+                reply,
+                delivered_count,
+                actions,
+            );
             delivered += 1;
         }
         if delivered < batch && !no_wait {
@@ -2236,7 +2424,7 @@ impl Engine {
     /// Background maintenance: max-age eviction, redelivery of expired
     /// pending messages, expiry of waiting pulls, push backlog drains,
     /// dedup-window pruning. Returns actions to send.
-    fn tick(&mut self) -> Vec<Action> {
+    fn tick(&mut self, has_interest: &dyn Fn(&str, &str) -> bool) -> Vec<Action> {
         let mut actions = Vec::new();
         let now = Instant::now();
         let now_ns = now_ns();
@@ -2296,8 +2484,9 @@ impl Engine {
                         ));
                     }
                 }
-                // Redeliver expired pending messages.
-                let due: Vec<(u64, u64, u64)> = {
+                // Redeliver expired pending messages, in stream
+                // order (Go serves redeliveries oldest-first).
+                let mut due: Vec<(u64, u64, u64)> = {
                     let c = stream.consumers.get_mut(&cname).unwrap();
                     c.pending
                         .iter()
@@ -2305,6 +2494,7 @@ impl Engine {
                         .map(|(cseq, p)| (*cseq, p.stream_seq, p.delivered))
                         .collect()
                 };
+                due.sort_by_key(|(_, sseq, _)| *sseq);
                 for (cseq, sseq, delivered) in due {
                     let staged = stream.get(sseq).map(|m| StoredMsg {
                         seq: m.seq,
@@ -2317,13 +2507,32 @@ impl Engine {
                     let Some(pending) = c.pending.remove(&cseq) else {
                         continue;
                     };
-                    let _ = pending;
                     if c.max_deliver > 0 && delivered >= c.max_deliver as u64 {
                         continue;
                     }
                     if c.deliver_subject.is_some() {
+                        // No interest on the deliver subject yet (e.g.
+                        // the client has not reconnected after a
+                        // restart): defer without burning a delivery
+                        // cycle, as Go does — the next tick retries.
+                        // A delivery to a subject nobody reads would
+                        // otherwise inflate the delivery count. The
+                        // original delivery time is kept so a restart
+                        // during deferral does not stretch the window.
+                        let to = c.deliver_subject.clone().unwrap();
+                        if !has_interest(&account, &to) {
+                            c.pending.insert(
+                                cseq,
+                                Pending {
+                                    stream_seq: sseq,
+                                    delivered,
+                                    deadline: now + TICK,
+                                    delivered_at_ns: pending.delivered_at_ns,
+                                },
+                            );
+                            continue;
+                        }
                         if let Some(m) = staged {
-                            let to = c.deliver_subject.clone().unwrap();
                             let nd = delivered + 1;
                             c.consumer_seq += 1;
                             let ncseq = c.consumer_seq;
@@ -2343,12 +2552,16 @@ impl Engine {
                                     stream_seq: sseq,
                                     delivered: nd,
                                     deadline: now + c.ack_wait,
+                                    delivered_at_ns: now_ns,
                                 },
                             );
                             c.num_redelivered += 1;
                         }
                     } else {
-                        c.redeliver.push_back(sseq);
+                        c.redeliver.push_back(Redeliver {
+                            stream_seq: sseq,
+                            delivered: delivered + 1,
+                        });
                         c.num_redelivered += 1;
                     }
                 }
@@ -2397,7 +2610,9 @@ pub async fn redelivery_loop(js: std::sync::Arc<JetStream>, shared: std::sync::A
             _ = tokio::time::sleep(TICK) => {
                 let actions = {
                     let mut engine = js.engine.lock().unwrap();
-                    engine.tick()
+                    engine.tick(&|account, subject| {
+                        crate::server::has_interest(&shared, account, subject)
+                    })
                 };
                 // Tick can evict messages, so it is a mutation too.
                 js.persist();

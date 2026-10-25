@@ -233,6 +233,33 @@ KV/object-store client helpers (their server-side primitives exist).
   5000 x 256 B to a never-reading subscriber, connection closed)
   in `tests/e2e_raw.rs`.
 
+### Phase 19 — JetStream persistence completeness (gap area 4)
+- Pending ack state is now persisted in the whole-engine JSON
+  snapshot (version 2; version 1 snapshots still load, with empty ack
+  state): per-consumer pending entries (consumer seq, stream seq,
+  delivery count, wall-clock delivery time), ack floors, redelivery
+  counts, and pull redelivery queues. On reload, each pending entry's
+  deadline is recomputed as delivery_time + ack_wait, preserving the
+  remaining ack window; pull entries already past their deadline are
+  queued for immediate redelivery, push entries get a now deadline
+  for the next tick. Pull redelivery now carries the incremented
+  delivery count (previously reset to 1), and tick redelivery order
+  is stream order. Push redelivery defers while the deliver subject
+  has no local/route/leaf interest (new `has_interest` helper in
+  `src/server.rs`) instead of burning a delivery cycle on a dropped
+  message, matching Go's late-subscriber behaviour. Waiting pulls are
+  deliberately not persisted (they belong to a dead connection).
+- Go semantics probed first against nats-server v2.15.1 (pull and
+  push, file store): no redelivery immediately after a restart
+  inside the ack window (fresh messages still served); redelivery
+  after the window with delivered=2 and fresh consumer seqs, in
+  stream order; acked messages never redelivered; a restart after
+  the original window expired redelivers immediately.
+- Verified: 4 new tests in `tests/e2e_js_persistence.rs` (pull
+  redelivery, acked-not-redelivered, push redelivery, dedup after
+  restart); cargo test 110 green; parity GREEN (52 pass + 1
+  exception); bench no regression vs 86edbe8.
+
 ## Future work (not in this plan)
 - Gateways, JetStream clustering/replication, mirroring/sourcing,
   MQTT/WebSocket gateways, JWT operator mode, route/leaf TLS,

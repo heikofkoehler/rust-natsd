@@ -1049,6 +1049,34 @@ fn interest_of(subs: &InterestMap, subject: &str, account: &str) -> (bool, HashM
     (plain, counts)
 }
 
+/// Whether any local subscription, route, or leaf has interest in
+/// `subject` for `account`. Used by the JetStream tick to defer a push
+/// redelivery while nobody is listening on the deliver subject, so it
+/// does not burn a delivery cycle on a dropped message. Read-only: it
+/// uses `match_groups`, which does not update delivery counters.
+pub(crate) fn has_interest(shared: &Arc<Shared>, account: &str, subject: &str) -> bool {
+    {
+        let sl = shared.sublist.read().unwrap();
+        let gm = sl.match_groups(subject, u64::MAX, true, Some(account));
+        if !gm.plain.is_empty() || !gm.groups.is_empty() {
+            return true;
+        }
+    }
+    for subs in shared.route_subs.lock().unwrap().values() {
+        let (plain, counts) = interest_of(subs, subject, account);
+        if plain || !counts.is_empty() {
+            return true;
+        }
+    }
+    for subs in shared.leaf_subs.lock().unwrap().values() {
+        let (plain, counts) = interest_of(subs, subject, account);
+        if plain || !counts.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 fn route_interest_full(shared: &Arc<Shared>, subject: &str, account: &str) -> InterestTargets {
     let subs = shared.route_subs.lock().unwrap();
     shared
