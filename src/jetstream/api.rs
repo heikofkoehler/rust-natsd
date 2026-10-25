@@ -321,6 +321,30 @@ impl Engine {
             );
             return;
         }
+        // Phase 34: replicated streams are refused, never silently
+        // stored as R1. The Raft layer (raft.rs / js_cluster.rs)
+        // exists and is tested at the group layer, but it is NOT
+        // wired into the JetStream publish path yet, so an acked
+        // publish could not be quorum-committed. Refusing here —
+        // with or without cluster peers — is the honest behaviour
+        // until the wiring phase lands; advertising R3 while
+        // storing R1 is a forbidden shortcut.
+        if body
+            .get("num_replicas")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|n| n > 1)
+        {
+            api_error_action(
+                account,
+                reply,
+                type_name,
+                400,
+                10002,
+                "replicated streams (num_replicas > 1) are not yet supported: the Phase 34 Raft layer is experimental and not wired into the JetStream publish path, so this request is refused rather than stored as a single replica",
+                actions,
+            );
+            return;
+        }
         let subjects: Vec<String> = body
             .get("subjects")
             .and_then(|v| v.as_array())
@@ -560,6 +584,25 @@ impl Engine {
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
+        // Phase 34: same refusal as STREAM.CREATE — an update
+        // must not raise a stream's replica count into unwired
+        // territory either.
+        if body
+            .get("num_replicas")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|n| n > 1)
+        {
+            api_error_action(
+                account,
+                reply,
+                type_name,
+                400,
+                10002,
+                "replicated streams (num_replicas > 1) are not yet supported: the Phase 34 Raft layer is experimental and not wired into the JetStream publish path, so this request is refused rather than stored as a single replica",
+                actions,
+            );
+            return;
+        }
         if let Some(body_name) = body.get("name").and_then(|v| v.as_str()) {
             if body_name != name {
                 api_error_action(

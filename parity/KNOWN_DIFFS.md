@@ -153,8 +153,12 @@ README Known issues list and PLAN's Future work list)
   interest are not advertised over gateways, and a gateway TLS
   listener without `verify` and no CA does not require a client
   certificate where Go's does (see PLAN Phase 33).
-- JetStream clustering/replication: single-node only (design note:
-  PLAN Phase 25). Mirroring/sourcing and imports/exports are
+- JetStream clustering/replication: Raft layer only (PLAN Phase
+  34: core, per-group WAL, Raft-over-routes transport, tested at
+  the group layer); the JetStream engine is NOT wired through it,
+  replicated streams are refused rather than served, and
+  STREAM.INFO/CONSUMER.INFO/`/jsz` honestly report `cluster: null`
+  for R1 streams. Mirroring/sourcing and imports/exports are
   implemented same-node and cross-node (Phase 32); the remaining
   cross-node limits are documented in PLAN Phase 32 (cross-node
   consumer deliveries to a foreign client, leaf imports outside the

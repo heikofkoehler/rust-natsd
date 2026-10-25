@@ -168,6 +168,8 @@ impl JetStream {
             total_consumers += s.consumers.len();
             streams.push(json!({
                 "name": s.name,
+                // Phase 34: honestly absent for R1 streams.
+                "cluster": Value::Null,
                 "messages": s.live_count(),
                 "bytes": s.bytes(),
                 "first_seq": s.first_seq(),
@@ -709,6 +711,10 @@ impl Stream {
                 "sources": self.sources.iter().map(source_cfg_json).collect::<Vec<_>>(),
             },
             "created": rfc3339(self.created_ns),
+            // Phase 34: cluster info is honestly absent for R1 /
+            // single-node streams (null, not fabricated). It is
+            // populated only once Raft stream groups are wired in.
+            "cluster": Value::Null,
             "state": {
                 "messages": self.live_count(),
                 "bytes": self.bytes(),
@@ -782,6 +788,10 @@ impl Consumer {
                 "max_ack_pending": self.max_ack_pending,
                 "num_replicas": 0,
             },
+            // Phase 34: as for streams — honestly absent for
+            // single-node consumers until consumer state is
+            // replicated through a stream Raft group.
+            "cluster": Value::Null,
             "delivered": {
                 "consumer_seq": self.consumer_seq,
                 "stream_seq": self.next_stream_seq.saturating_sub(1),

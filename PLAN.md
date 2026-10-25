@@ -39,9 +39,13 @@ and strict mode (53 probes, 52 pass + 1 documented KV-gate
 exception, 0 fail).
 
 Remaining items: JetStream clustering/replication is a
-**documented remainder, not implemented** — it has a design note
-below (Phase 25) and no code. Gateways were a remainder in Phase
-24 and are implemented in Phase 33. Still non-goals:
+**documented remainder, partially implemented in Phase 34** —
+the Raft core, per-group WAL, and Raft-over-routes transport are
+implemented and tested at the group layer, but the JetStream
+engine publish/ack/consumer path is NOT wired through them, so
+replicated streams are refused rather than served (see Phase
+34). The Phase 25 design note stands. Gateways were a remainder
+in Phase 24 and are implemented in Phase 33. Still non-goals:
 cross-node mirroring/sourcing, cross-node imports/exports, JWT
 imports across routes/leafs, MQTT/WebSocket gateways, XKeys,
 cert-to-user mapping on route/leaf connections, and the
@@ -1727,10 +1731,189 @@ for current behaviour.
   verification block (fmt, clippy, cargo test, e2e-go.sh,
   parity.sh).
 
+### Phase 34 — JetStream clustering / Raft (renumbered from plan Phase 33; STOPPED CLEANLY — Raft layer done, engine wiring is the remainder)
+- Task renumbering: the plan's Phase 33 (this work) became Phase
+  34 because the gateway phase landed as Phase 33 first; the
+  existing PLAN.md entries for Phases 27–33 were not overwritten,
+  this entry is appended. This phase implements the Phase 25
+  design note's components (a), (b), and the transport half of
+  (d) — it does not edit Phase 25, and it does NOT claim the
+  full Phase 25 test plan (R3 stream end to end) — that gate
+  was not met, so per the task's stop rule this phase stopped
+  cleanly: only verified code is committed, the cluster path is
+  NOT wired into the default JetStream path, and the remainder
+  below is the concrete next-step design.
+- Step 1 — Raft core (`src/raft.rs`, NEW): deterministic,
+  transport-agnostic state machine. Persistent term/vote/log,
+  Leader/Follower/Candidate, RequestVote, AppendEntries with
+  prevLogIndex/prevLogTerm matching, commit advancement on
+  quorum (current-term entries only, §5.4.2 — an old-term entry
+  commits only when a newer-term entry from the same leader
+  does), snapshot install + log compaction (stale snapshots are
+  no-ops, never truncations of committed state), static
+  3-node-style membership configured at group formation.
+  Election timeouts are values supplied by the caller; the core
+  takes an explicit fake clock (`now_ms`) and contains no
+  randomness, no sockets, no timers — tests drive it
+  deterministically. Dynamic membership change (joint
+  consensus) is NOT implemented: it did not fall out cleanly and
+  is a remainder, not a stub. Unit tests FIRST, all in
+  `src/raft.rs`: election (single candidate wins with quorum,
+  split-vote timeout retries in a higher term), log matching
+  (follower rejects a mismatched prevLog, leader backs
+  `next_index` up using the follower's hint and overwrites the
+  divergent entry), commit advancement (no commit with zero
+  follower acks, commit on majority; old-term entry not
+  committed by counting alone), snapshot restore (log
+  truncated to the snapshot prefix, state-machine data
+  preserved, stale snapshot ignored), stale-term rejection and
+  higher-term step-down.
+- Step 2 — WAL backing (`FileRaftStore` in `src/raft.rs`):
+  per-group durable state under
+  `<store_dir>/raft/<sanitised-group>/` — `term.json`,
+  `log.wal` (magic + CRC32 framed entries), `snapshot.json` +
+  `snapshot.bin`. This layout is deliberately distinct from
+  the single-node stream WAL
+  (`<store_dir>/<account>/streams/<stream>/`), so clustered
+  WAL data can never corrupt or be mistaken for R1 stream data,
+  and R1 streams keep working exactly as before (full suite +
+  parity persistence probe green). Crash recovery: a restarted
+  node replays its group log and snapshot before rejoining
+  (`RaftNode::from_persistent` restores term/vote/log/snapshot
+  as a follower, so it must rejoin via election); a corrupt
+  WAL tail is truncated on load, never replayed (same
+  fail-closed rule as the stream WAL). Unit tests: WAL
+  roundtrip + crash recovery (fresh store replays term, vote,
+  both entries; recovered node is a follower with the full
+  log), snapshot persistence + replay, corrupt-tail truncation.
+- Step 3 — cluster binding (`src/js_cluster.rs`, NEW):
+  `ClusterManager` holds one meta Raft group plus one Raft group
+  per replicated stream (group lifecycle: create on assignment,
+  replay on rejoin, tear down on delete is API-level — the
+  manager's `create_group` + per-group WAL is the mechanism).
+  `NatsRaftTransport` binds Raft RPCs to internal NATS subjects
+  `$JS.RAFT.<node-id>` over the existing cluster routes: each
+  node holds an internal client connection subscribed to its own
+  subject, publishes RPCs to peers' subjects, and route RS+
+  propagation carries them cross-node — no new wire protocol,
+  no route-parser changes. Rust-only cluster is the honest
+  scope: Go Raft interop is a separate reverse-engineering
+  effort and is NOT claimed anywhere. Documented choices:
+  consumer delivery/ack state is replicated per *stream* group,
+  not per consumer group (Go uses a group per consumer) — the
+  stream group already orders stream and consumer mutations
+  against each other; reads are served by the group leader
+  only, followers refuse (`NotLeader`) — there are no
+  stale-tolerant follower reads in this phase; Raft RPCs are
+  fire-and-forget NATS messages, loss handled by heartbeat /
+  append retries, as Raft expects of an unreliable transport;
+  node identity is the configured server name (stable across
+  restarts); election-timeout randomisation lives only in the
+  transport's tick loop, never in `raft.rs`. Two bugs found by
+  the integration test and fixed in this phase, both recorded
+  because the wiring phase will otherwise rediscover them: (1)
+  a detached `tokio::spawn` ticker survived a transport abort,
+  so a "killed" leader kept sending heartbeats and survivors
+  never timed out — the ticker now runs as a `select!` future
+  against the reader loop and dies with the connection; (2)
+  the test's quorum-restore expectation was wrong, not the
+  core: an entry written under an old term cannot commit by
+  counting alone under a new leader (§5.4.2) — the test now
+  proposes a second, current-term op, which carries it.
+  Every mutation shape is encoded (`GroupOp`: AppendMsg,
+  DeleteMsg, Purge, consumer create/delete/ack; `MetaOp`:
+  stream assign/delete) — but the JetStream engine does NOT
+  propose through these groups yet, so a PUB ack today is still
+  a single-node ack. That is the remainder, stated plainly in
+  the module docs so no reader mistakes this layer for
+  clustered JetStream.
+- Step 4 — API/monitoring: `STREAM.CREATE` and `STREAM.UPDATE`
+  with `num_replicas > 1` are refused with 400/10002 and a
+  message naming the Phase 34 state — with or without cluster
+  peers, because refusing only when peerless would still
+  advertise-then-store-R1 once peers exist but wiring does
+  not. Nothing is silently stored as R1. `STREAM.INFO`,
+  `CONSUMER.INFO`, and `/jsz` per-stream entries now carry
+  `"cluster": null` — honestly absent for R1/single-node
+  streams, not fabricated. Verified: async-nats parses the
+  null cluster as `None`.
+- Step 5 — tests (the plan's gate, at the layer that exists):
+  `tests/e2e_js_cluster_raft.rs` runs 3 real rust-natsd nodes
+  meshed by routes and drives the meta group through the
+  transport: election + 5 replicated ops committed in order on
+  all 3 nodes; leader-transport abort (SIGKILL equivalent at
+  this layer — no graceful close) → survivors re-elect,
+  continue serving, dead leader commits nothing new; restarted
+  node rejoins and serves the full 8-op sequence (no gap, no
+  duplicates); minority partition (one follower's transport
+  down) → its own propose fails `NotLeader` and it commits
+  nothing while the majority advances to 9, then rejoins
+  cleanly at 9; quorum loss (2 of 3 transports down) → the
+  remaining node commits nothing new for 2 s, then the
+  restored cluster serves again (both the pre-restore old-term
+  op and a new current-term op committed on all nodes).
+  The stream-level gate is NOT met and is NOT claimed: no R3
+  stream, no stream-leader SIGKILL with zero acked-message
+  loss, no MSG.GET full-range restart catch-up at the stream
+  level, no meta-leader reassignment on replica loss — those
+  are the wiring phase's tests, not this phase's.
+- Forbidden shortcuts — none shipped: no shared snapshot files
+  as clustering, no election without log replication, no
+  primary-backup copying without quorum, no advertising
+  `num_replicas > 1` while storing R1, no PUB ack before
+  quorum commit (the engine path that would ack is unwired,
+  and the API refuses the replicated case outright).
+- Verified: `cargo fmt --check` clean; `cargo clippy
+  --all-targets -- -D warnings` clean; `cargo test` 268
+  passed, 0 failed (was 256 at the Phase 33 run: +10 Raft unit
+  tests + 2 cluster integration tests); `scripts/e2e-go.sh`
+  OK; `scripts/parity.sh` GREEN (52 pass + 1 documented KV-gate
+  exception + 0 fail; JS full PASS; persistence PASS;
+  cluster/leaf smoke PASS). No stray servers: the integration
+  test shuts every node down and removes its store dir.
+- REMAINDER — concrete next steps, in order, with tests
+  (the wiring phase): (1) Wire the server binary to start a
+  `ClusterManager` + `NatsRaftTransport` when JetStream and
+  clustering are configured (needs: a cluster-node-id source —
+  server name is the design — plus peer discovery from route
+  peers or an explicit peer list, plus auth for the internal
+  connection, which today assumes no client auth; gate the
+  whole path behind an explicit opt-in so default single-node
+  behaviour is untouched). (2) Route the engine's mutation
+  path through stream groups: publish → propose `StreamAppend`
+  → apply on commit → only then send the PUB ack; ack →
+  propose `ConsumerAck` → apply on commit; consumer
+  create/delete, purge, delete likewise; meta group assigns
+  streams/consumers to peers on create and reassigns on
+  replica loss. The engine's Actions pattern must be preserved:
+  never dispatch deliveries while holding `engine.lock()`, and
+  never hold the sublist RwLock across socket/channel ops —
+  Raft apply effects must be drained after the lock drops, as
+  `handle_message` already does for actions. (3) Reads: the
+  group leader serves MSG.GET / CONSUMER.INFO; followers
+  redirect to the leader (or refuse with the leader's
+  identity) — implement one, test it, document it; do not
+  silently serve follower reads. (4) Dynamic membership
+  (joint consensus) only after (1)–(3) are green, or document
+  static membership as the permanent scope. (5) Then, and only
+  then, lift the `num_replicas > 1` refusal behind the opt-in,
+  populate real `cluster` fields in STREAM.INFO /
+  CONSUMER.INFO / `/jsz`, and run the full Phase 25 gate: R3
+  stream end to end, stream-leader SIGKILL with zero acked
+  loss, minority partition refusing writes and rejoining
+  cleanly, restart catch-up verified by MSG.GET across the
+  full sequence range, quorum loss refusing writes, replica
+  loss + meta reassignment. Go Raft interop stays a separate
+  reverse-engineering effort after all of that, not a
+  consequence of it.
+
 ## Future work (not in this plan)
 - JetStream clustering/replication
-  (Phase 25): documented remainder with a design note, not
-  implemented, not planned-imminent — no code, no accepting stub.
+  (Phase 25 design note; Phase 34 partial): Raft core, per-group
+  WAL, and Raft-over-routes transport implemented and tested at
+  the group layer; the JetStream engine wiring is the remainder
+  (see Phase 34) — replicated streams are refused, not served,
+  and there is no accepting stub.
 - JWT imports across routes/leafs, MQTT/WebSocket gateways,
   XKeys, cert-to-user mapping on route/leaf connections,
   object-store client-helper verification (KV done in Phase 31).
