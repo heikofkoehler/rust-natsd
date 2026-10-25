@@ -104,15 +104,16 @@ impl LeafParser {
                 if self.buf.len() < need {
                     return Ok(None);
                 }
-                let frame = self.buf.split_to(need);
-                let body = &frame[..*total];
+                // Zero-copy payload: freeze the split-off frame and
+                // slice it, exactly like the client parser. (This used
+                // to Bytes::copy_from_slice the body here.)
+                let mut frame = self.buf.split_to(need);
+                let _ = frame.split_off(*total); // drop trailing CRLF
+                let body = frame.freeze();
                 let (headers, payload) = if *hdr_len > 0 {
-                    (
-                        Some(Bytes::copy_from_slice(&body[..*hdr_len])),
-                        Bytes::copy_from_slice(&body[*hdr_len..]),
-                    )
+                    (Some(body.slice(..*hdr_len)), body.slice(*hdr_len..))
                 } else {
-                    (None, Bytes::copy_from_slice(body))
+                    (None, body)
                 };
                 let mut op = std::mem::replace(op, LeafOp::Ping);
                 if let LeafOp::LMsg {

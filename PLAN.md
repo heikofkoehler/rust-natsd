@@ -246,3 +246,16 @@ KV/object-store client helpers (their server-side primitives exist).
 - Parser is a pure state machine over a byte buffer (no I/O), which is what
   makes the split-at-every-byte unit tests possible.
 - No unsafe code. `#![forbid(unsafe_code)]` in the library.
+- Parser copy audit (gap area 3): the client parser was already
+  zero-copy on the PUB/HPUB hot path — `BytesMut::split_to` + `freeze`,
+  with HPUB headers/payload as `Bytes::slice` views — so it was left
+  alone. The route and leaf parsers were not: they
+  `Bytes::copy_from_slice`d every forwarded body, and now freeze+slice
+  like the client parser. Copies that remain are necessary, not
+  oversights: `feed()` copies socket bytes into the parser buffer once
+  (the readers use `read` into a stack buffer; removing that copy would
+  mean a `read_buf`-into-`BytesMut` reader-loop change, not a parser
+  change), control lines are small `String`s, and `encode_msg`/`encode_hmsg`
+  copy the payload once per recipient into the contiguous
+  header+payload+CRLF frame the writer sends (a scatter/gather writer
+  would be needed to avoid that, out of scope).
