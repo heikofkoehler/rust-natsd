@@ -204,3 +204,86 @@ async fn rust_client_many_messages_in_order() {
     }
     srv.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn rust_client_fanout_to_two_subscribers() {
+    let srv = start_server(test_config()).await;
+    let c1 = connect(&srv).await;
+    let c2 = connect(&srv).await;
+    let publisher = connect(&srv).await;
+    let mut s1 = c1.subscribe("fan.out").await.unwrap();
+    let mut s2 = c2.subscribe("fan.out").await.unwrap();
+    c1.flush().await.unwrap();
+    c2.flush().await.unwrap();
+    publisher.publish("fan.out", "both".into()).await.unwrap();
+    let m1 = timeout(T, s1.next()).await.unwrap().unwrap();
+    let m2 = timeout(T, s2.next()).await.unwrap().unwrap();
+    assert_eq!(m1.payload.as_ref(), b"both");
+    assert_eq!(m2.payload.as_ref(), b"both");
+    srv.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rust_client_unsubscribe_stops_delivery() {
+    let srv = start_server(test_config()).await;
+    let client = connect(&srv).await;
+    let mut sub = client.subscribe("gone.topic").await.unwrap();
+    client.flush().await.unwrap();
+    client.publish("gone.topic", "first".into()).await.unwrap();
+    let first = timeout(T, sub.next()).await.unwrap().unwrap();
+    assert_eq!(first.payload.as_ref(), b"first");
+    sub.unsubscribe().await.unwrap();
+    client.flush().await.unwrap();
+    client.publish("gone.topic", "second".into()).await.unwrap();
+    // No second delivery: the stream ends (unsubscribed) or times out.
+    let next = timeout(Duration::from_secs(1), sub.next()).await;
+    assert!(
+        matches!(next, Ok(None) | Err(_)),
+        "unsubscribed subscriber must not receive more: {next:?}"
+    );
+    srv.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rust_client_request_with_headers_carries_headers_and_reply() {
+    let srv = start_server(test_config()).await;
+    let responder = connect(&srv).await;
+    let requester = connect(&srv).await;
+    let mut svc = responder.subscribe("svc.headers").await.unwrap();
+    responder.flush().await.unwrap();
+    let responder_pub = responder.clone();
+    let task = tokio::spawn(async move {
+        if let Some(msg) = svc.next().await {
+            let trace = msg
+                .headers
+                .as_ref()
+                .and_then(|h| h.get("X-Trace"))
+                .map(|v| v.as_str().to_string());
+            assert_eq!(trace.as_deref(), Some("abc"));
+            let reply = msg.reply.expect("request has a reply subject");
+            responder_pub.publish(reply, "pong".into()).await.unwrap();
+        }
+    });
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert("X-Trace", "abc");
+    let resp = requester
+        .request_with_headers("svc.headers", headers, "ping".into())
+        .await
+        .expect("request with headers");
+    assert_eq!(resp.payload.as_ref(), b"pong");
+    task.await.unwrap();
+    srv.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rust_client_publish_without_subscribers_succeeds() {
+    let srv = start_server(test_config()).await;
+    let client = connect(&srv).await;
+    // Publishing to a subject with no subscribers is not an error.
+    client
+        .publish("nobody.listens", "hello?".into())
+        .await
+        .expect("publish without subscribers");
+    client.flush().await.expect("flush");
+    srv.shutdown().await.unwrap();
+}

@@ -847,3 +847,42 @@ async fn go_rejects_expired_rust_generated_jwt() {
     );
     drop(go);
 }
+
+// BUG (server, not test): JWT auth via the official Go client can never
+// succeed today. nats.go's UserJWT flow never sends a CONNECT `nkey`
+// field (UserJWT and Nkey are mutually exclusive in nats.go), but
+// rust-natsd's verify_user requires CONNECT nkey == JWT sub. Go's own
+// server derives the user key from the JWT sub claim instead. This
+// test reproduces the Go-client shape (jwt + nonce signature, no nkey
+// field) and is ignored until the server derives the key from sub.
+// The Go program mode `jwt` in e2e/go/advanced.go is the same
+// reproduction via nats.go and is likewise not wired into
+// scripts/e2e-go-advanced.sh yet.
+#[tokio::test]
+#[ignore = "JWT auth requires CONNECT nkey == sub; nats.go UserJWT never sends nkey"]
+async fn jwt_login_without_nkey_field_authenticates() {
+    let fx = fixture();
+    let srv = server::start(jwt_config(&fx, vec![]))
+        .await
+        .expect("server starts");
+    let mut client = Raw::connect(srv.addr).await;
+    let info = client.info().await;
+    let nonce = info["nonce"].as_str().expect("INFO nonce").to_string();
+    use base64::Engine;
+    let sig = fx.user.sign(nonce.as_bytes()).unwrap();
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig);
+    // Deliberately no "nkey" field, exactly as nats.go UserJWT sends.
+    client
+        .send(&format!(
+            "CONNECT {{\"jwt\":\"{}\",\"sig\":\"{sig_b64}\",\"verbose\":false,\"headers\":true}}\r\nPING\r\n",
+            fx.user_jwt
+        ))
+        .await;
+    assert_eq!(client.read_line().await, "PONG");
+    client.send("SUB allowed.z 1\r\n").await;
+    client.send("PUB allowed.z 2\r\nhi\r\n").await;
+    let (subject, _, payload) = client.read_msg().await;
+    assert_eq!(subject, "allowed.z");
+    assert_eq!(payload, b"hi");
+    srv.shutdown().await.expect("shutdown");
+}
