@@ -181,14 +181,17 @@ impl Engine {
             let Some(s) = self.streams.get(&dep) else {
                 continue;
             };
+            // Phase 32: remote links are served by the mirror loop,
+            // never by the local capture hook (a same-named local
+            // stream must not also feed a remote link).
             if let Some(cfg) = &s.mirror {
-                if cfg.live && cfg.name == origin_name {
+                if cfg.live && !cfg.remote && cfg.name == origin_name {
                     plan.push((dep.clone(), true, cfg.clone()));
                     continue;
                 }
             }
             for cfg in &s.sources {
-                if cfg.live && cfg.name == origin_name {
+                if cfg.live && !cfg.remote && cfg.name == origin_name {
                     plan.push((dep.clone(), false, cfg.clone()));
                 }
             }
@@ -274,6 +277,83 @@ impl Engine {
             };
             Self::store_message(stream, &m.subject, headers, m.payload, m.time_ns);
         }
+    }
+
+    /// Phase 32: store one message pulled from a remote origin into a
+    /// remote mirror/source link's target stream. Returns the new
+    /// target sequence, or None when the message is a duplicate of
+    /// one already stored for this link (the pull loop tracks origin
+    /// sequences per link and skips re-deliveries, but this is the
+    /// second line of defence: `last_origin_seq` is kept per link
+    /// on the target stream). Mirror copies are exact; source copies
+    /// add the `Nats-Stream-Source` header with the target's own
+    /// token (the origin's token is not visible across the cluster;
+    /// the header shape is otherwise Go's). Timestamps are the
+    /// mirror-arrival time: a pull delivery carries no timestamp,
+    /// unlike the same-node capture hook which preserves the origin
+    /// timestamp. Fan-out actions are returned for the caller to
+    /// dispatch after releasing the engine lock, as usual.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_remote_copy(
+        &mut self,
+        target: &str,
+        account: &str,
+        origin_name: &str,
+        origin_seq: u64,
+        is_mirror: bool,
+        filter_subject: Option<&str>,
+        subject: &str,
+        headers: &Option<Bytes>,
+        payload: &Bytes,
+        actions: &mut Vec<Action>,
+    ) -> Option<u64> {
+        let (token, last) = {
+            let stream = self.stream_for(target, account)?;
+            let link = if is_mirror {
+                stream.mirror.as_ref()
+            } else {
+                stream.sources.iter().find(|c| c.name == origin_name)
+            }?;
+            if !link.live || !link.remote {
+                return None;
+            }
+            (
+                stream.source_token.clone(),
+                stream
+                    .remote_progress
+                    .get(origin_name)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        };
+        if origin_seq <= last {
+            return None;
+        }
+        let headers2 = if is_mirror {
+            headers.clone()
+        } else {
+            Some(append_source_header(
+                headers.clone(),
+                origin_name,
+                origin_seq,
+                filter_subject,
+                subject,
+                &token,
+            ))
+        };
+        let time_ns = now_ns();
+        let seq = {
+            let stream = self.stream_for_mut(target, account).unwrap();
+            Self::store_message(stream, subject, headers2, payload.clone(), time_ns)
+        };
+        {
+            let stream = self.stream_for_mut(target, account).unwrap();
+            stream
+                .remote_progress
+                .insert(origin_name.to_string(), origin_seq);
+        }
+        self.fan_out(target, account, actions);
+        Some(seq)
     }
 
     /// Would adding `origins` to a new stream named `new_name`

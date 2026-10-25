@@ -98,7 +98,8 @@ pub struct Shared {
     /// JetStream engine, present when `--jetstream` is set (Phase 9).
     pub(crate) jetstream: Option<Arc<crate::jetstream::JetStream>>,
     /// Service-import reply mappings: synthetic reply subject
-    /// (`_RIMPORT.<seq>`, handed to the exporting account's responder)
+    /// (`_RIMPORT.<originating server id>.<seq>` since Phase 32,
+    /// handed to the exporting account's responder)
     /// -> (importing account, original reply subject, creation
     /// instant). Replies published to a synthetic subject are
     /// delivered back into the importing account (see process_op).
@@ -303,6 +304,9 @@ async fn supervisor(
             js.clone(),
             shared.clone(),
         ));
+        // Phase 32: cross-node mirror/source pull loop (no-op on
+        // nodes with no remote links; see jetstream/mirror.rs).
+        tasks.spawn(crate::jetstream::mirror_loop(js.clone(), shared.clone()));
     }
     loop {
         tokio::select! {

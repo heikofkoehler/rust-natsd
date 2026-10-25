@@ -1459,14 +1459,149 @@ for current behaviour.
   (exception kept; async-nats verification and the
   mirror-direct difference added).
 
+### Phase 32 — Cross-node imports/exports + cross-node JetStream mirroring (renumbered from plan Phase 31)
+
+- Task renumbering: the plan's Phase 31 (this work) became Phase 32
+  because the KV/Object Store phase landed as Phase 31 first; the
+  existing PLAN.md entries for Phases 27–31 were not overwritten,
+  this entry is appended. `_RIMPORT` form verified in code before
+  building on it: the implementation uses `_RIMPORT.<seq>` (not the
+  plan's `_RIMPORT.<node_id>.<seq>`), so Phase 32 keeps the prefix
+  and adds the node id, minting `_RIMPORT.<originating server
+  id>.<seq>`. Same-node replies are unchanged in behaviour (the
+  existing `tests/e2e_imports.rs` tests pass unmodified, and the new
+  form still matches their `starts_with("_RIMPORT.")` assertions);
+  the node id exists because per-node sequence counters can
+  collide across nodes, and it lets a responder's node tell a
+  remote reply from a local one.
+- Cross-node account imports/exports (`src/server/imports.rs`,
+  `src/server/delivery.rs`, `src/server/conn.rs`): the importing
+  node advertises stream-import interest at connection
+  establishment — RS+ in the exporting account on routes, LS+ on a
+  leaf whose connection account is the exporting account — so the
+  exporter node forwards those publishes and the importer copies
+  them to the local subject on arrival with the same
+  `deliver_stream_imports` table and the same authorization checks
+  (export must cover the concrete subject and list the importer).
+  Service imports use the same `try_service_import` on arrival
+  (Local, Route, and Leaf origins now, with the translated message
+  delivered locally only on an arrival node, so it cannot loop):
+  the importing node translates locally and forwards the rewritten
+  request via the responder's own advertised interest, and a
+  responder's reply to a remote synthetic subject is forwarded to
+  every route/leaf (bypassing interest and, like the same-node
+  interception, the responder's publish allow list — the synthetic
+  channel is import machinery) and claimed on the minting node by
+  its reply-mapping lookup, which delivers to the importer's
+  original reply subject; any other node drops it. Authorization is
+  enforced on both sides exactly as same-node: the importer's
+  publish allow/deny on the local subject (checked in `conn` before
+  translation), the responder's subscribe allow/deny on the exported
+  subject at SUB time, and the export coverage/listing check at
+  translation and copy time — no cross-node path bypasses a check
+  the local path performs. Denied cross-node imports are dropped
+  on the importing node and never forwarded.
+- `$JS.API` routing fixed first, as the task required verifying it:
+  it did NOT actually route before this phase — `handle_message`
+  consumed every API request locally, so the advertised `$JS.API.>`
+  interest never carried a request to the hosting node. Now
+  (`src/jetstream/api.rs::should_forward_api`) a stream-referencing
+  `$JS.API` request or `$JS.ACK` from a local client, for a stream
+  absent from this node's engine, is not consumed when the node has
+  route/leaf peers, so `deliver` forwards it via the peers'
+  `$JS.API.>` / `$JS.ACK.>` interest (advertised per account at
+  connection establishment); Route/Leaf/Internal origins are always
+  answered locally, which is the loop guard. `STREAM.CREATE` is
+  never forwarded (creation is always local) and `STREAM.LIST` /
+  `NAMES` stay per-node. Verified by a test: `STREAM.INFO` for a
+  stream hosted on node 1, issued from node 2, returns its message
+  count instead of a local 404.
+- Cross-node stream mirroring/sourcing (`src/jetstream/mirror.rs`,
+  `src/jetstream/stream.rs::append_remote_copy`,
+  `src/jetstream/api.rs::api_stream_create`): a mirror/source whose
+  origin is not on this node is created in remote mode (flagged
+  `SourceCfg.remote`, persisted in stream meta) when the node has
+  peers, and served by a background pull loop — one durable pull
+  consumer per link on the origin stream, created via forwarded
+  `$JS.API.CONSUMER.CREATE` with `ack_policy: none`,
+  `deliver_policy` replaying the link's backfill range (`all` /
+  `by_start_sequence` / `by_start_time`, the last newly supported
+  by the consumer engine for this), and the link's
+  `filter_subject`, then repeated `MSG.NEXT` (`no_wait`, batch 32).
+  The loop talks to its own node over a loopback raw client
+  (authenticating with the first password user of the mirror
+  stream's account when the config has one), subscribes to the
+  origin stream's subjects (or the link's filter) before pulling —
+  pull deliveries are framed with the original subject by the
+  `route_via` path, which Phase 32 also extended to forward to
+  routes/leafs with interest in the original subject — and stores
+  each message via `append_remote_copy`: mirror copies exact,
+  source copies add the `Nats-Stream-Source` header (trailing token
+  is the mirror's own token, since the origin's is not visible
+  across the cluster), filter honoured by the consumer, timestamps
+  are mirror-arrival time (a pull delivery carries no timestamp,
+  unlike the same-node capture hook). The same-node capture hook
+  never feeds remote links, and remote links are never backfilled
+  locally. Progress is the origin consumer's `next_stream_seq`
+  plus a persisted per-link `remote_progress` watermark, so a
+  mirror-node restart reuses the existing consumer (create returns
+  10013) and resumes without duplicates; an origin restart with a
+  store dir (consumer persisted) resumes the same way, and a
+  MSG.NEXT error for a lost consumer drops back to consumer
+  creation. Remaining honest limits: a mirror-node crash between
+  receiving a pull message and storing it loses that one message
+  (ack-none already advanced the origin consumer past it); an
+  origin recreated after deletion starts a new sequence incarnation
+  that the watermark cannot distinguish from the old one, so that
+  path follows the same-node delete-kills-the-link rule only
+  loosely (see below). Leaf-node mirroring falls out naturally
+  through the same forwarded API + leaf interest and is tested
+  (hub stream, leaf mirror, backfill + live).
+- Behaviour changed, deliberately and documented: (1) the synthetic
+  reply subject gains the node id (above); (2) `route_via`
+  consumer deliveries now also forward to routes/leafs with
+  interest in the original subject (previously local-only) — this
+  is what the mirror loop relies on, and it changes nothing when
+  no remote node has such interest; (3) cross-node mirror/source
+  of a nonexistent stream is accepted and left empty (Go's
+  behaviour), because the creating node cannot synchronously
+  verify a remote origin — the same-node 404/10059 deviation is
+  preserved exactly when the node has no peers, and the mirror
+  loop's consumer creation is the async existence check (it
+  retries while the origin is absent). `external` /
+  `subject_transforms` are still rejected.
+- Not implemented / remainders: a JetStream consumer whose client
+  sits on another node does not receive push/pull deliveries across
+  the cluster — a pull delivery is framed with the original subject
+  and the route protocol carries no deliver-subject field, so only
+  a subscriber to the original subject (the mirror loop) can be
+  matched on arrival; a leaf import from an account other than the
+  leaf connection's account cannot be carried on that connection
+  (leaf frames carry no account token); the mirror loopback client
+  cannot use a TLS-required client port or a JWT-only account
+  (no password user in config); JWT imports across routes/leafs
+  are not separately verified.
+- Verified: 10 new tests (`tests/e2e_imports.rs`: cross-node
+  service request/reply both directions, cross-node stream copy,
+  cross-node denied import, leaf service + stream imports through
+  an exporter-account leaf; `tests/e2e_js_mirror.rs`: API
+  forwarding to the hosting node, cross-node mirror backfill +
+  live, cross-node source filter + start_seq, cross-node
+  nonexistent-mirror-stays-empty, leaf-node mirror, cross-node
+  mirror resume after origin restart with a store dir) plus 1 unit
+  test (reply-subject parsing); full verification numbers in the
+  commit message's verification block (fmt, clippy, cargo test,
+  e2e-go.sh, parity.sh).
+
 ## Future work (not in this plan)
 - Gateways (Phase 24) and JetStream clustering/replication
   (Phase 25): documented remainders with design notes, not
   implemented, not planned-imminent — no code, no accepting stub.
-- Cross-node mirroring/sourcing, cross-node imports/exports,
-  JWT imports across routes/leafs, MQTT/WebSocket gateways,
+- JWT imports across routes/leafs, MQTT/WebSocket gateways,
   XKeys, cert-to-user mapping on route/leaf connections,
   object-store client-helper verification (KV done in Phase 31).
+  (Cross-node mirroring/sourcing and cross-node imports/exports
+  are done in Phase 32.)
 - Phase 28C is complete (see above); no further 28-series item
   remains.
 

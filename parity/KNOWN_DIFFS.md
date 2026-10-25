@@ -147,9 +147,12 @@ README Known issues list and PLAN's Future work list)
 - Gateways (super-cluster): Rust returns an empty `/gatewayz`; no
   gateway protocol is implemented (design note: PLAN Phase 24).
 - JetStream clustering/replication: single-node only (design note:
-  PLAN Phase 25). Mirroring/sourcing are implemented same-node only;
-  cross-node mirroring/sourcing remain out of scope.
-- Cross-node imports/exports; JWT imports across routes/leafs.
+  PLAN Phase 25). Mirroring/sourcing and imports/exports are
+  implemented same-node and cross-node (Phase 32); the remaining
+  cross-node limits are documented in PLAN Phase 32 (cross-node
+  consumer deliveries to a foreign client, leaf imports outside the
+  leaf connection's account, TLS/JWT loopback limits).
+- JWT imports across routes/leafs (not separately verified).
 - MQTT/WebSocket: not implemented in rust-natsd (see README
   non-goals); not probed. JWT operator mode, route/leaf TLS, and TLS
   client-certificate-to-user mapping are now implemented (see

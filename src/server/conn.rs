@@ -813,6 +813,27 @@ pub(crate) async fn process_op(
                     );
                     return true;
                 }
+                // Phase 32: a reply minted by another node (its node
+                // id differs from ours) is forwarded to every
+                // route/leaf, bypassing the publish-permission check
+                // exactly as the same-node interception above does:
+                // only the minting node claims it on arrival. A
+                // same-node subject whose mapping expired falls
+                // through to the normal permission-checked path, as
+                // before.
+                if let Some((node, _)) = super::imports::parse_import_reply_subject(&subject) {
+                    if node != shared.server_id {
+                        if state.verbose {
+                            let _ = tx.send(encode_ok()).await;
+                        }
+                        super::delivery::forward_remote_import_reply(
+                            shared,
+                            &Message::new(&subject, reply_to, None, payload)
+                                .with_account(&state.account),
+                        );
+                        return true;
+                    }
+                }
             }
             if !state.permissions.can_publish(&subject) {
                 // Go's exact error text; the connection stays alive and
@@ -889,6 +910,20 @@ pub(crate) async fn process_op(
                         None,
                     );
                     return true;
+                }
+                // Phase 32: remote-node reply, as for PUB above.
+                if let Some((node, _)) = super::imports::parse_import_reply_subject(&subject) {
+                    if node != shared.server_id {
+                        if state.verbose {
+                            let _ = tx.send(encode_ok()).await;
+                        }
+                        super::delivery::forward_remote_import_reply(
+                            shared,
+                            &Message::new(&subject, reply_to, Some(headers), payload)
+                                .with_account(&state.account),
+                        );
+                        return true;
+                    }
                 }
             }
             if !state.permissions.can_publish(&subject) {

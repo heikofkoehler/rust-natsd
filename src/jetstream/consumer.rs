@@ -470,6 +470,24 @@ impl Engine {
                     .unwrap_or(0);
                 wanted.max(stream.first_seq())
             }
+            // Phase 32: needed by the cross-node mirror pull loop,
+            // which translates a link's opt_start_time into a
+            // by_start_time consumer. The first message at or after
+            // the timestamp, else just past the last message.
+            "by_start_time" => {
+                let wanted = match config.get("opt_start_time") {
+                    Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+                    Some(Value::String(s)) => crate::jetstream::parse_rfc3339_ns(s).unwrap_or(0),
+                    _ => 0,
+                };
+                stream
+                    .messages
+                    .iter()
+                    .filter(|m| !stream.deleted.contains(&m.seq) && m.time_ns >= wanted)
+                    .map(|m| m.seq)
+                    .next()
+                    .unwrap_or_else(|| stream.last_seq() + 1)
+            }
             _ => stream.first_seq(),
         };
         let consumer = Consumer {

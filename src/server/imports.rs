@@ -7,6 +7,18 @@
 //! original reply subject. Entries expire after 60 s (Phase 28C; Go's
 //! `_R_.` mappings expire by TTL) and are pruned opportunistically on
 //! insert and lookup, so a stale mapping can never route a reply.
+//!
+//! Phase 32 (cross-node): the synthetic subject is
+//! `_RIMPORT.<originating server id>.<seq>`. Same-node replies still
+//! match by the `_RIMPORT.` prefix and the local lookup, so
+//! same-node behaviour is unchanged; the node id lets a responder on
+//! another node tell that the mapping lives elsewhere (its own lookup
+//! misses) and forward the reply to every route/leaf instead of
+//! dropping it, and lets the originating node claim it on arrival
+//! (see `delivery::forward_remote_import_reply` and the
+//! route/leaf-origin branch of `deliver`). Sequence counters are
+//! per-node, so without the node id two nodes could mint the same
+//! subject for different inboxes.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -89,24 +101,50 @@ pub(crate) fn with_request_info(headers: Option<Bytes>, importing_account: &str)
     }
 }
 
+/// Parse a synthetic service-import reply subject into (node id,
+/// sequence) when it carries a node id, or None for the legacy
+/// `_RIMPORT.<seq>` form (same-node replies minted before Phase 32,
+/// and any reply whose mapping is looked up locally only).
+pub(crate) fn parse_import_reply_subject(subject: &str) -> Option<(String, u64)> {
+    let rest = subject.strip_prefix("_RIMPORT.")?;
+    let mut parts = rest.split('.');
+    let node = parts.next()?;
+    let seq = parts.next()?;
+    if parts.next().is_some() || node.is_empty() {
+        return None;
+    }
+    seq.parse::<u64>().ok().map(|s| (node.to_string(), s))
+}
+
 /// Service-import translation, moved verbatim out of `deliver` in
 /// Phase 29 (only the guard became an early return and the
 /// `return delivered` / `return false` became `Some(..)`).
-// Service import (local publishes only, same node): a publish on
-// the importing account's local subject is rewritten into the
-// exporting account and never delivered locally — the import
-// shadows the local subject, as on Go. An import the exporting
-// account does not authorize (account not listed on the export, or
-// remote pattern not covered by the export) is dropped outright:
-// it must never leak across accounts. Go refuses to start on an
-// unauthorized service import; rust-natsd keeps the server up and
-// drops the message instead (see Config::import_authorized).
+// Service import (Phase 32: local publishes, plus messages arriving
+// on a route/leaf in the importing account — a node whose config
+// declares the import translates on arrival, so an asymmetric
+// cluster where only the receiving node knows the import still
+// translates; a translated message is delivered locally only on the
+// arrival node, because `deliver` with a Route/Leaf origin never
+// re-forwards): a publish on the importing account's local subject
+// is rewritten into the exporting account and never delivered
+// locally — the import shadows the local subject, as on Go. An
+// import the exporting account does not authorize (account not
+// listed on the export, or remote pattern not covered by the
+// export) is dropped outright: it must never leak across accounts.
+// Go refuses to start on an unauthorized service import; rust-natsd
+// keeps the server up and drops the message instead (see
+// Config::import_authorized).
 pub(crate) fn try_service_import(
     shared: &Arc<Shared>,
     msg: &Message,
     origin: Origin,
 ) -> Option<bool> {
-    if !(matches!(origin, Origin::Local(_, _)) && !msg.service_translated && !msg.import_copy) {
+    if !(matches!(
+        origin,
+        Origin::Local(_, _) | Origin::Route(_) | Origin::Leaf(_)
+    ) && !msg.service_translated
+        && !msg.import_copy)
+    {
         return None;
     }
     if let Some(publisher_account) = shared.config.account(&msg.account).cloned() {
@@ -129,7 +167,9 @@ pub(crate) fn try_service_import(
             translated.service_translated = true;
             if let Some(orig_reply) = &msg.reply_to {
                 let seq = shared.import_seq.fetch_add(1, Ordering::SeqCst);
-                let synthetic = format!("_RIMPORT.{seq}");
+                // Phase 32: node id disambiguates per-node sequences
+                // across the cluster (see the module header).
+                let synthetic = format!("_RIMPORT.{}.{}", shared.server_id, seq);
                 prune_import_replies(shared);
                 shared.import_replies.lock().unwrap().insert(
                     synthetic.clone(),
@@ -236,6 +276,18 @@ mod tests {
         prune_import_map(&mut map, now);
         assert!(!map.contains_key("_RIMPORT.1"), "expired entry must go");
         assert!(map.contains_key("_RIMPORT.2"), "fresh entry must stay");
+    }
+
+    #[test]
+    fn import_reply_subject_parses_node_and_seq() {
+        assert_eq!(
+            parse_import_reply_subject("_RIMPORT.NABCDEFGHIJKLMNOPQRSTU.42"),
+            Some(("NABCDEFGHIJKLMNOPQRSTU".to_string(), 42))
+        );
+        // Legacy same-node form has no node id.
+        assert_eq!(parse_import_reply_subject("_RIMPORT.42"), None);
+        assert_eq!(parse_import_reply_subject("_RIMPORT."), None);
+        assert_eq!(parse_import_reply_subject("foo"), None);
     }
 
     #[test]

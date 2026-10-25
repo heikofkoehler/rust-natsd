@@ -97,6 +97,7 @@ impl Engine {
         msg: &Message,
         origin: Origin,
         js_enabled_for_account: bool,
+        has_peers: bool,
     ) -> (bool, Vec<Action>) {
         let mut actions = Vec::new();
         if matches!(origin, Origin::Internal) {
@@ -108,7 +109,7 @@ impl Engine {
             return (true, actions);
         }
         if let Some(rest) = subject.strip_prefix("$JS.API.") {
-            self.process_api(rest, msg, js_enabled_for_account, &mut actions);
+            self.process_api(rest, msg, js_enabled_for_account, has_peers, &mut actions);
             return (true, actions);
         }
         self.capture(msg, &mut actions);
@@ -120,6 +121,7 @@ impl Engine {
         rest: &str,
         msg: &Message,
         js_enabled_for_account: bool,
+        has_peers: bool,
         actions: &mut Vec<Action>,
     ) {
         let Some(reply) = msg.reply_to.clone() else {
@@ -175,7 +177,15 @@ impl Engine {
         }
         match parts.as_slice() {
             ["STREAM", "CREATE", name] => {
-                self.api_stream_create(&msg.account, name, &body, &reply, &type_name, actions);
+                self.api_stream_create(
+                    &msg.account,
+                    name,
+                    &body,
+                    &reply,
+                    &type_name,
+                    has_peers,
+                    actions,
+                );
             }
             ["STREAM", "CREATE"] => {
                 let name = body
@@ -183,7 +193,15 @@ impl Engine {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                self.api_stream_create(&msg.account, &name, &body, &reply, &type_name, actions);
+                self.api_stream_create(
+                    &msg.account,
+                    &name,
+                    &body,
+                    &reply,
+                    &type_name,
+                    has_peers,
+                    actions,
+                );
             }
             ["STREAM", "UPDATE", name] => {
                 self.api_stream_update(&msg.account, name, &body, &reply, &type_name, actions);
@@ -280,6 +298,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn api_stream_create(
         &mut self,
         account: &str,
@@ -287,6 +306,7 @@ impl Engine {
         body: &Value,
         reply: &str,
         type_name: &str,
+        has_peers: bool,
         actions: &mut Vec<Action>,
     ) {
         if !valid_name(name) {
@@ -380,7 +400,17 @@ impl Engine {
         // Every origin must exist in this account. Go accepts a
         // mirror/source of a nonexistent stream and leaves it empty;
         // this implementation rejects it instead (404/10059), so a
-        // typo cannot silently create an empty stream.
+        // typo cannot silently create an empty stream. Phase 32
+        // exception: when the node has route/leaf peers, an origin
+        // absent locally is treated as remote — the creating node
+        // cannot synchronously verify a remote stream's existence
+        // (STREAM.CREATE is answered under the engine lock, with no
+        // network round trip), so the link is created in remote mode
+        // and the mirror loop's consumer creation on the origin node
+        // is the existence check: a truly nonexistent remote origin
+        // leaves the mirror empty (Go's behaviour) and the loop
+        // retries, rather than failing creation. Without peers the
+        // 404 deviation is preserved exactly.
         let mut origins: Vec<String> = Vec::new();
         if let Some(cfg) = &mirror {
             origins.push(cfg.name.clone());
@@ -390,9 +420,22 @@ impl Engine {
             match self.stream_for(origin, account) {
                 Some(_) => {}
                 None => {
-                    let (code, err_code, desc) = err_not_found("stream");
-                    api_error_action(account, reply, type_name, code, err_code, &desc, actions);
-                    return;
+                    if has_peers {
+                        if let Some(cfg) = &mut mirror {
+                            if cfg.name == *origin {
+                                cfg.remote = true;
+                            }
+                        }
+                        for cfg in &mut sources {
+                            if cfg.name == *origin {
+                                cfg.remote = true;
+                            }
+                        }
+                    } else {
+                        let (code, err_code, desc) = err_not_found("stream");
+                        api_error_action(account, reply, type_name, code, err_code, &desc, actions);
+                        return;
+                    }
                 }
             }
         }
@@ -474,6 +517,7 @@ impl Engine {
             deny_delete: cfg_bool(body, "deny_delete", false),
             deny_purge: cfg_bool(body, "deny_purge", false),
             allow_rollup_hdrs: cfg_bool(body, "allow_rollup_hdrs", false),
+            remote_progress: HashMap::new(),
             wal_rewrite: false,
         };
         self.streams.insert(name.to_string(), stream);
@@ -481,11 +525,18 @@ impl Engine {
         // create response: backfill + link registration are atomic
         // with respect to publishes, so nothing is lost or doubled.
         // Go backfills asynchronously; the final state matches.)
+        // Remote links are not backfilled here: the origin's messages
+        // are not on this node, and the mirror loop pulls them (its
+        // consumer's deliver policy replays the same backfill range).
         if let Some(cfg) = &mirror {
-            self.backfill(name, account, cfg, true);
+            if !cfg.remote {
+                self.backfill(name, account, cfg, true);
+            }
         }
         for cfg in &sources {
-            self.backfill(name, account, cfg, false);
+            if !cfg.remote {
+                self.backfill(name, account, cfg, false);
+            }
         }
         let info = self.streams.get(name).unwrap().info_json();
         api_response(account, reply, type_name, info, actions);
@@ -1132,6 +1183,63 @@ impl Engine {
     }
 }
 
+/// Whether a `$JS.API` / `$JS.ACK` message for a stream this node
+/// does not host should be forwarded to another node instead of
+/// being answered locally with a 404. Phase 32: previously
+/// `handle_message` consumed every API request locally, so the
+/// `$JS.API.>` interest the server advertises to routes/leafs never
+/// actually carried a request to the hosting node (the README's
+/// "routes cluster-wide" claim was aspirational). Now a
+/// stream-referencing request/ack from a local client, for a stream
+/// absent from this node's engine, is not consumed when the node has
+/// route/leaf peers — `deliver` then forwards it via the peers'
+/// `$JS.API.>` / `$JS.ACK.>` interest, and the hosting node answers
+/// (its origin is Route/Leaf, so it always processes locally and
+/// cannot bounce the request back). `STREAM.CREATE`, `STREAM.LIST`,
+/// `STREAM.NAMES` and account `INFO` are never forwarded: creation
+/// is always local (a remote mirror is created locally in remote
+/// mode, see `api_stream_create`), and list/names are per-node.
+/// Only Local origin forwards; Route/Leaf/Internal messages are
+/// always processed locally, which is also the loop guard.
+fn should_forward_api(shared: &Shared, js: &JetStream, msg: &Message, origin: Origin) -> bool {
+    if !matches!(origin, Origin::Local(_, _)) {
+        return false;
+    }
+    let has_peers =
+        !shared.routes.lock().unwrap().is_empty() || !shared.leafs.lock().unwrap().is_empty();
+    if !has_peers {
+        return false;
+    }
+    let stream_name: Option<&str> = if let Some(rest) = msg.subject.strip_prefix("$JS.ACK.") {
+        rest.split('.').next()
+    } else if let Some(rest) = msg.subject.strip_prefix("$JS.API.") {
+        let parts: Vec<&str> = rest.split('.').collect();
+        match parts.as_slice() {
+            ["STREAM", "INFO", name]
+            | ["STREAM", "UPDATE", name]
+            | ["STREAM", "DELETE", name]
+            | ["STREAM", "PURGE", name]
+            | ["STREAM", "MSG", "GET", name]
+            | ["STREAM", "MSG", "DELETE", name]
+            | ["DIRECT", "GET", name, ..]
+            | ["CONSUMER", "CREATE", name, ..]
+            | ["CONSUMER", "DURABLE", "CREATE", name, ..]
+            | ["CONSUMER", "INFO", name, ..]
+            | ["CONSUMER", "LIST", name]
+            | ["CONSUMER", "DELETE", name, ..]
+            | ["CONSUMER", "MSG", "NEXT", name, ..] => Some(name),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some(name) = stream_name else {
+        return false;
+    };
+    let engine = js.engine.lock().unwrap();
+    engine.stream_for(name, &msg.account).is_none()
+}
+
 /// Called for every message before core delivery. Returns true when
 /// JetStream consumed the message (API request or ack) so it must not
 /// also be delivered as an ordinary message.
@@ -1141,10 +1249,17 @@ pub fn handle_message(
     msg: &Message,
     origin: Origin,
 ) -> bool {
+    // Phase 32 forwarding (see `should_forward_api`): not consumed,
+    // so `deliver` forwards the request to the hosting node.
+    if should_forward_api(shared, js, msg, origin) {
+        return false;
+    }
     let js_enabled_for_account = shared.config.jetstream_enabled_for_account(&msg.account);
+    let has_peers =
+        !shared.routes.lock().unwrap().is_empty() || !shared.leafs.lock().unwrap().is_empty();
     let (consumed, actions) = {
         let mut engine = js.engine.lock().unwrap();
-        engine.process(msg, origin, js_enabled_for_account)
+        engine.process(msg, origin, js_enabled_for_account, has_peers)
     };
     // Persist after every mutating operation (capture, API, ack) so
     // a restart restores the engine. Cheap at this scale (whole-engine

@@ -366,3 +366,188 @@ async fn conf_imports_exports_shape_parses() {
         "an unlisted account is not authorized"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 32: cross-node imports (routes and leafs)
+// ---------------------------------------------------------------------------
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn two_route_nodes() -> (
+    rust_natsd::server::RunningServer,
+    rust_natsd::server::RunningServer,
+) {
+    // Both nodes carry the same account/import config (cluster nodes
+    // share it); what differs is where each client connects.
+    let mut cfg1 = imports_config();
+    cfg1.cluster_host = "127.0.0.1".into();
+    cfg1.cluster_port = free_port();
+    let n1 = server::start(cfg1).await.expect("node1 starts");
+    let n1_cluster = n1.cluster_addr.unwrap();
+    let mut cfg2 = imports_config();
+    cfg2.cluster_host = "127.0.0.1".into();
+    cfg2.cluster_port = free_port();
+    cfg2.routes = vec![format!("nats://{n1_cluster}")];
+    let n2 = server::start(cfg2).await.expect("node2 starts");
+    // Route establishment + RS+ propagation (import interest included).
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    (n1, n2)
+}
+
+#[tokio::test]
+async fn cross_node_service_request_reply_through_import() {
+    let (n1, n2) = two_route_nodes().await;
+    // Responder on node 1 (exporter side), requester on node 2.
+    let mut alice = Raw::connect(n1.addr).await;
+    alice.login("alice", "alicepw").await;
+    let mut bob = Raw::connect(n2.addr).await;
+    bob.login("bob", "bobpw").await;
+    alice.send("SUB svc.echo 1\r\n").await;
+    bob.send("SUB _INBOX.bob1 2\r\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    bob.send("PUB local.echo _INBOX.bob1 5\r\nhello\r\n").await;
+    let (subject, reply, headers, payload) = alice.read_hmsg().await;
+    assert_eq!(subject, "svc.echo");
+    assert_eq!(payload, b"hello");
+    assert!(
+        headers.contains("Nats-Request-Info: {\"acc\":\"B\"}"),
+        "translated request must carry Nats-Request-Info for B: {headers}"
+    );
+    let reply = reply.expect("service request carries a reply subject");
+    // Phase 32: the synthetic subject now carries the minting node's
+    // id, so the responder's node can tell it is remote.
+    assert!(
+        reply.starts_with("_RIMPORT."),
+        "reply must be synthetic, got: {reply}"
+    );
+    assert_eq!(
+        reply.split('.').count(),
+        3,
+        "cross-node reply subject carries a node id: {reply}"
+    );
+
+    alice.send(&format!("PUB {reply} 5\r\nworld\r\n")).await;
+    let (subject, _reply, payload) = bob.read_msg().await;
+    assert_eq!(subject, "_INBOX.bob1");
+    assert_eq!(payload, b"world");
+    n2.shutdown().await.expect("shutdown");
+    n1.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cross_node_service_request_reply_reverse_direction() {
+    let (n1, n2) = two_route_nodes().await;
+    // Requester on node 1, responder on node 2: the reply must travel
+    // back across the route to the minting node.
+    let mut bob = Raw::connect(n1.addr).await;
+    bob.login("bob", "bobpw").await;
+    let mut alice = Raw::connect(n2.addr).await;
+    alice.login("alice", "alicepw").await;
+    alice.send("SUB svc.echo 1\r\n").await;
+    bob.send("SUB _INBOX.bob1 2\r\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    bob.send("PUB local.echo _INBOX.bob1 5\r\nhello\r\n").await;
+    let (subject, reply, _headers, payload) = alice.read_hmsg().await;
+    assert_eq!(subject, "svc.echo");
+    assert_eq!(payload, b"hello");
+    let reply = reply.expect("reply subject");
+    alice.send(&format!("PUB {reply} 5\r\nworld\r\n")).await;
+    let (subject, _reply, payload) = bob.read_msg().await;
+    assert_eq!(subject, "_INBOX.bob1");
+    assert_eq!(payload, b"world");
+    n2.shutdown().await.expect("shutdown");
+    n1.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cross_node_stream_import_copies() {
+    let (n1, n2) = two_route_nodes().await;
+    let mut alice = Raw::connect(n1.addr).await;
+    alice.login("alice", "alicepw").await;
+    let mut bob = Raw::connect(n2.addr).await;
+    bob.login("bob", "bobpw").await;
+    bob.send("SUB feed.news 1\r\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    alice.send("PUB events.news 4\r\nnews\r\n").await;
+    let (subject, _reply, payload) = bob.read_msg().await;
+    assert_eq!(subject, "feed.news");
+    assert_eq!(payload, b"news");
+    alice.send("PUB events.other 3\r\nxyz\r\n").await;
+    assert_eq!(bob.read_line_timeout(300).await, None);
+    n2.shutdown().await.expect("shutdown");
+    n1.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cross_node_denied_import_dropped() {
+    let (n1, n2) = two_route_nodes().await;
+    let mut alice = Raw::connect(n1.addr).await;
+    alice.login("alice", "alicepw").await;
+    let mut carol = Raw::connect(n2.addr).await;
+    carol.login("carol", "carolpw").await;
+    alice.send("SUB svc.echo 1\r\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // C is not listed on A's export: the cross-node request must be
+    // dropped on the importing node, never forwarded to the exporter.
+    carol
+        .send("PUB local.echo _INBOX.carol1 5\r\nhello\r\n")
+        .await;
+    assert_eq!(alice.read_line_timeout(300).await, None);
+    assert_eq!(carol.read_line_timeout(300).await, None);
+    n2.shutdown().await.expect("shutdown");
+    n1.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn leaf_service_and_stream_imports_through_exporter_account_leaf() {
+    // Leaf connection bound to the exporting account (leaf user
+    // alice in A): the leaf node translates B->A locally and the
+    // translated traffic rides the leaf connection in account A;
+    // stream-import interest (A events.>) is advertised as LS+ on
+    // that connection, and replies return via the node-id synthetic
+    // subject claimed on the leaf node.
+    let mut hub_cfg = imports_config();
+    hub_cfg.leaf_port = free_port();
+    let hub = server::start(hub_cfg).await.expect("hub starts");
+    let hub_leaf = hub.leaf_addr.unwrap();
+    let mut leaf_cfg = imports_config();
+    leaf_cfg.leaf_urls = vec![format!("nats://{hub_leaf}")];
+    leaf_cfg.leaf_user = Some("alice".into());
+    leaf_cfg.leaf_pass = Some("alicepw".into());
+    let leaf = server::start(leaf_cfg).await.expect("leaf starts");
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let mut alice = Raw::connect(hub.addr).await;
+    alice.login("alice", "alicepw").await;
+    let mut bob = Raw::connect(leaf.addr).await;
+    bob.login("bob", "bobpw").await;
+    alice.send("SUB svc.echo 1\r\n").await;
+    bob.send("SUB _INBOX.bob1 2\r\n").await;
+    bob.send("SUB feed.news 3\r\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    bob.send("PUB local.echo _INBOX.bob1 5\r\nhello\r\n").await;
+    let (subject, reply, _headers, payload) = alice.read_hmsg().await;
+    assert_eq!(subject, "svc.echo");
+    assert_eq!(payload, b"hello");
+    let reply = reply.expect("reply subject");
+    alice.send(&format!("PUB {reply} 5\r\nworld\r\n")).await;
+    let (subject, _reply, payload) = bob.read_msg().await;
+    assert_eq!(subject, "_INBOX.bob1");
+    assert_eq!(payload, b"world");
+
+    alice.send("PUB events.news 4\r\nnews\r\n").await;
+    let (subject, _reply, payload) = bob.read_msg().await;
+    assert_eq!(subject, "feed.news");
+    assert_eq!(payload, b"news");
+    leaf.shutdown().await.expect("shutdown");
+    hub.shutdown().await.expect("shutdown");
+}

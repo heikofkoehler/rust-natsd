@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::conn::{try_send, ConnHandle};
+use super::imports::parse_import_reply_subject;
 use super::{InterestMap, InterestTargets, Shared};
 use crate::leaf::{
     encode_leaf_hmsg, encode_lmsg, encode_ls_minus, encode_ls_plus, LeafOp, LeafParser,
@@ -162,10 +163,16 @@ pub fn deliver(
 
     // Phase 31 consumer deliveries (see `route_via`): route on the
     // deliver subject / pull reply inbox, but frame with the
-    // original subject. Local-only, like `deliver_stream_copy`:
-    // never service-translated, never forwarded to routes/leafs
-    // (a JS delivery to a local inbox is not a publish on the
-    // original subject), and never a no-responders case.
+    // original subject. Never service-translated, and never a
+    // no-responders case. Phase 32: no longer local-only — a
+    // consumer delivery is also forwarded to routes/leafs with
+    // interest in the original subject, which is what lets a
+    // cross-node pull consumer (the mirror loop) receive its
+    // messages: the receiving node matches the frame by its original
+    // subject, and the mirror loop subscribes to the origin stream's
+    // subjects (or the link's filter) for exactly that match. When
+    // no remote node has interest in the original subject, this
+    // behaves exactly as before (local delivery only).
     if let Some(via) = msg.route_via.clone() {
         let (deliveries, expired) = {
             let mut sl = shared.sublist.write().unwrap();
@@ -186,7 +193,53 @@ pub fn deliver(
             .stats
             .out_msgs
             .fetch_add(deliveries.len() as u64, Ordering::Relaxed);
-        return !deliveries.is_empty();
+        let mut forwarded = !deliveries.is_empty();
+        for (rid, handle, plain, _) in route_interest_full(shared, &msg.subject, &msg.account) {
+            if !plain {
+                continue;
+            }
+            let frame = match &msg.headers {
+                Some(h) => encode_route_hmsg(
+                    &msg.account,
+                    &msg.subject,
+                    msg.reply_to.as_deref(),
+                    h,
+                    &msg.payload,
+                ),
+                None => encode_rmsg(
+                    &msg.account,
+                    &msg.subject,
+                    msg.reply_to.as_deref(),
+                    &[],
+                    &msg.payload,
+                ),
+            };
+            if try_send(&handle, frame) {
+                forwarded = true;
+            } else {
+                eprintln!("rust-natsd: slow route {rid}, closing (consumer delivery)");
+                close_route(shared, rid);
+            }
+        }
+        for (_lid, handle, plain, _) in leaf_interest_full(shared, &msg.subject, &msg.account) {
+            if !plain {
+                continue;
+            }
+            let frame = match &msg.headers {
+                Some(h) => encode_leaf_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+                None => encode_lmsg(
+                    &msg.subject,
+                    msg.reply_to.as_deref(),
+                    &[],
+                    None,
+                    &msg.payload,
+                ),
+            };
+            if try_send(&handle, frame) {
+                forwarded = true;
+            }
+        }
+        return forwarded;
     }
 
     let (publisher_conn, publisher_echo) = match origin {
@@ -197,6 +250,38 @@ pub fn deliver(
     // Messages arriving on a route/leaf are delivered locally only
     // (full mesh / hub-and-spoke loop prevention).
     if matches!(origin, Origin::Route(_) | Origin::Leaf(_)) {
+        // Phase 32: a service-import reply arriving over a route/leaf
+        // is claimed by the node that minted its mapping, if any, and
+        // delivered to the importer's original reply subject; a reply
+        // no node on this path minted is dropped, never delivered to
+        // subscribers of the synthetic subject in the responder's
+        // account. The lookup is account-agnostic (the mapping itself
+        // names the importing account), so a leaf frame — which
+        // carries no account token — is claimed correctly too.
+        if msg.subject.starts_with("_RIMPORT.") {
+            if let Some((account, orig_reply)) =
+                super::imports::lookup_import_reply(shared, &msg.subject)
+            {
+                deliver(
+                    shared,
+                    &Message::new(&orig_reply, None, msg.headers.clone(), msg.payload.clone())
+                        .with_account(&account),
+                    Origin::Internal,
+                    None,
+                );
+                return true;
+            }
+            return false;
+        }
+        // Phase 32: a message arriving in the importing account is
+        // service-translated on arrival exactly as a local publish
+        // is (same function, same authorization checks). The
+        // translated message is delivered locally only by the
+        // Route/Leaf branch below (via the recursive `deliver`
+        // call inside `try_service_import`), so it cannot loop.
+        if let Some(delivered) = super::imports::try_service_import(shared, msg, origin) {
+            return delivered;
+        }
         let result = {
             let mut sl = shared.sublist.write().unwrap();
             match origin {
@@ -234,7 +319,33 @@ pub fn deliver(
             .stats
             .out_msgs
             .fetch_add(result.deliveries.len() as u64, Ordering::Relaxed);
-        return !result.deliveries.is_empty();
+        // Phase 32: stream-import copies on arrival, same table and
+        // same authorization checks as the local path — except a
+        // service-translated message never also gets stream-copied,
+        // matching the local path (which returns before the copy
+        // step). Copies are local-only (`deliver_stream_copy`).
+        let mut delivered = !result.deliveries.is_empty();
+        if !msg.service_translated && super::imports::deliver_stream_imports(shared, msg) {
+            delivered = true;
+        }
+        return delivered;
+    }
+
+    // Phase 32: a reply to a synthetic subject minted by another node
+    // (local/internal publish — the client-connection path handles
+    // this before the permission check, this is the backstop for any
+    // other local publisher) is forwarded to every route/leaf
+    // regardless of interest: only the minting node can claim it on
+    // arrival, and no subscriber ever legitimately subscribes to a
+    // synthetic subject. A same-node or legacy reply is handled by
+    // the normal path below (its mapping is local).
+    if msg.subject.starts_with("_RIMPORT.") {
+        if let Some((node, _)) = parse_import_reply_subject(&msg.subject) {
+            if node != shared.server_id {
+                forward_remote_import_reply(shared, msg);
+                return true;
+            }
+        }
     }
 
     // Service import (local publishes only, same node): translation,
@@ -417,6 +528,70 @@ pub(crate) fn deliver_stream_copy(shared: &Arc<Shared>, msg: &Message) -> bool {
         .out_msgs
         .fetch_add(deliveries.len() as u64, Ordering::Relaxed);
     !deliveries.is_empty()
+}
+
+/// Forward a service-import reply minted by another node to every
+/// route and leaf, bypassing interest: the minting node claims it on
+/// arrival via its reply-mapping lookup, and every other node drops
+/// it (route/leaf-origin `_RIMPORT` handling in `deliver`). The
+/// account token on route frames is the responder's account, as for
+/// any other message in that account; leaf frames carry no account
+/// and are claimed account-agnostically on arrival. Bypassing the
+/// publish-permission check here mirrors the same-node interception
+/// in `conn::process_op`: the synthetic reply channel is import
+/// machinery, not a subject the responder's allow list governs.
+pub(crate) fn forward_remote_import_reply(shared: &Arc<Shared>, msg: &Message) {
+    let route_handles: Vec<(u64, Arc<ConnHandle>)> = shared
+        .routes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, r)| !r.handle.is_closed())
+        .map(|(id, r)| (*id, r.handle.clone()))
+        .collect();
+    for (rid, handle) in route_handles {
+        let frame = match &msg.headers {
+            Some(h) => encode_route_hmsg(
+                &msg.account,
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                h,
+                &msg.payload,
+            ),
+            None => encode_rmsg(
+                &msg.account,
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                &[],
+                &msg.payload,
+            ),
+        };
+        if !try_send(&handle, frame) {
+            eprintln!("rust-natsd: slow route {rid}, closing (import reply)");
+            close_route(shared, rid);
+        }
+    }
+    let leaf_handles: Vec<Arc<ConnHandle>> = shared
+        .leafs
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|l| !l.handle.is_closed())
+        .map(|l| l.handle.clone())
+        .collect();
+    for handle in leaf_handles {
+        let frame = match &msg.headers {
+            Some(h) => encode_leaf_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+            None => encode_lmsg(
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                &[],
+                None,
+                &msg.payload,
+            ),
+        };
+        let _ = try_send(&handle, frame);
+    }
 }
 
 /// Send MSG/HMSG frames for local deliveries, dropping slow consumers.
@@ -686,10 +861,53 @@ pub(crate) fn send_local_interest(
             }
             for account in accounts {
                 let _ = try_send(handle, encode_rs_plus(&account, "$JS.API.>", None));
+                // Phase 32: $JS.ACK interest, so an ack for a stream
+                // hosted elsewhere is forwarded instead of being
+                // consumed-and-dropped locally (see
+                // `jetstream::handle_message`).
+                let _ = try_send(handle, encode_rs_plus(&account, "$JS.ACK.>", None));
             }
         } else if let Some(account) = leaf_account {
             let _ = try_send(handle, encode_ls_plus("$JS.API.>", None));
+            let _ = try_send(handle, encode_ls_plus("$JS.ACK.>", None));
             let _ = account;
+        }
+    }
+    // Phase 32: stream-import interest. A node hosting an importer
+    // advertises the exported subject in the exporting account, so
+    // the node hosting the exporter forwards those publishes here
+    // and this node copies them to the importer's local subject on
+    // arrival (route/leaf-origin branch of `deliver`). Service
+    // imports need no interest: the importing node translates
+    // locally and forwards the rewritten request via the responder's
+    // own advertised interest. Imports are config-static, so
+    // advertising them at connection establishment is sufficient —
+    // there is no runtime import-subscription to propagate.
+    // Leaf frames carry no account token, so a leaf only advertises
+    // imports whose source account is the leaf connection's account
+    // (the account the leaf user belongs to on the hub); a leaf
+    // import from any other account cannot be carried on that
+    // connection and is documented as a remainder.
+    if is_route {
+        for account in shared.config.all_accounts() {
+            for import in &account.imports {
+                if import.kind == Some(crate::config::ImportKind::Stream) {
+                    let _ = try_send(
+                        handle,
+                        encode_rs_plus(&import.source_account, &import.remote_subject, None),
+                    );
+                }
+            }
+        }
+    } else if let Some(leaf_account) = leaf_account {
+        for account in shared.config.all_accounts() {
+            for import in &account.imports {
+                if import.kind == Some(crate::config::ImportKind::Stream)
+                    && import.source_account == leaf_account
+                {
+                    let _ = try_send(handle, encode_ls_plus(&import.remote_subject, None));
+                }
+            }
         }
     }
 }

@@ -31,8 +31,11 @@
 //!   connection's reply inbox, and the client must re-issue Fetch.
 //!   Dedup ids are persisted (window restarts).
 //! - JetStream is per-node: streams capture messages published on the
-//!   hosting node, but `$JS.API` requests and `$JS.ACK` messages route
-//!   cluster-wide via the `$JS.API.>` interest the server advertises.
+//!   hosting node, and `$JS.API` requests and `$JS.ACK` messages for
+//!   a stream hosted elsewhere are forwarded cluster-wide (Phase 32
+//!   fixed this: the advertised `$JS.API.>` interest previously
+//!   never carried a request, because every request was consumed
+//!   locally first).
 //!   Streams are account-scoped (Phase 14); stream names are
 //!   node-global.
 //! - Retention: limits and workqueue (deleted after first ack; ack
@@ -89,11 +92,13 @@
 
 mod api;
 mod consumer;
+mod mirror;
 mod storage;
 mod stream;
 
 pub use self::api::handle_message;
 pub use self::consumer::redelivery_loop;
+pub(crate) use self::mirror::mirror_loop;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -250,6 +255,13 @@ pub(crate) struct SourceCfg {
     pub(crate) start_seq: u64,
     pub(crate) start_time_ns: u64,
     pub(crate) live: bool,
+    /// Phase 32: true when the origin stream is not on this node.
+    /// Such a link is served by the cross-node mirror loop (a durable
+    /// pull consumer on the origin node) instead of the same-node
+    /// capture hook; `copy_to_dependents` and `backfill` only follow
+    /// local links, and `remote` links are persisted so a restart
+    /// resumes them. False for every same-node link.
+    pub(crate) remote: bool,
 }
 
 pub(crate) struct Stream {
@@ -297,6 +309,12 @@ pub(crate) struct Stream {
     pub(crate) deny_delete: bool,
     pub(crate) deny_purge: bool,
     pub(crate) allow_rollup_hdrs: bool,
+    /// Phase 32: last origin sequence stored per remote link
+    /// (origin stream name -> origin seq), for pull-loop dedup.
+    /// Persisted in stream meta so a mirror-node restart does not
+    /// re-store already-copied messages when the origin consumer
+    /// itself was lost (origin restart without a store dir).
+    pub(crate) remote_progress: std::collections::HashMap<String, u64>,
     /// Phase 30: set when messages were renumbered in place
     /// (filtered purge), forcing the WAL writer to rewrite this
     /// stream's `msgs.wal` instead of trusting the append-only
@@ -508,6 +526,7 @@ pub(crate) fn parse_source_cfg(v: &Value) -> Option<SourceCfg> {
         start_seq: v.get("opt_start_seq").and_then(|n| n.as_u64()).unwrap_or(0),
         start_time_ns,
         live: true,
+        remote: false,
     })
 }
 

@@ -481,3 +481,365 @@ async fn mirror_survives_restart_and_resumes_live_copy() {
     srv.shutdown().await.expect("shutdown");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 32: cross-node mirroring/sourcing (routes and leafs)
+// ---------------------------------------------------------------------------
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn cluster_js_config(cluster_port: u16, routes: Vec<String>) -> Config {
+    Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        cluster_host: "127.0.0.1".into(),
+        cluster_port,
+        routes,
+        jetstream: true,
+        ..Default::default()
+    }
+}
+
+async fn two_js_nodes() -> (
+    rust_natsd::server::RunningServer,
+    rust_natsd::server::RunningServer,
+) {
+    let n1 = server::start(cluster_js_config(free_port(), vec![]))
+        .await
+        .expect("node1 starts");
+    let n1_cluster = n1.cluster_addr.unwrap();
+    let n2 = server::start(cluster_js_config(
+        free_port(),
+        vec![format!("nats://{n1_cluster}")],
+    ))
+    .await
+    .expect("node2 starts");
+    // Route establishment before any STREAM.CREATE that must be
+    // treated as remote (has_peers) rather than rejected 404.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    (n1, n2)
+}
+
+async fn connect_js(srv: &rust_natsd::server::RunningServer) -> jetstream::Context {
+    let client = async_nats::connect(format!("nats://{}", srv.addr))
+        .await
+        .expect("connects");
+    jetstream::new(client)
+}
+
+#[tokio::test]
+async fn cross_node_js_api_forwards_to_hosting_node() {
+    let (n1, n2) = two_js_nodes().await;
+    let js1 = connect_js(&n1).await;
+    js1.create_stream(jetstream::stream::Config {
+        name: "ORIG".into(),
+        subjects: vec!["orig.>".into()],
+        ..Default::default()
+    })
+    .await
+    .expect("create origin on node1");
+    publish(&js1, "orig.a", "o1").await;
+    // From node 2, STREAM.INFO for a stream hosted on node 1 must be
+    // forwarded (not answered 404 locally) and report the message.
+    let js2 = connect_js(&n2).await;
+    let mut info = js2.get_stream("ORIG").await.expect("stream info forwards");
+    // The info call itself may race the publish ack; poll the count.
+    for _ in 0..50 {
+        let i = info.info().await.expect("info");
+        if i.state.messages == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let i = info.info().await.expect("info");
+    assert_eq!(i.state.messages, 1);
+    n2.shutdown().await.expect("shutdown");
+    n1.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cross_node_mirror_backfill_and_live_copy() {
+    let (n1, n2) = two_js_nodes().await;
+    let js1 = connect_js(&n1).await;
+    js1.create_stream(jetstream::stream::Config {
+        name: "ORIG".into(),
+        subjects: vec!["orig.>".into()],
+        ..Default::default()
+    })
+    .await
+    .expect("create origin");
+    publish(&js1, "orig.a", "o1").await;
+    publish(&js1, "orig.b", "o2").await;
+    publish(&js1, "orig.a", "o3").await;
+
+    let js2 = connect_js(&n2).await;
+    let mut mirror = js2
+        .create_stream(jetstream::stream::Config {
+            name: "MIRROR".into(),
+            mirror: Some(Source {
+                name: "ORIG".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("create remote mirror");
+    // Backfill is pulled by the mirror loop (consumer replay), so it
+    // lands asynchronously, unlike the same-node synchronous copy.
+    wait_msgs(&mut mirror, 3).await;
+    for (seq, subject, data) in [
+        (1, "orig.a", "o1"),
+        (2, "orig.b", "o2"),
+        (3, "orig.a", "o3"),
+    ] {
+        let msg = mirror
+            .get_raw_message(seq)
+            .await
+            .expect("MSG.GET on cross-node mirror");
+        assert_eq!(msg.subject.as_str(), subject);
+        assert_eq!(msg.payload.as_ref(), data.as_bytes());
+        assert!(
+            msg.headers.get("Nats-Stream-Source").is_none(),
+            "mirror copies carry no source header"
+        );
+    }
+    publish(&js1, "orig.b", "o4").await;
+    wait_msgs(&mut mirror, 4).await;
+    let msg = mirror.get_raw_message(4).await.expect("live copy");
+    assert_eq!(msg.subject.as_str(), "orig.b");
+    assert_eq!(msg.payload.as_ref(), b"o4");
+    n2.shutdown().await.expect("shutdown");
+    n1.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cross_node_source_filter_and_start_seq() {
+    let (n1, n2) = two_js_nodes().await;
+    let js1 = connect_js(&n1).await;
+    js1.create_stream(jetstream::stream::Config {
+        name: "ORIGF".into(),
+        subjects: vec!["of.>".into()],
+        ..Default::default()
+    })
+    .await
+    .expect("create origin");
+    publish(&js1, "of.a", "fa1").await;
+    publish(&js1, "of.b", "fb1").await;
+    publish(&js1, "of.a", "fa2").await;
+
+    let js2 = connect_js(&n2).await;
+    let mut srcf = js2
+        .create_stream(jetstream::stream::Config {
+            name: "SRCF".into(),
+            sources: Some(vec![Source {
+                name: "ORIGF".into(),
+                filter_subject: Some("of.a".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        })
+        .await
+        .expect("create remote source");
+    wait_msgs(&mut srcf, 2).await;
+    publish(&js1, "of.b", "fb2").await;
+    publish(&js1, "of.a", "fa3").await;
+    wait_msgs(&mut srcf, 3).await;
+    for (seq, data) in [(1, "fa1"), (2, "fa2"), (3, "fa3")] {
+        let msg = srcf.get_raw_message(seq).await.expect("filtered copy");
+        assert_eq!(msg.payload.as_ref(), data.as_bytes());
+    }
+    let msg = srcf.get_raw_message(1).await.expect("source header");
+    let header = msg
+        .headers
+        .get("Nats-Stream-Source")
+        .expect("Nats-Stream-Source header")
+        .as_str();
+    assert!(
+        header.starts_with("ORIGF 1 "),
+        "source header starts with origin + origin seq, got {header}"
+    );
+
+    // Start sequence on a second remote source of the same origin.
+    let mut srcs = js2
+        .create_stream(jetstream::stream::Config {
+            name: "SRCS".into(),
+            sources: Some(vec![Source {
+                name: "ORIGF".into(),
+                start_sequence: Some(3),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        })
+        .await
+        .expect("create start_seq source");
+    // ORIGF sequences: 1=fa1, 2=fb1, 3=fa2, 4=fb2, 5=fa3.
+    wait_msgs(&mut srcs, 3).await;
+    for (seq, data) in [(1, "fa2"), (2, "fb2"), (3, "fa3")] {
+        let msg = srcs.get_raw_message(seq).await.expect("start_seq copy");
+        assert_eq!(msg.payload.as_ref(), data.as_bytes());
+    }
+    n2.shutdown().await.expect("shutdown");
+    n1.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cross_node_mirror_of_nonexistent_stays_empty() {
+    // Phase 32 behaviour change, documented in PLAN: with peers, the
+    // creating node cannot synchronously verify a remote origin, so
+    // creation succeeds and the mirror stays empty (Go's behaviour);
+    // the same-node 404 deviation is preserved only without peers
+    // (see mirror_source_of_nonexistent_stream_rejected).
+    let (n1, n2) = two_js_nodes().await;
+    let js2 = connect_js(&n2).await;
+    let mut bad = js2
+        .create_stream(jetstream::stream::Config {
+            name: "BADM".into(),
+            mirror: Some(Source {
+                name: "NOPE".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("remote mirror creation is accepted");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let info = bad.info().await.expect("info");
+    assert_eq!(info.state.messages, 0, "no origin, no copies");
+    drop(n1);
+    n2.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn leaf_node_mirror_of_hub_stream() {
+    // $G-only hub/leaf pair: the leaf mirror loop's CONSUMER.CREATE
+    // and MSG.NEXT ride the leaf connection via $JS.API.> interest,
+    // and pull deliveries return on the loopback client's inbox.
+    let hub = server::start(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        cluster_port: 0,
+        leaf_port: free_port(),
+        jetstream: true,
+        ..Default::default()
+    })
+    .await
+    .expect("hub starts");
+    let hub_leaf = hub.leaf_addr.unwrap();
+    let leaf = server::start(Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        cluster_port: 0,
+        leaf_urls: vec![format!("nats://{hub_leaf}")],
+        jetstream: true,
+        ..Default::default()
+    })
+    .await
+    .expect("leaf starts");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let js_hub = connect_js(&hub).await;
+    js_hub
+        .create_stream(jetstream::stream::Config {
+            name: "ORIG".into(),
+            subjects: vec!["orig.>".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("create origin on hub");
+    publish(&js_hub, "orig.a", "l1").await;
+    publish(&js_hub, "orig.a", "l2").await;
+
+    let js_leaf = connect_js(&leaf).await;
+    let mut mirror = js_leaf
+        .create_stream(jetstream::stream::Config {
+            name: "MIRROR".into(),
+            mirror: Some(Source {
+                name: "ORIG".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("create mirror on leaf");
+    wait_msgs(&mut mirror, 2).await;
+    publish(&js_hub, "orig.a", "l3").await;
+    wait_msgs(&mut mirror, 3).await;
+    let msg = mirror.get_raw_message(3).await.expect("live leaf copy");
+    assert_eq!(msg.payload.as_ref(), b"l3");
+    leaf.shutdown().await.expect("shutdown");
+    hub.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cross_node_mirror_resumes_after_origin_restart() {
+    // Origin node with a store dir (so its consumer survives the
+    // restart): the mirror link must resume, not duplicate or lose.
+    let dir = tmpdir("xnode-mirror-restart");
+    let n1_cluster_port = free_port();
+    let mk_n1 = || {
+        server::start(Config {
+            host: "127.0.0.1".into(),
+            port: 0,
+            cluster_host: "127.0.0.1".into(),
+            cluster_port: n1_cluster_port,
+            jetstream: true,
+            js_store_dir: Some(dir.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+    };
+    let n1 = mk_n1().await.expect("node1 starts");
+    let n2 = server::start(cluster_js_config(
+        free_port(),
+        vec![format!("nats://127.0.0.1:{n1_cluster_port}")],
+    ))
+    .await
+    .expect("node2 starts");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let js1 = connect_js(&n1).await;
+    js1.create_stream(jetstream::stream::Config {
+        name: "ORIG".into(),
+        subjects: vec!["orig.>".into()],
+        ..Default::default()
+    })
+    .await
+    .expect("create origin");
+    publish(&js1, "orig.a", "r1").await;
+    let js2 = connect_js(&n2).await;
+    let mut mirror = js2
+        .create_stream(jetstream::stream::Config {
+            name: "MIRROR".into(),
+            mirror: Some(Source {
+                name: "ORIG".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("create remote mirror");
+    wait_msgs(&mut mirror, 1).await;
+
+    // Restart the origin node (same cluster port, so node 2's route
+    // solicitation reconnects); the mirror loop reuses the origin
+    // consumer and resumes.
+    drop(js1);
+    n1.shutdown().await.expect("shutdown origin");
+    let n1b = mk_n1().await.expect("origin restarts");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let js1b = connect_js(&n1b).await;
+    publish(&js1b, "orig.a", "r2").await;
+    wait_msgs(&mut mirror, 2).await;
+    let msg = mirror.get_raw_message(1).await.expect("first copy kept");
+    assert_eq!(msg.payload.as_ref(), b"r1");
+    let msg = mirror.get_raw_message(2).await.expect("resumed copy");
+    assert_eq!(msg.payload.as_ref(), b"r2");
+    n2.shutdown().await.expect("shutdown");
+    n1b.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}

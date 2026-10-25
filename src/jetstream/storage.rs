@@ -686,6 +686,7 @@ fn source_cfg_json(v: &SourceCfg) -> Value {
         "opt_start_seq": v.start_seq,
         "opt_start_time_ns": v.start_time_ns,
         "live": v.live,
+        "remote": v.remote,
     })
 }
 
@@ -718,6 +719,7 @@ pub(crate) fn stream_meta_json(s: &Stream) -> Value {
         "deny_delete": s.deny_delete,
         "deny_purge": s.deny_purge,
         "allow_rollup_hdrs": s.allow_rollup_hdrs,
+        "remote_progress": s.remote_progress.iter().map(|(k, v)| (k.clone(), json!(*v))).collect::<Value>(),
     })
 }
 
@@ -1332,6 +1334,7 @@ impl Engine {
                         .and_then(|n| n.as_u64())
                         .unwrap_or(0),
                     live: v.get("live").and_then(|n| n.as_bool()).unwrap_or(true),
+                    remote: v.get("remote").and_then(|n| n.as_bool()).unwrap_or(false),
                 }
             };
             let mirror = sv.get("mirror").and_then(|v| {
@@ -1392,6 +1395,15 @@ impl Engine {
                 deny_delete: get_b("deny_delete"),
                 deny_purge: get_b("deny_purge"),
                 allow_rollup_hdrs: get_b("allow_rollup_hdrs"),
+                remote_progress: sv
+                    .get("remote_progress")
+                    .and_then(|v| v.as_object())
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 wal_rewrite: false,
             };
             if stream.base_seq == 0 {
@@ -1695,6 +1707,7 @@ mod tests {
             deny_delete: false,
             deny_purge: false,
             allow_rollup_hdrs: false,
+            remote_progress: HashMap::new(),
             wal_rewrite: false,
         };
         stream.messages.push_back(stored(1, "s.a", "hello"));
@@ -1766,6 +1779,7 @@ mod tests {
             deny_delete: false,
             deny_purge: false,
             allow_rollup_hdrs: false,
+            remote_progress: HashMap::new(),
             wal_rewrite: false,
         };
         store.save_stream_meta(&stream).unwrap();
