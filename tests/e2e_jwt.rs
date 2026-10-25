@@ -848,18 +848,11 @@ async fn go_rejects_expired_rust_generated_jwt() {
     drop(go);
 }
 
-// BUG (server, not test): JWT auth via the official Go client can never
-// succeed today. nats.go's UserJWT flow never sends a CONNECT `nkey`
-// field (UserJWT and Nkey are mutually exclusive in nats.go), but
-// rust-natsd's verify_user requires CONNECT nkey == JWT sub. Go's own
-// server derives the user key from the JWT sub claim instead. This
-// test reproduces the Go-client shape (jwt + nonce signature, no nkey
-// field) and is ignored until the server derives the key from sub.
-// The Go program mode `jwt` in e2e/go/advanced.go is the same
-// reproduction via nats.go and is likewise not wired into
-// scripts/e2e-go-advanced.sh yet.
+// Go-client shape (jwt + nonce signature, no nkey field): nats.go's
+// UserJWT never sends a CONNECT `nkey` field (UserJWT and Nkey are
+// mutually exclusive there); the server derives the user key from
+// the JWT `sub` claim, as Go's server does (Phase 28B).
 #[tokio::test]
-#[ignore = "JWT auth requires CONNECT nkey == sub; nats.go UserJWT never sends nkey"]
 async fn jwt_login_without_nkey_field_authenticates() {
     let fx = fixture();
     let srv = server::start(jwt_config(&fx, vec![]))

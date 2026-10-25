@@ -97,11 +97,6 @@ README, and PLAN agree. They do not fail the parity run, because the
 parity probes do not cover them — that is a coverage statement, not
 a claim that they match Go.
 
-- **JWT auth via the official Go client never succeeds.** nats.go
-  UserJWT never sends a CONNECT `nkey` field, but rust-natsd
-  requires `nkey == JWT sub` (test
-  `jwt_login_without_nkey_field_authenticates`, `#[ignore]`d;
-  fix: derive the user key from the JWT `sub`, as Go does).
 - **CONSUMER.INFO `num_pending` hardcoded to 0**;
   `num_ack_pending` is real.
 - **Deliberate deviations from Go** (verified against 2.15.1):

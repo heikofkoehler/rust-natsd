@@ -19,7 +19,12 @@
 //!   of the JWT chain, the client must also prove possession of the
 //!   user private key by signing the per-connection INFO nonce (the
 //!   existing standalone-nkey check): a `jwt` field alone, or with a
-//!   missing/invalid nonce signature, never authenticates.
+//!   missing/invalid nonce signature, never authenticates. The key
+//!   for that signature is the JWT `sub` claim: when CONNECT carries
+//!   an `nkey` field it must equal `sub` (Phase 28B), and when it
+//!   does not — the shape nats.go's UserJWT always sends, since
+//!   UserJWT and Nkey are mutually exclusive there — the key is
+//!   derived directly from `sub`, as Go's server does.
 //!
 //! Time validation: `exp` in the past rejects (no leeway — stricter
 //! than any clock-skew allowance Go might grant, which can only make
@@ -556,11 +561,17 @@ impl OperatorTrust {
         }
         match expected_nkey {
             Some(nkey) if nkey == sub => {}
-            _ => {
+            Some(_) => {
                 return Err("CONNECT nkey does not match the user JWT sub".to_string());
             }
+            // No nkey field: derive the user key from the JWT sub
+            // (nats.go UserJWT shape, Go server behaviour). The
+            // nonce signature below is still verified against that
+            // key, so a JWT alone never authenticates.
+            None => {}
         }
-        // Possession proof: the INFO nonce signed with the user key.
+        // Possession proof: the INFO nonce signed with the user key
+        // (the JWT sub, whether or not CONNECT carried an nkey).
         // Missing nonce, missing sig, or a bad sig all reject — a JWT
         // alone never authenticates.
         let (Some(nonce), Some(sig)) = (nonce, sig_b64) else {

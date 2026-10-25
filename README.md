@@ -65,7 +65,7 @@ rust-natsd does; it replaces the older support table.
 | Protocol errors | Implemented | Go's exact `-ERR` texts; malformed `CONNECT` closes silently, like Go |
 | Auth: `--user/--pass`, `--auth-token` | Implemented | Token only via `auth_token`, matching Go (token-as-password is rejected) |
 | NKey auth | Implemented | Per-connection `nonce` in `INFO`, `nkey`/`sig` in `CONNECT`, verified with the `nkeys` crate; standalone nkey users only |
-| JWT operator mode | Implemented | `src/jwt.rs`: operator → account → user Ed25519 chain verified with the existing `nkeys` crate (no new dependency); header must be `typ: JWT` / `alg: ed25519-nkey`, `exp` in the past / `nbf` in the future / `iat` >60 s in the future all reject, any failure rejects with no fallback. User JWTs additionally require the INFO-nonce signature (a `jwt` field alone never authenticates; `bearer_token` is not honored — the nonce signature is always required). User pub/sub claims apply, falling back per-axis to the account JWT's `default_permissions`; account JWT imports/exports reuse the area-6 machinery (see `Config::all_accounts`). `.conf`: `operator: "<jwt>"` (Go inline shape) or `operator { jwt \| jwt_file, accounts: [...] }`, plus Go's `resolver { type: memory }` + top-level `resolver_preload: { <pubkey>: "<jwt>" }` (Go v2.15.1's real preload key, probed — a `preload` map inside `resolver` is also accepted). Verified against Go 2.15.1: Rust-generated JWTs are accepted by Go (pub/sub delivery works) and expired ones rejected. Go-shape notes: claim `name` is top-level (also accepted inside `nats`); account limits keys are `conn`/`subs`/`payload`/`data`/`leaf`/`imports`/`exports` with -1 = unlimited and absent = 0 (enforced by Go, ignored by rust-natsd); a Go export with no `accounts` field authorizes any importer, while a present list restricts to it. Not implemented: account-JWT `limits` enforcement, user `revocations` lists (revocation here = removing the account JWT from trust), and `$SYS` special-casing (the system account is an ordinary JWT account) |
+| JWT operator mode | Implemented | `src/jwt.rs`: operator → account → user Ed25519 chain verified with the existing `nkeys` crate (no new dependency); header must be `typ: JWT` / `alg: ed25519-nkey`, `exp` in the past / `nbf` in the future / `iat` >60 s in the future all reject, any failure rejects with no fallback. User JWTs additionally require the INFO-nonce signature (a `jwt` field alone never authenticates; `bearer_token` is not honored — the nonce signature is always required, Phase 28C changes this). When CONNECT carries an `nkey` it must equal the JWT `sub`; when it does not (nats.go UserJWT shape), the key is derived from `sub` (Phase 28B). User pub/sub claims apply, falling back per-axis to the account JWT's `default_permissions`; account JWT imports/exports reuse the area-6 machinery (see `Config::all_accounts`). `.conf`: `operator: "<jwt>"` (Go inline shape) or `operator { jwt \| jwt_file, accounts: [...] }`, plus Go's `resolver { type: memory }` + top-level `resolver_preload: { <pubkey>: "<jwt>" }` (Go v2.15.1's real preload key, probed — a `preload` map inside `resolver` is also accepted). Verified against Go 2.15.1: Rust-generated JWTs are accepted by Go (pub/sub delivery works) and expired ones rejected. Go-shape notes: claim `name` is top-level (also accepted inside `nats`); account limits keys are `conn`/`subs`/`payload`/`data`/`leaf`/`imports`/`exports` with -1 = unlimited and absent = 0 (enforced by Go, ignored by rust-natsd); a Go export with no `accounts` field authorizes any importer, while a present list restricts to it. Not implemented: account-JWT `limits` enforcement, user `revocations` lists (revocation here = removing the account JWT from trust), and `$SYS` special-casing (the system account is an ordinary JWT account) |
 | Multi-account + pub/sub allow/deny | Implemented | `accounts {}` in `.conf` (per-user `permissions` or account-level `authorization`), `system_account`, `no_auth_user`; subscriptions/deliveries/routes/leafs/JetStream scoped per account; Go's exact permission-violation `-ERR` text, connection stays alive |
 | Account imports/exports (service + stream) | Implemented (same node) | `accounts { NAME { exports: [{service\|stream: "subj", accounts: ["B"]}], imports: [{service\|stream: {account: A, subject: "subj"}, to: "local"}] } }` — Go v2.15.1 `.conf` shape probed (`to`, not `local_subject`; the older spelling is accepted as an alias). Service requests are rewritten into the exporting account with a synthetic `_RIMPORT.<seq>` reply subject that routes replies back; stream publishes are copied to the importer's local subject. Unauthorized imports (account not listed, remote pattern not covered by the export) are dropped, never delivered; the importing account's publish allow/deny is checked on the local subject and the responder's subscribe allow/deny on the exported subject. Same-node only: imports do not cross routes/leafs, and route/leaf-origin messages do not fan out to stream importers. Reply mappings are retained for the server lifetime (Go's `_R_.` mappings expire by TTL) |
 | TLS client connections | Implemented | `--tls/--tlscert/--tlskey/--tlsverify/--tlscacert`, `tls {}` in `.conf`, `tls_required` in `INFO`; STARTTLS order (plaintext `INFO` first, then upgrade), matching Go |
@@ -277,21 +277,9 @@ limit (see PLAN Phase 18).
 
 ## Known issues and limitations
 
-These are known, not hidden. The remaining one is covered by a test
-that is committed `#[ignore]`d naming the bug, so the suite stays
-green without pretending it passes.
+These are known, not hidden. There are currently no `#[ignore]`d
+tests in the suite.
 
-- **JWT auth via the official Go client can never succeed.** nats.go's
-  `UserJWT` flow never sends a CONNECT `nkey` field (UserJWT and
-  Nkey are mutually exclusive in nats.go), but rust-natsd's
-  `verify_user` requires CONNECT `nkey == JWT sub`, so every
-  Go-JWT login fails with `-ERR 'Authorization Violation'` (test
-  `jwt_login_without_nkey_field_authenticates` in
-  `tests/e2e_jwt.rs`, ignored; the Go JWT mode in
-  `e2e/go/advanced.go` is deliberately unwired from
-  `scripts/e2e-go-advanced.sh` until this is fixed). Fix: derive
-  the user key from the JWT `sub` claim, as Go does. Note the
-  reverse direction works: Rust-generated JWTs are accepted by Go.
 - **CONSUMER.INFO `num_pending` is hardcoded to 0** (in
   `src/jetstream.rs`); `num_ack_pending` is real.
 - **Deliberate deviations from Go** (all verified against Go

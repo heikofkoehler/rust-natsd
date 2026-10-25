@@ -946,6 +946,27 @@ for current behaviour.
 - Docs synced in the same commit: README feature matrix and Known
   issues (max_deliver bullet removed), `parity/KNOWN_DIFFS.md`.
 
+### Phase 28B — Go-client UserJWT login without CONNECT.nkey (2026-10-25)
+- `src/jwt.rs` `verify_user`: when CONNECT carries `nkey` it must
+  still equal the user JWT `sub` (a mismatched nkey rejects, as
+  before); when it carries none, the nonce-signature key is
+  derived from `sub` itself. The signature is still required and
+  still verified against the INFO nonce, so a JWT alone never
+  authenticates — only the key source changed, matching Go's
+  server (nats.go UserJWT and Nkey are mutually exclusive, so the
+  Go client shape never sends `nkey`).
+- Tests: `#[ignore]` removed from
+  `jwt_login_without_nkey_field_authenticates` in
+  `tests/e2e_jwt.rs`; the JWT mode in `e2e/go/advanced.go` is now
+  wired into `scripts/e2e-go-advanced.sh` (it was deliberately
+  unwired while the bug was open, and its stale "reproduces a bug"
+  comment is updated). No new test file layout was invented:
+  the mode already existed in `advanced.go` (there is no
+  `e2e/go/main_test.go`).
+- Docs synced in the same commit: README feature matrix and Known
+  issues (JWT bullet removed; the suite now has no `#[ignore]`d
+  tests), `parity/KNOWN_DIFFS.md`.
+
 ## Future work (not in this plan)
 - Gateways (Phase 24) and JetStream clustering/replication
   (Phase 25): documented remainders with design notes, not
@@ -954,8 +975,8 @@ for current behaviour.
   JWT imports across routes/leafs, MQTT/WebSocket gateways,
   XKeys, cert-to-user mapping on route/leaf connections,
   KV/object-store client-helper verification.
-- The remaining ignored-test bug from Phase 26 (Go-client JWT
-  login) — Phase 28B, not a feature.
+- Phase 28C (num_pending, import reply TTL, JWT/conf enforcement)
+  remains.
 
 ## Design notes
 - Single shared subscription registry behind a lock; delivery resolves the

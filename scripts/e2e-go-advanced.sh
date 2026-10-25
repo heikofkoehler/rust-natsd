@@ -58,10 +58,7 @@ done
 cd e2e/go
 go run . -addr nats://127.0.0.1:14250 -mode imports
 go run . -addr nats://127.0.0.1:14250 -mode mirror
-# NOTE: the jwt mode is intentionally NOT run yet. It reproduces a
-# real server bug: nats.go UserJWT never sends a CONNECT nkey field,
-# but rust-natsd requires nkey == JWT sub (see the ignored
-# jwt_login_without_nkey_field_authenticates test in tests/e2e_jwt.rs).
-# Wire this back in once the server derives the key from the JWT sub:
-# go run . -addr nats://127.0.0.1:14251 -mode jwt -creds "$TMPDIR_WORK/creds.json"
+# JWT mode: nats.go UserJWT (no CONNECT nkey field) against the
+# JWT-operator server; fixed in Phase 28B (key derived from JWT sub).
+go run . -addr nats://127.0.0.1:14251 -mode jwt -creds "$TMPDIR_WORK/creds.json"
 echo "GO ADVANCED E2E: OK"

@@ -114,11 +114,10 @@ func genjwtMode() {
 	fmt.Println("PASS genjwt wrote conf and creds")
 }
 
-// jwtMode reproduces a server bug (see the ignored Rust test
+// jwtMode exercises the Go-client JWT shape (see the Rust test
 // jwt_login_without_nkey_field_authenticates): nats.go UserJWT never
-// sends a CONNECT nkey field, but rust-natsd requires nkey == JWT sub,
-// so this currently fails with Authorization Violation. It is kept so
-// the fix can be verified by wiring it into scripts/e2e-go-advanced.sh.
+// sends a CONNECT nkey field; since Phase 28B the server derives the
+// user key from the JWT sub, as Go's server does, so this connects.
 func jwtMode(url string) {
 	raw, err := os.ReadFile(*advCreds)
 	check("jwt creds read", err)
