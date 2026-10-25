@@ -64,9 +64,12 @@
 //!   implemented and is rejected at creation.
 //! - KV is not a separate implementation: a KV bucket is a plain stream
 //!   named `KV_<bucket>` with subjects `$KV.<bucket>.>`; the primitives
-//!   KV needs (headers on stored messages, `MSG.GET` with `last_by_subj`)
-//!   are implemented, but the nats.go/async-nats KV client helpers are
-//!   not verified against this server.
+//!   KV needs (headers on stored messages, `MSG.GET` with `last_by_subj`,
+//!   `DIRECT.GET`, rollup, deny flags — Phase 31) are implemented,
+//!   and the async-nats KV helpers are verified against this server
+//!   (`tests/e2e_js_kv.rs`). The nats.go KV helpers are still
+//!   version-gated (server 0.1.0 < 2.6.2); see PLAN Phase 31 and
+//!   `parity/KNOWN_DIFFS.md`.
 //!
 //! Phase 29 layout: this module is the public facade (`JetStream` handle
 //! and lock coordinator) plus the shared engine types (`Engine`, `Stream`,
@@ -283,6 +286,17 @@ pub(crate) struct Stream {
     /// per-origin-stream id; this one is generated at creation and
     /// persisted).
     pub(crate) source_token: String,
+    /// Phase 31: direct-get / deny / rollup config, from
+    /// STREAM.CREATE/UPDATE. `allow_direct` gates `$JS.API.DIRECT.GET`
+    /// on this stream; `mirror_direct` gates it on a mirror stream;
+    /// `deny_delete` rejects STREAM.MSG.DELETE; `deny_purge` rejects
+    /// STREAM.PURGE; `allow_rollup_hdrs` permits `Nats-Rollup`
+    /// publishes (which otherwise fail with 500/10111).
+    pub(crate) allow_direct: bool,
+    pub(crate) mirror_direct: bool,
+    pub(crate) deny_delete: bool,
+    pub(crate) deny_purge: bool,
+    pub(crate) allow_rollup_hdrs: bool,
     /// Phase 30: set when messages were renumbered in place
     /// (filtered purge), forcing the WAL writer to rewrite this
     /// stream's `msgs.wal` instead of trusting the append-only
@@ -616,6 +630,27 @@ impl Stream {
             .map(|m| m.seq)
     }
 
+    /// Last live (non-deleted) message for a subject pattern: exact
+    /// match for a literal subject, wildcard match otherwise. Shared
+    /// by MSG.GET `last_by_subj` and DIRECT.GET's subject form, so a
+    /// message deleted via STREAM.MSG.DELETE is not resurfaced by
+    /// either (Go returns not-found for it, probed against v2.15.1).
+    pub(crate) fn last_for_subject(&self, subject: &str) -> Option<&StoredMsg> {
+        if subject.contains('*') || subject.contains('>') {
+            self.messages
+                .iter()
+                .rev()
+                .filter(|m| !self.deleted.contains(&m.seq))
+                .find(|m| subject_matches(subject, &m.subject))
+        } else {
+            self.messages
+                .iter()
+                .rev()
+                .filter(|m| !self.deleted.contains(&m.seq))
+                .find(|m| m.subject == subject)
+        }
+    }
+
     pub(crate) fn info_json(&self) -> Value {
         let first_ts = self
             .messages
@@ -643,12 +678,12 @@ impl Stream {
                 "num_replicas": 1,
                 "duplicate_window": 120_000_000_000i64,
                 "compression": "none",
-                "allow_direct": false,
-                "mirror_direct": false,
+                "allow_direct": self.allow_direct,
+                "mirror_direct": self.mirror_direct,
                 "sealed": false,
-                "deny_delete": false,
-                "deny_purge": false,
-                "allow_rollup_hdrs": false,
+                "deny_delete": self.deny_delete,
+                "deny_purge": self.deny_purge,
+                "allow_rollup_hdrs": self.allow_rollup_hdrs,
                 "consumer_limits": {},
                 "allow_msg_ttl": false,
                 "mirror": self.mirror.as_ref().map(source_cfg_json),

@@ -52,6 +52,15 @@ pub struct Message {
     /// into the exporting account): it must not be service-translated
     /// a second time, but it may still fan out to stream importers.
     pub service_translated: bool,
+    /// Phase 31: when set, sublist matching routes on this subject
+    /// while frames still carry `subject`. JetStream consumer
+    /// deliveries need it: the frame subject must be the original
+    /// stream message subject (clients read it — async-nats KV
+    /// Watch derives the key from it), but the only subscription
+    /// that must receive it is the consumer's deliver subject /
+    /// pull reply inbox. Without the override the server used to
+    /// send the inbox as the frame subject, which broke Watch.
+    pub route_via: Option<String>,
 }
 
 impl Message {
@@ -70,11 +79,17 @@ impl Message {
             no_responders: false,
             import_copy: false,
             service_translated: false,
+            route_via: None,
         }
     }
 
     pub fn with_account(mut self, account: &str) -> Self {
         self.account = account.to_string();
+        self
+    }
+
+    pub fn with_route_via(mut self, via: &str) -> Self {
+        self.route_via = Some(via.to_string());
         self
     }
 
@@ -143,6 +158,35 @@ pub fn deliver(
             // also delivered as ordinary messages.
             return true;
         }
+    }
+
+    // Phase 31 consumer deliveries (see `route_via`): route on the
+    // deliver subject / pull reply inbox, but frame with the
+    // original subject. Local-only, like `deliver_stream_copy`:
+    // never service-translated, never forwarded to routes/leafs
+    // (a JS delivery to a local inbox is not a publish on the
+    // original subject), and never a no-responders case.
+    if let Some(via) = msg.route_via.clone() {
+        let (deliveries, expired) = {
+            let mut sl = shared.sublist.write().unwrap();
+            let gm = sl.match_groups(&via, u64::MAX, true, Some(&msg.account));
+            let mut deliveries = gm.plain;
+            for members in gm.groups.values() {
+                if !members.is_empty() {
+                    let cursor = shared.queue_cursor.fetch_add(1, Ordering::SeqCst);
+                    deliveries.push(members[(cursor as usize) % members.len()].clone());
+                }
+            }
+            let expired = sl.note_deliveries(&deliveries);
+            (deliveries, expired)
+        };
+        send_local_frames(shared, msg, &deliveries);
+        cleanup_expired(shared, &expired);
+        shared
+            .stats
+            .out_msgs
+            .fetch_add(deliveries.len() as u64, Ordering::Relaxed);
+        return !deliveries.is_empty();
     }
 
     let (publisher_conn, publisher_echo) = match origin {

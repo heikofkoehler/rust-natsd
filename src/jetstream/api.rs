@@ -75,6 +75,13 @@ pub(crate) fn parse_u64(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
+/// Stream-config boolean: present JSON bool, else `default`.
+/// async-nats serializes `allow_rollup` as `allow_rollup_hdrs`;
+/// Go/nats.go use the same five names.
+pub(crate) fn cfg_bool(body: &Value, key: &str, default: bool) -> bool {
+    body.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('.')
@@ -130,12 +137,15 @@ impl Engine {
             // below matches Go's shape for that subject.
             ["INFO"] => "account_info",
             ["STREAM", "CREATE", ..] => "stream_create",
+            ["STREAM", "UPDATE", ..] => "stream_update",
             ["STREAM", "INFO", ..] => "stream_info",
             ["STREAM", "LIST"] => "stream_list",
             ["STREAM", "NAMES"] => "stream_names",
             ["STREAM", "DELETE", ..] => "stream_delete",
             ["STREAM", "PURGE", ..] => "stream_purge",
             ["STREAM", "MSG", "GET", ..] => "stream_msg_get",
+            ["STREAM", "MSG", "DELETE", ..] => "stream_msg_delete",
+            ["DIRECT", "GET", ..] => "direct_get",
             ["CONSUMER", "CREATE", ..] => "consumer_create",
             ["CONSUMER", "DURABLE", "CREATE", ..] => "consumer_create",
             ["CONSUMER", "INFO", ..] => "consumer_info",
@@ -175,6 +185,9 @@ impl Engine {
                     .to_string();
                 self.api_stream_create(&msg.account, &name, &body, &reply, &type_name, actions);
             }
+            ["STREAM", "UPDATE", name] => {
+                self.api_stream_update(&msg.account, name, &body, &reply, &type_name, actions);
+            }
             ["STREAM", "INFO", name] => {
                 self.api_stream_info(&msg.account, name, &reply, &type_name, actions)
             }
@@ -192,6 +205,22 @@ impl Engine {
             }
             ["STREAM", "MSG", "GET", name] => {
                 self.api_stream_msg_get(&msg.account, name, &body, &reply, &type_name, actions)
+            }
+            ["STREAM", "MSG", "DELETE", name] => {
+                self.api_stream_msg_delete(&msg.account, name, &body, &reply, &type_name, actions)
+            }
+            // $JS.API.DIRECT.GET.<stream> (JSON body: seq /
+            // next_by_subj / last_by_subj) and
+            // $JS.API.DIRECT.GET.<stream>.<last_by_subj subject...>
+            // (empty body). The subject tokens are joined back with
+            // '.' because KV subjects themselves contain dots.
+            ["DIRECT", "GET", name, rest @ ..] => {
+                let last = if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.join("."))
+                };
+                self.api_direct_get(&msg.account, name, last.as_deref(), &body, &reply, actions);
             }
             // The consumer name is parts[3] when present; clients
             // append the filter subject as further tokens
@@ -440,6 +469,11 @@ impl Engine {
             mirror: mirror.clone(),
             sources: sources.clone(),
             source_token: make_source_token(name, created_ns),
+            allow_direct: cfg_bool(body, "allow_direct", false),
+            mirror_direct: cfg_bool(body, "mirror_direct", false),
+            deny_delete: cfg_bool(body, "deny_delete", false),
+            deny_purge: cfg_bool(body, "deny_purge", false),
+            allow_rollup_hdrs: cfg_bool(body, "allow_rollup_hdrs", false),
             wal_rewrite: false,
         };
         self.streams.insert(name.to_string(), stream);
@@ -455,6 +489,387 @@ impl Engine {
         }
         let info = self.streams.get(name).unwrap().info_json();
         api_response(account, reply, type_name, info, actions);
+    }
+
+    /// STREAM.UPDATE: replace mutable config on an existing stream,
+    /// preserving messages, consumers, creation time, and the
+    /// mirror/source links. Applied: subjects, retention (limits /
+    /// workqueue only), max_msgs, max_bytes, max_age,
+    /// max_msgs_per_subject, and the five Phase 31 flags.
+    /// Deliberately not applied (Go restricts them too, in various
+    /// ways): storage changes are ignored, and a mirror/sources
+    /// config naming a different origin than the current one is
+    /// rejected — relinking a live stream is not implemented.
+    pub(crate) fn api_stream_update(
+        &mut self,
+        account: &str,
+        name: &str,
+        body: &Value,
+        reply: &str,
+        type_name: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        if let Some(body_name) = body.get("name").and_then(|v| v.as_str()) {
+            if body_name != name {
+                api_error_action(
+                    account,
+                    reply,
+                    type_name,
+                    400,
+                    10002,
+                    "stream name in request does not match update subject",
+                    actions,
+                );
+                return;
+            }
+        }
+        let Some(stream) = self.stream_for_mut(name, account) else {
+            let (code, err_code, desc) = err_not_found("stream");
+            api_error_action(account, reply, type_name, code, err_code, &desc, actions);
+            return;
+        };
+        // Mirror/source relink rejection (name comparison only; a
+        // same-named link keeps its existing filter/start config).
+        let check_link =
+            |raw: Option<&Value>, current: &Option<SourceCfg>| -> Result<(), &'static str> {
+                let Some(raw) = raw.filter(|v| !v.is_null()) else {
+                    return Ok(());
+                };
+                let Some(new_name) = raw.get("name").and_then(|v| v.as_str()) else {
+                    return Err("mirror/source name is required");
+                };
+                match current {
+                    Some(cfg) if cfg.name == new_name => Ok(()),
+                    Some(_) => Err("mirror/source changes are not supported"),
+                    None => Err("mirror/source changes are not supported"),
+                }
+            };
+        if let Err(desc) = check_link(body.get("mirror"), &stream.mirror) {
+            api_error_action(account, reply, type_name, 400, 10002, desc, actions);
+            return;
+        }
+        if let Some(arr) = body.get("sources").and_then(|v| v.as_array()) {
+            if !arr.is_empty() {
+                if arr.len() != stream.sources.len() {
+                    api_error_action(
+                        account,
+                        reply,
+                        type_name,
+                        400,
+                        10002,
+                        "mirror/source changes are not supported",
+                        actions,
+                    );
+                    return;
+                }
+                for (raw, cur) in arr.iter().zip(stream.sources.iter()) {
+                    if raw.get("name").and_then(|v| v.as_str()) != Some(cur.name.as_str()) {
+                        api_error_action(
+                            account,
+                            reply,
+                            type_name,
+                            400,
+                            10002,
+                            "mirror/source changes are not supported",
+                            actions,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(subjects) = body.get("subjects").and_then(|v| v.as_array()) {
+            let subjects: Vec<String> = subjects
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if subjects.is_empty() && stream.mirror.is_none() && stream.sources.is_empty() {
+                api_error_action(
+                    account,
+                    reply,
+                    type_name,
+                    400,
+                    10002,
+                    "stream subjects are required",
+                    actions,
+                );
+                return;
+            }
+            if !subjects.is_empty() && stream.mirror.is_some() {
+                api_error_action(
+                    account,
+                    reply,
+                    type_name,
+                    400,
+                    10002,
+                    "stream mirrors can not contain subjects",
+                    actions,
+                );
+                return;
+            }
+            if !subjects.is_empty() {
+                stream.subjects = subjects;
+            }
+        }
+        if let Some(retention) = body.get("retention").and_then(|v| v.as_str()) {
+            if retention != "limits" && retention != "workqueue" {
+                api_error_action(
+                    account,
+                    reply,
+                    type_name,
+                    400,
+                    10002,
+                    "only limits and workqueue retention are supported",
+                    actions,
+                );
+                return;
+            }
+            stream.retention = retention.to_string();
+        }
+        if let Some(v) = body.get("max_msgs").and_then(|v| v.as_i64()) {
+            stream.max_msgs = v;
+        }
+        if let Some(v) = body.get("max_bytes").and_then(|v| v.as_i64()) {
+            stream.max_bytes = v;
+        }
+        if let Some(v) = body.get("max_age").and_then(|v| v.as_i64()) {
+            stream.max_age_ns = v;
+        }
+        if let Some(v) = body.get("max_msgs_per_subject").and_then(|v| v.as_i64()) {
+            stream.max_msgs_per_subject = v;
+        }
+        stream.allow_direct = cfg_bool(body, "allow_direct", stream.allow_direct);
+        stream.mirror_direct = cfg_bool(body, "mirror_direct", stream.mirror_direct);
+        stream.deny_delete = cfg_bool(body, "deny_delete", stream.deny_delete);
+        stream.deny_purge = cfg_bool(body, "deny_purge", stream.deny_purge);
+        stream.allow_rollup_hdrs = cfg_bool(body, "allow_rollup_hdrs", stream.allow_rollup_hdrs);
+        let info = stream.info_json();
+        api_response(account, reply, type_name, info, actions);
+    }
+
+    /// STREAM.MSG.DELETE: mark one sequence deleted in place (the
+    /// sequence gap stays, as Go does: first_seq jumps past a
+    /// deleted prefix). Error shapes probed against Go v2.15.1:
+    /// missing stream 404/10059; deny_delete 500/10057 "message
+    /// delete not permitted"; seq past the end 500/10057 "stream
+    /// store EOF"; deleted / pre-base seq 500/10057 "no message
+    /// found". `no_erase` is accepted and ignored: the message is
+    /// unretrievable either way, which is the client-visible part.
+    pub(crate) fn api_stream_msg_delete(
+        &mut self,
+        account: &str,
+        name: &str,
+        body: &Value,
+        reply: &str,
+        type_name: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(stream) = self.stream_for_mut(name, account) else {
+            let (code, err_code, desc) = err_not_found("stream");
+            api_error_action(account, reply, type_name, code, err_code, &desc, actions);
+            return;
+        };
+        if stream.deny_delete {
+            api_error_action(
+                account,
+                reply,
+                type_name,
+                500,
+                10057,
+                "message delete not permitted",
+                actions,
+            );
+            return;
+        }
+        let seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        if seq == 0 || seq > stream.last_seq() {
+            api_error_action(
+                account,
+                reply,
+                type_name,
+                500,
+                10057,
+                "stream store EOF",
+                actions,
+            );
+            return;
+        }
+        if seq < stream.base_seq || stream.deleted.contains(&seq) {
+            api_error_action(
+                account,
+                reply,
+                type_name,
+                500,
+                10057,
+                "no message found",
+                actions,
+            );
+            return;
+        }
+        stream.deleted.insert(seq);
+        api_response(
+            account,
+            reply,
+            type_name,
+            json!({ "success": true }),
+            actions,
+        );
+    }
+
+    /// DIRECT.GET: the raw-message endpoint modern KV
+    /// getters/watchers use when the stream has allow_direct (nats.go
+    /// `DirectGet`, async-nats `direct_get*`). Unlike MSG.GET it
+    /// returns the payload itself, with `Nats-Stream`,
+    /// `Nats-Sequence`, `Nats-Subject`, `Nats-Time-Stamp` headers
+    /// plus the stored message's own headers, exactly as Go
+    /// v2.15.1 does (probed). Error shapes are HMSG status lines,
+    /// because both clients parse the status from the version line:
+    /// - not servable (stream missing, or allow_direct off and not
+    ///   a mirror_direct mirror): `NATS/1.0 503` with no payload —
+    ///   Go answers this way too (no direct-get responder), so
+    ///   nats.go reports "no responders" and async-nats reports
+    ///   NoResponders on both servers.
+    /// - message not found: `NATS/1.0 404 Message Not Found`.
+    /// - empty request (no seq / next_by_subj / last_by_subj):
+    ///   `NATS/1.0 408 Empty Request`.
+    ///
+    /// Go difference, documented: Go lets a mirror answer direct
+    /// gets addressed to its origin (the `Nats-Stream` header then
+    /// names the mirror, which nats.go explicitly tolerates), and
+    /// answers nothing for a mirror's own name. Rust answers the
+    /// requested stream directly when it is servable, including a
+    /// mirror_direct mirror's own copies — the client-visible
+    /// outcome (message + valid headers) is the same, and the
+    /// mirror-name case is a permissive superset, not a gap.
+    pub(crate) fn api_direct_get(
+        &mut self,
+        account: &str,
+        name: &str,
+        last_subject: Option<&str>,
+        body: &Value,
+        reply: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        let no_responders = |actions: &mut Vec<Action>| {
+            actions.push(Action::Deliver(
+                Message::new(
+                    reply,
+                    None,
+                    Some(Bytes::from("NATS/1.0 503\r\n\r\n")),
+                    Bytes::new(),
+                )
+                .with_account(account),
+            ));
+        };
+        let status_error = |status_line: &str, actions: &mut Vec<Action>| {
+            actions.push(Action::Deliver(
+                Message::new(
+                    reply,
+                    None,
+                    Some(Bytes::from(format!("{status_line}\r\n\r\n"))),
+                    Bytes::new(),
+                )
+                .with_account(account),
+            ));
+        };
+        let Some(stream) = self.stream_for(name, account) else {
+            no_responders(actions);
+            return;
+        };
+        let servable = stream.allow_direct || (stream.mirror.is_some() && stream.mirror_direct);
+        if !servable {
+            no_responders(actions);
+            return;
+        }
+        let found = if let Some(subj) = last_subject {
+            stream.last_for_subject(subj).map(|m| {
+                (
+                    m.seq,
+                    m.subject.clone(),
+                    m.headers.clone(),
+                    m.payload.clone(),
+                    m.time_ns,
+                )
+            })
+        } else if let Some(subj) = body.get("last_by_subj").and_then(|v| v.as_str()) {
+            stream.last_for_subject(subj).map(|m| {
+                (
+                    m.seq,
+                    m.subject.clone(),
+                    m.headers.clone(),
+                    m.payload.clone(),
+                    m.time_ns,
+                )
+            })
+        } else if let Some(next) = body.get("next_by_subj").and_then(|v| v.as_str()) {
+            let from = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+            stream
+                .messages
+                .iter()
+                .filter(|m| !stream.deleted.contains(&m.seq))
+                .filter(|m| m.seq >= from || from == 0)
+                .find(|m| subject_matches(next, &m.subject))
+                .map(|m| {
+                    (
+                        m.seq,
+                        m.subject.clone(),
+                        m.headers.clone(),
+                        m.payload.clone(),
+                        m.time_ns,
+                    )
+                })
+        } else if let Some(seq) = body.get("seq").and_then(|v| v.as_u64()) {
+            if seq == 0 {
+                status_error("NATS/1.0 408 Empty Request", actions);
+                return;
+            }
+            stream.get(seq).map(|m| {
+                (
+                    m.seq,
+                    m.subject.clone(),
+                    m.headers.clone(),
+                    m.payload.clone(),
+                    m.time_ns,
+                )
+            })
+        } else {
+            status_error("NATS/1.0 408 Empty Request", actions);
+            return;
+        };
+        match found {
+            Some((seq, subject, stored_headers, payload, time_ns)) => {
+                let mut block = format!(
+                    "NATS/1.0\r\nNats-Stream: {name}\r\nNats-Sequence: {seq}\r\nNats-Subject: {subject}\r\nNats-Time-Stamp: {}\r\n",
+                    rfc3339(time_ns),
+                );
+                if let Some(h) = &stored_headers {
+                    let text = String::from_utf8_lossy(h);
+                    for line in text.lines() {
+                        if line.starts_with("NATS/") || line.is_empty() {
+                            continue;
+                        }
+                        // The four direct-get headers above win over
+                        // any same-named stored header.
+                        let key = line.split(':').next().unwrap_or("").trim();
+                        if key.eq_ignore_ascii_case("Nats-Stream")
+                            || key.eq_ignore_ascii_case("Nats-Sequence")
+                            || key.eq_ignore_ascii_case("Nats-Subject")
+                            || key.eq_ignore_ascii_case("Nats-Time-Stamp")
+                        {
+                            continue;
+                        }
+                        block.push_str(line);
+                        block.push_str("\r\n");
+                    }
+                }
+                block.push_str("\r\n");
+                actions.push(Action::Deliver(
+                    Message::new(reply, None, Some(Bytes::from(block)), payload)
+                        .with_account(account),
+                ));
+            }
+            None => status_error("NATS/1.0 404 Message Not Found", actions),
+        }
     }
 
     pub(crate) fn api_stream_info(
@@ -596,6 +1011,20 @@ impl Engine {
             api_error_action(account, reply, type_name, code, err_code, &desc, actions);
             return;
         };
+        // Go's purge-denied shape, probed: the error plus
+        // `"purged": 0` in the same body (not a bare error).
+        if stream.deny_purge {
+            let body = json!({
+                "type": type_name,
+                "error": { "code": 500, "err_code": 10110, "description": "stream purge not permitted" },
+                "purged": 0,
+            });
+            actions.push(Action::Deliver(
+                Message::new(reply, None, None, Bytes::from(body.to_string()))
+                    .with_account(account),
+            ));
+            return;
+        }
         let filter = body
             .get("filter")
             .and_then(|v| v.as_str())
@@ -669,15 +1098,7 @@ impl Engine {
         let found = if let Some(seq) = body.get("seq").and_then(|v| v.as_u64()) {
             stream.get(seq)
         } else if let Some(subj) = body.get("last_by_subj").and_then(|v| v.as_str()) {
-            if subj.contains('*') || subj.contains('>') {
-                stream
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|m| subject_matches(subj, &m.subject))
-            } else {
-                stream.messages.iter().rev().find(|m| m.subject == subj)
-            }
+            stream.last_for_subject(subj)
         } else {
             None
         };

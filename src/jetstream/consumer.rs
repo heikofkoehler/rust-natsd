@@ -23,6 +23,14 @@ use crate::subject::subject_matches;
 /// (unless ack policy is none). `delivered` is 1 for a fresh delivery
 /// and the incremented count for a redelivery; it is carried in the
 /// ack subject, which is how clients report `NumDelivered`.
+///
+/// Phase 31: the `$JS.ACK` reply subject is attached even for ack
+/// policy none (Go v2.15.1, probed: an ack-none push delivery still
+/// carries `$JS.ACK.<stream>.<consumer>...` as its reply). Clients
+/// need it: async-nats KV watch parses every delivered message's
+/// reply to recover stream/consumer sequences, and fails the watch
+/// ("did not found reply subject") without it. Only the pending
+/// tracking is skipped for ack none, so no redelivery ever happens.
 pub(crate) fn deliver_to_consumer(
     stream_name: &str,
     account: &str,
@@ -32,26 +40,25 @@ pub(crate) fn deliver_to_consumer(
     delivered: u64,
     actions: &mut Vec<Action>,
 ) {
-    if consumer.ack_policy == AckPolicy::None {
-        actions.push(Action::Deliver(
-            Message::new(to_subject, None, msg.headers.clone(), msg.payload.clone())
-                .with_account(account),
-        ));
-        return;
-    }
     consumer.consumer_seq += 1;
     let cseq = consumer.consumer_seq;
     let pending_count = consumer.pending.len() + 1;
     let reply = consumer.ack_subject(stream_name, delivered, msg.seq, cseq, pending_count);
+    // Frame subject is the original stream message subject; routing
+    // goes to the deliver subject / pull reply inbox (see route_via).
     actions.push(Action::Deliver(
         Message::new(
-            to_subject,
+            &msg.subject,
             Some(reply),
             msg.headers.clone(),
             msg.payload.clone(),
         )
-        .with_account(account),
+        .with_account(account)
+        .with_route_via(to_subject),
     ));
+    if consumer.ack_policy == AckPolicy::None {
+        return;
+    }
     consumer.pending.insert(
         cseq,
         Pending {
@@ -338,7 +345,7 @@ impl Engine {
             return;
         };
         let config = body.get("config").unwrap_or(&Value::Null);
-        let name = from_subject
+        let mut name = from_subject
             .or_else(|| {
                 config
                     .get("name")
@@ -352,6 +359,21 @@ impl Engine {
                     .map(|s| s.to_string())
             })
             .unwrap_or_default();
+        // Phase 31: a create with no name at all is an ephemeral
+        // consumer (Go assigns a server-side name; async-nats KV
+        // watch and ordered consumers create exactly this way).
+        // A present-but-invalid name is still rejected below.
+        if name.is_empty() {
+            let mut salt = crate::jetstream::now_ns();
+            loop {
+                let candidate = format!("eph-{salt:x}");
+                if !stream.consumers.contains_key(&candidate) {
+                    name = candidate;
+                    break;
+                }
+                salt += 1;
+            }
+        }
         if !valid_name(&name) {
             api_error_action(
                 account,
@@ -883,12 +905,13 @@ impl Engine {
                             let reply = c.ack_subject(&name, nd, sseq, ncseq, c.pending.len() + 1);
                             actions.push(Action::Deliver(
                                 Message::new(
-                                    &to,
+                                    &m.subject,
                                     Some(reply),
                                     m.headers.clone(),
                                     m.payload.clone(),
                                 )
-                                .with_account(&account),
+                                .with_account(&account)
+                                .with_route_via(&to),
                             ));
                             c.pending.insert(
                                 ncseq,

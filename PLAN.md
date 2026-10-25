@@ -30,12 +30,12 @@ file support, plus the gap areas 1–3 (trie sublist, RwLock sublist,
 parser copy audit — Phase 18a) and the slow-consumer fix (Phase 18).
 All are implemented and verified against the unmodified official Go
 (`nats.go` v1.55.0) and Rust (`async-nats` 0.38) clients, plus
-raw-wire protocol tests. **200 Rust tests green, 2 ignored** (the
-ignored tests name two unfixed bugs — see Phase 26 and README
-Known issues); Go interop scripts green in both directions (routes,
-leafs, JetStream, route/leaf TLS, imports, mirroring). Parity suite
-green in default and strict mode (53 probes, 52 pass + 1 documented
-KV-gate exception, 0 fail).
+raw-wire protocol tests. **229 Rust tests green, 0 ignored**
+(measured in the Phase 31 full run; the Phase 26 ignored tests no
+longer exist in the tree); Go interop scripts green in both
+directions (routes, leafs, JetStream, route/leaf TLS, imports,
+mirroring). Parity suite green in default and strict mode
+(53 probes, 52 pass + 1 documented KV-gate exception, 0 fail).
 
 Remaining items: gateways and JetStream clustering/replication are
 **documented remainders, not implemented** — each has a design note
@@ -43,8 +43,9 @@ below (Phase 24, Phase 25) and no code. Still non-goals:
 cross-node mirroring/sourcing, cross-node imports/exports, JWT
 imports across routes/leafs, MQTT/WebSocket gateways, XKeys,
 cert-to-user mapping on route/leaf connections, and the
-KV/object-store client helpers (their server-side primitives exist;
-raw `$KV` matches Go, nats.go helpers are version-gated).
+object-store client helpers (KV helpers are verified since Phase
+31 — async-nats end to end, nats.go still version-gated; object
+store is not yet exercised against this server).
 
 Note on phase sections below: they are a historical record in
 phase order. Where a later phase supersedes an earlier one, the
@@ -1288,6 +1289,176 @@ for current behaviour.
   behavioural difference closed (persistence behaviour is
   identical; only the on-disk mechanism changed).
 
+### Phase 31 — KV/Object Store interop: DIRECT.GET, stream flags, STREAM.UPDATE, STREAM.MSG.DELETE (2026-10-25)
+- Renumbering: this work was planned as Phase 30, but PLAN.md
+  already has a Phase 30 (WAL), so it is recorded as Phase 31
+  (plan 30 → 31). The Phase 27, 28A–C, 29, and 30 entries are
+  untouched. One commit, local only (not pushed).
+- GATE EVIDENCE FIRST (before any feature code). Live probes
+  against Go v2.15.1 and rust-natsd at the Phase 30 HEAD, plus
+  the nats.go v1.55.0 source in the module cache:
+  - nats.go KV gate is ONLY the server-version check, not
+    api_lvl: `kv.go:399` (`KeyValue`) and `kv.go:424`
+    (`CreateKeyValue`) return `nats: key-value requires at
+    least server version 2.6.2` when `serverMinVersion(2,6,2)`
+    (`nats.go:2811`, parsed from the INFO `version` field) is
+    false. The parity go-client `kv` mode confirms it live:
+    Go passes (`{"get_value":"v1",...}`), Rust fails with
+    exactly that error before any KV traffic (INFO versions
+    2.15.1 vs 0.1.0). The plan's api_lvl theory is wrong for
+    this gate: in nats.go v1.55.0 `api_lvl` appears only as
+    the INFO field (`nats.go:1102`) and the
+    `ConnectedServerJetStream()` accessor (`nats.go:2864`) —
+    no KV or JS path gates on it. async-nats 0.38 has no
+    version gate and no api_lvl use at all: its KV getter
+    chooses the direct path purely from the stream info's
+    `allow_direct` flag (`kv/mod.rs` entry path).
+  - api_lvl / version decision (HONESTY GATE, unchanged):
+    rust-natsd still reports its own crate version 0.1.0 and
+    still omits `api_lvl`. Faking a Go version to clear the
+    2.6.2 gate, or advertising Go's api_lvl 5, would imply JS
+    features Rust does not implement (clustering, full
+    consumer/producer surface) and is explicitly not done.
+    Consequence, stated plainly: nats.go KV helpers cannot
+    reach green against this server until its own version
+    reaches 2.6.2, so parity stays 52 pass + 1 documented
+    exception (the KV gate), 0 fail — NOT 53/53, and the
+    exception stays in `parity/KNOWN_DIFFS.md`. What Phase 31
+    does earn: async-nats KV helpers verified end to end
+    (below), and every server primitive nats.go KV would use
+    probed identical to Go (below).
+- DIRECT.GET (`src/jetstream/api.rs`, `api_direct_get`):
+  `$JS.API.DIRECT.GET.<stream>` with a JSON body (`seq`,
+  `next_by_subj`, `last_by_subj`) and
+  `$JS.API.DIRECT.GET.<stream>.<last_by_subj subject...>`
+  with an empty body (subject tokens rejoined with '.', so
+  dotted KV subjects work) — both shapes verified against
+  what nats.go (`jsm.go` `getMsg`) and async-nats
+  (`stream.rs` `direct_get*`) actually request. Success is
+  the raw payload with `Nats-Stream`, `Nats-Sequence`,
+  `Nats-Subject`, `Nats-Time-Stamp` (RFC3339) headers plus
+  the stored message's own headers passthrough. Errors are
+  HMSG status lines, because both clients parse status from
+  the version line: not-found `NATS/1.0 404 Message Not
+  Found`; empty request (no seq/next/last) `NATS/1.0 408
+  Empty Request`; not servable (stream missing, or
+  allow_direct off and not a mirror_direct mirror)
+  `NATS/1.0 503` with no payload — Go answers that way too
+  (no direct-get responder), so nats.go reports "no
+  responders" and async-nats NoResponders on both servers.
+  A Go probe program run against both servers after the
+  change produces identical output for every direct-get,
+  deny, rollup, and update case (modulo JSON key order and
+  the mirror-name case below).
+- Stream flags (`Stream` in `src/jetstream/mod.rs`,
+  STREAM.CREATE/UPDATE, `info_json`, WAL `meta.json` +
+  snapshot load in `storage.rs`; pre-Phase-31 snapshots load
+  the flags as false): `allow_direct`, `mirror_direct`,
+  `deny_delete`, `deny_purge`, `allow_rollup_hdrs`.
+  STREAM.UPDATE is new (it did not exist): it replaces
+  subjects, retention (limits/workqueue), max_msgs,
+  max_bytes, max_age, max_msgs_per_subject, and the five
+  flags on an existing stream, preserving messages,
+  consumers, creation time, and mirror/source links.
+  Storage changes are ignored (not rejected — clients send
+  a storage value on update) and a mirror/sources config
+  naming a different origin is rejected (relinking a live
+  stream is not implemented); both limits are documented in
+  the handler.
+- Enforcement, all shapes probed against Go v2.15.1 first:
+  STREAM.MSG.DELETE is new (it did not exist): success
+  marks the sequence deleted in place (first_seq jumps past
+  a deleted prefix, as Go does); errors are missing stream
+  404/10059, deny_delete 500/10057 "message delete not
+  permitted", seq past the end 500/10057 "stream store
+  EOF", deleted/pre-base seq 500/10057 "no message
+  found"; `no_erase` is accepted (the message is
+  unretrievable either way). STREAM.PURGE on a deny_purge
+  stream returns Go's shape exactly: 500/10110 "stream
+  purge not permitted" plus `"purged": 0` in the same body.
+  Rollup in `capture` (`src/jetstream/stream.rs`): a publish
+  with `Nats-Rollup: sub` deletes all prior live messages
+  for that subject, `all` deletes the stream's live
+  messages, then the new message stores at the next
+  sequence (no renumbering — earlier sequences become
+  gaps); without allow_rollup_hdrs, or with any other
+  value, the publish fails with 500/10111 ("rollup not
+  permitted" / `rollup value invalid: "<value>"`). Rollup
+  runs only for actually-stored direct publishes (after
+  dedup and expected-sequence checks), never for
+  mirror/source copies. KV delete (DEL marker publish)
+  and KV purge (rollup-sub PURGE marker publish) are
+  therefore NOT blocked by a KV bucket's deny_delete —
+  deny_delete gates only the MSG.DELETE API, as on Go.
+  MSG.GET `last_by_subj` now shares the direct-get
+  `last_for_subject` helper, so a MSG.DELETE'd message is
+  not resurfaced by either endpoint (Go returns not-found
+  for it, probed).
+- Mirror-direct, Go quirk documented, not copied: on Go,
+  a direct get addressed to an origin with allow_direct is
+  answered by one of its mirrors (the `Nats-Stream` header
+  names the mirror — nats.go explicitly tolerates this),
+  whether or not the mirror has mirror_direct, and a
+  direct get addressed to a mirror's own name always gets
+  no responders (even with mirror_direct, even when the
+  origin lacks allow_direct). Rust answers the requested
+  stream directly when it is servable, including a
+  mirror_direct mirror's own copies: the client-visible
+  outcome (message + valid headers) is identical, and the
+  mirror-name case is a permissive superset, not a gap.
+  (Caught while probing: Go `-js` without `-sd` persists
+  JetStream state in the working directory, so early mirror
+  probes that reused a cwd shared state across server
+  processes; the mirror conclusions above come from
+  clean-store reruns only.)
+- Drive-by fixes the KV tests exposed (all Go-matching,
+  all probed or standard NATS semantics, none pre-existing
+  test depended on the old behaviour):
+  - Ephemeral consumers: CONSUMER.CREATE with no name
+    anywhere (subject, config `name`, `durable_name`) now
+    gets a server-assigned `eph-<hex>` name instead of
+    400/10002. async-nats KV watch and ordered consumers
+    create exactly this way; Go assigns ephemeral names.
+  - Ack-none deliveries now carry the `$JS.ACK` reply
+    subject (Go v2.15.1, probed: an ack-none push delivery
+    still carries `$JS.ACK.<stream>.<consumer>...` as its
+    reply). Pending tracking is still skipped for ack
+    none, so no redelivery ever happens (the existing
+    ack-none test still passes). async-nats KV watch
+    parses every delivered message's reply and failed
+    without it.
+  - Consumer delivery subjects (the Watch blocker):
+    push/pull/NAK/tick deliveries used to frame the
+    message with the deliver subject / pull reply inbox
+    as its subject. They now frame the original stream
+    message subject and route on the inbox via a new
+    `Message::route_via` field (`src/server/delivery.rs`):
+    `deliver()` matches the sublist on `route_via` but
+    frames with `subject`, local-only (no import
+    translation, no route/leaf forwarding). nats.go and
+    async-nats push/pull subscribers now see the real
+    subject, as on Go; KV Watch derives the key from it.
+- Tests (`tests/e2e_js_kv.rs`, 5 tests, all green):
+  async-nats `create_key_value` put/get/delete/purge
+  (config echo, DEL/PURGE operations, post-purge stream
+  state); revisions + watch (direct and MSG.GET paths,
+  watch entry for a later put); DIRECT.GET forms and
+  errors (seq, last, first, next-wildcard, not-found
+  kinds, allow_direct-off 503, STREAM.UPDATE flipping
+  allow_direct on); deny_delete/deny_purge/MSG.DELETE
+  (codes, gap semantics, EOF vs no-message-found);
+  rollup sub/all/denied/bogus. Full verification:
+  `cargo fmt --check` clean, `cargo clippy --all-targets
+  -- -D warnings` clean, `cargo test` 229 passed / 0
+  failed / 0 ignored, `scripts/e2e-go.sh` OK,
+  `scripts/parity.sh` GREEN (52 pass + 1 KV-gate
+  exception + 0 fail; the KV exception is unchanged and
+  honest). Docs synced in the same commit: README KV
+  matrix row + parity paragraph + deviations bullet, this
+  PLAN entry, `parity/KNOWN_DIFFS.md` KV section
+  (exception kept; async-nats verification and the
+  mirror-direct difference added).
+
 ## Future work (not in this plan)
 - Gateways (Phase 24) and JetStream clustering/replication
   (Phase 25): documented remainders with design notes, not
@@ -1295,7 +1466,7 @@ for current behaviour.
 - Cross-node mirroring/sourcing, cross-node imports/exports,
   JWT imports across routes/leafs, MQTT/WebSocket gateways,
   XKeys, cert-to-user mapping on route/leaf connections,
-  KV/object-store client-helper verification.
+  object-store client-helper verification (KV done in Phase 31).
 - Phase 28C is complete (see above); no further 28-series item
   remains.
 

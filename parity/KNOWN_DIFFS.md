@@ -1,8 +1,9 @@
 # Parity residue: rust-natsd vs Go nats-server v2.15.1
 
 As of the parity-fix work (2026-10-24), re-verified 2026-10-25 at
-HEAD `0cb8650`, **there are no remaining known
-server diffs**. Every divergence in the previous edition of this file
+HEAD `0cb8650` and again during Phase 31 (2026-10-25: 53 probes,
+52 pass + 1 documented exception, 0 fail), **there are no
+remaining known server diffs**. Every divergence in the previous edition of this file
 is fixed and passes in both default and `--strict` mode:
 
 | Former diff | Fix |
@@ -88,6 +89,32 @@ watch via `$KV.>`) and matches Go. KV is therefore usable through any
 client that does not apply nats.go's version gate, and will become
 usable through nats.go itself when rust-natsd's own version reaches
 2.6.2.
+
+Phase 31 update (2026-10-25): the gate was re-verified against the
+nats.go v1.55.0 source before any feature code — it is ONLY the
+version check (`kv.go:399`/`424`, via `serverMinVersion` on the
+INFO `version` field). `api_lvl` gates nothing in nats.go: it is
+only the INFO field and the `ConnectedServerJetStream()` accessor,
+and async-nats 0.38 has no version gate and no api_lvl use at all
+(its KV getter keys off the stream info's `allow_direct` flag).
+Accordingly rust-natsd still reports 0.1.0 and still omits
+`api_lvl`: advertising Go's api_lvl 5 would imply JS features
+Rust does not implement. The server side is now complete for KV:
+`DIRECT.GET` (seq / last / next-by-subject, with the Go error
+shapes), `allow_direct` / `mirror_direct` / `deny_delete` /
+`deny_purge` / `allow_rollup_hdrs`, `STREAM.UPDATE`, and
+`STREAM.MSG.DELETE` are implemented and were probed identical to
+Go v2.15.1 with a nats.go probe program (direct gets, deny codes
+10057/10110, rollup sub/all/denied/bogus, update flipping
+allow_direct on) — and async-nats KV helpers are verified end to
+end in `tests/e2e_js_kv.rs` (put/get/delete/purge, revisions,
+watch). One documented difference remains: Go answers a direct
+get addressed to an origin from one of its mirrors (the
+`Nats-Stream` header names the mirror) and answers nothing for a
+mirror's own name, while Rust answers the requested stream
+directly when servable, including a mirror_direct mirror's own
+copies. The parity KV exception therefore stays: it is the
+version gate, not a server gap, and 53/53 is not claimed.
 
 ## Known issues and deliberate deviations (not parity diffs)
 

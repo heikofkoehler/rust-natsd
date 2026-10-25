@@ -368,6 +368,48 @@ impl Engine {
                     continue;
                 }
             }
+            // Phase 31 rollup (Go v2.15.1, probed): a publish
+            // carrying `Nats-Rollup` replaces history before the new
+            // message is stored — `sub` deletes all prior live
+            // messages for this subject, `all` deletes the whole
+            // stream's live messages — and the new message is then
+            // stored at the next sequence (no renumbering, so
+            // earlier sequences become gaps). A stream without
+            // allow_rollup_hdrs, or a value other than sub/all,
+            // fails the publish: 500/10111 "rollup not permitted"
+            // / `rollup value invalid: "<value>"`. Rollup runs
+            // only for a message that is actually stored (after
+            // dedup and expected-sequence checks), and only on
+            // direct publishes — mirror/source copies use
+            // store_message directly and never re-apply it.
+            if let Some(rollup) = header_get(msg, "Nats-Rollup") {
+                let stream = self.stream_for_mut(name, &msg.account).unwrap();
+                match rollup.as_str() {
+                    "sub" | "all" if stream.allow_rollup_hdrs => {
+                        let is_all = rollup == "all";
+                        let subject = msg.subject.clone();
+                        for m in stream.messages.iter() {
+                            if !stream.deleted.contains(&m.seq) && (is_all || m.subject == subject)
+                            {
+                                stream.deleted.insert(m.seq);
+                            }
+                        }
+                    }
+                    "sub" | "all" => {
+                        if first_error.is_none() {
+                            first_error = Some((500, 10111, "rollup not permitted".to_string()));
+                        }
+                        continue;
+                    }
+                    other => {
+                        if first_error.is_none() {
+                            first_error =
+                                Some((500, 10111, format!("rollup value invalid: \"{other}\"")));
+                        }
+                        continue;
+                    }
+                }
+            }
             let seq = {
                 let stream = self.stream_for_mut(name, &msg.account).unwrap();
                 Self::store_message(
@@ -514,12 +556,13 @@ impl Engine {
                             );
                             actions.push(Action::Deliver(
                                 Message::new(
-                                    &to,
+                                    &m.subject,
                                     Some(reply),
                                     m.headers.clone(),
                                     m.payload.clone(),
                                 )
-                                .with_account(&msg.account),
+                                .with_account(&msg.account)
+                                .with_route_via(&to),
                             ));
                             consumer.pending.insert(
                                 ncseq,

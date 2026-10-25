@@ -713,6 +713,11 @@ pub(crate) fn stream_meta_json(s: &Stream) -> Value {
         "mirror": s.mirror.as_ref().map(source_cfg_json),
         "sources": s.sources.iter().map(source_cfg_json).collect::<Vec<_>>(),
         "source_token": s.source_token,
+        "allow_direct": s.allow_direct,
+        "mirror_direct": s.mirror_direct,
+        "deny_delete": s.deny_delete,
+        "deny_purge": s.deny_purge,
+        "allow_rollup_hdrs": s.allow_rollup_hdrs,
     })
 }
 
@@ -1309,6 +1314,7 @@ impl Engine {
             let get_s = |k: &str| sv.get(k).and_then(|v| v.as_str()).unwrap_or("");
             let get_i = |k: &str| sv.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
             let get_u = |k: &str| sv.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let get_b = |k: &str| sv.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
             let parse_snap_cfg = |v: &Value| -> SourceCfg {
                 SourceCfg {
                     name: v
@@ -1379,6 +1385,13 @@ impl Engine {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| make_source_token(get_s("name"), created_ns)),
+                // Pre-Phase-31 snapshots lack these keys and load
+                // as false, matching the old hardcoded info_json.
+                allow_direct: get_b("allow_direct"),
+                mirror_direct: get_b("mirror_direct"),
+                deny_delete: get_b("deny_delete"),
+                deny_purge: get_b("deny_purge"),
+                allow_rollup_hdrs: get_b("allow_rollup_hdrs"),
                 wal_rewrite: false,
             };
             if stream.base_seq == 0 {
@@ -1677,6 +1690,11 @@ mod tests {
             mirror: None,
             sources: Vec::new(),
             source_token: "tok".to_string(),
+            allow_direct: false,
+            mirror_direct: false,
+            deny_delete: false,
+            deny_purge: false,
+            allow_rollup_hdrs: false,
             wal_rewrite: false,
         };
         stream.messages.push_back(stored(1, "s.a", "hello"));
@@ -1743,6 +1761,11 @@ mod tests {
             mirror: None,
             sources: Vec::new(),
             source_token: "tok".to_string(),
+            allow_direct: false,
+            mirror_direct: false,
+            deny_delete: false,
+            deny_purge: false,
+            allow_rollup_hdrs: false,
             wal_rewrite: false,
         };
         store.save_stream_meta(&stream).unwrap();

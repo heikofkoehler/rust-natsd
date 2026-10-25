@@ -86,7 +86,7 @@ rust-natsd does; it replaces the older support table.
 | JetStream clustering / replication | Not implemented | Remainder, not implemented — design note in PLAN Phase 25 (Raft/WAL scope); single-node only, no replication, no high availability |
 | JetStream mirroring / sourcing | Implemented (same node) | `mirror` / `sources` in STREAM.CREATE (`name`, `filter_subject`, `opt_start_seq`, `opt_start_time`); backfill at creation then live copies via the capture hook (atomic under the engine lock: no loss, no duplicates); mirror copies are exact, source copies add a `Nats-Stream-Source` header; origin delete keeps copies but kills the link permanently, purge leaves the mirror untouched. Cross-node mirroring/sourcing (routes/leafs, `external`) is NOT implemented and is rejected at creation. One deliberate deviation from Go: a mirror/source of a nonexistent stream is rejected with 404/10059 instead of Go's accept-and-leave-empty |
 | JetStream `$JS.API` routing across routes/leafs (`$JS.API.>` interest) | Implemented | |
-| KV / object store as client helpers | Partial | Stream primitives exist (`KV_<bucket>` streams, `last_by_subj`); raw `$KV` traffic matches Go (parity probe `kv_raw`), but the nats.go/async-nats KV helpers apply a version gate (see below) and are not verified end-to-end |
+| KV / object store as client helpers | Partial | `DIRECT.GET` (seq / last / next-by-subject), `allow_direct` / `mirror_direct` / `deny_delete` / `deny_purge` / `allow_rollup_hdrs`, `STREAM.UPDATE`, and `STREAM.MSG.DELETE` implemented and probed identical to Go v2.15.1 (Phase 31); async-nats KV helpers verified end to end (`tests/e2e_js_kv.rs`: put/get/delete/purge, revisions, watch). nats.go KV helpers remain version-gated (see below) and raw `$KV` traffic matches Go (parity probe `kv_raw`); object-store helpers are not yet exercised |
 | Monitoring `/varz` | Implemented | Real `http_port`, `mem`, `slow_consumers`, configured ping values |
 | Monitoring `/connz` | Implemented | `acc`/`state`/`limit`/`offset` filters; `account`/`user`/`tls` per connection |
 | Monitoring `/subz` | Implemented | Rust superset: Go 2.15.1 answers 404 here |
@@ -169,12 +169,16 @@ matching configs and runs the same raw-wire and Go-client probes
 against both: **53 probes, 52 pass + 1 documented exception, 0 fail,
 in both default and `--strict` mode** (last verified 2026-10-25
 at HEAD `0cb8650`, re-verified during the 2026-10-25 documentation
-refresh).
+refresh and again during Phase 31).
 The single exception is not a server difference: `nats.go` gates
 key-value on server version >= 2.6.2, and rust-natsd honestly reports
 its own crate version (0.1.0), so `CreateKeyValue` fails client-side
-before any KV traffic happens. Raw `$KV` traffic bypassing the gate
-matches Go. The remaining documented exceptions — Go-only `INFO`
+before any KV traffic happens. That gate is the only thing standing
+between parity and 53/53 for KV: async-nats KV helpers, which apply
+no version gate, are verified end to end since Phase 31, and every
+server primitive nats.go KV would use (DIRECT.GET, rollup, deny
+flags) was probed identical to Go. Raw `$KV` traffic bypassing the
+gate matches Go. The remaining documented exceptions — Go-only `INFO`
 fields, the monitoring superset, TLS refusal-layer variance — are
 listed in full in [parity/KNOWN_DIFFS.md](parity/KNOWN_DIFFS.md).
 Nothing in this section claims byte-identical monitoring JSON or
@@ -285,6 +289,13 @@ tests in the suite.
   backfill is synchronous where Go's is asynchronous (final state
   matches); a mirror/source of a nonexistent stream is rejected
   with 404/10059 where Go accepts it and leaves the stream empty;
+  DIRECT.GET on a mirror's own name is served when the mirror has
+  `mirror_direct`, where Go answers nothing for the mirror name
+  (Go instead lets mirrors answer direct gets addressed to their
+  origin — a serving detail clients cannot distinguish except via
+  the `Nats-Stream` header, which nats.go explicitly tolerates);
+  STREAM.UPDATE ignores storage changes and rejects mirror/source
+  relinks, where Go is more permissive;
   an unauthorized account import drops the message instead of Go
   refusing to start the server; import reply mappings expire after
   60 s (pruned on insert/lookup); translated service requests carry
