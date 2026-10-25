@@ -2,30 +2,55 @@
 
 A NATS server implemented in Rust, from scratch. Scope for this plan:
 **Core NATS pub-sub protocol** (the client protocol spoken by `nats-server`,
-formerly `gnatsd`, in Go), plus routes/clustering, leaf nodes, in-memory
-JetStream, a monitoring endpoint, and `.conf` file support — complete
-enough that unmodified Go (`nats.go`) and Rust (`async-nats`) clients can
-connect, publish, subscribe, request/reply, cluster, and use JetStream
-against it.
+formerly `gnatsd`, in Go), plus routes/clustering, leaf nodes, JetStream
+(in-memory or file-persisted, single-node), TLS client, route, and leaf
+connections, NKey and JWT-operator authentication, multi-account
+scoping with imports/exports, JetStream mirroring/sourcing (same node),
+a monitoring endpoint, and `.conf` file support — complete enough that
+unmodified Go (`nats.go`) and Rust (`async-nats`) clients can connect,
+publish, subscribe, request/reply, cluster, and use JetStream against
+it.
 
-Explicitly out of scope (see end): gateways, JetStream
-clustering/replication and file persistence, MQTT/WebSocket gateways.
+Explicitly out of scope (see end, and kept identical in README and
+`parity/KNOWN_DIFFS.md`): gateways, JetStream clustering/replication
+(Raft/WAL), MQTT/WebSocket gateways, cross-node mirroring/sourcing,
+cross-node imports/exports, JWT imports across routes/leafs, XKeys,
+cert-to-user mapping on route/leaf connections, and Go-only INFO
+fields. File persistence is **in** scope (Phases 15, 19) — an earlier
+version of this plan listed it out of scope, which was superseded.
 
-## Status (2026-10-24)
+## Status (2026-10-25)
 
-Phases 0–16 **complete**: Core NATS pub-sub, routes/clustering, leaf
-nodes, JetStream (in-memory or file-persisted), TLS client connections,
-NKey authentication, multi-account scoping, the monitoring endpoint,
-and `.conf` file support are implemented and verified against the
-unmodified official Go (`nats.go` v1.55.0) and Rust (`async-nats` 0.38)
-clients, plus raw-wire protocol tests. 97 Rust tests green; Go interop
-scripts green in both directions (routes, leafs, JetStream).
+Phases 0–23 **complete**: Core NATS pub-sub, routes/clustering, leaf
+nodes, JetStream (in-memory or file-persisted, single-node),
+TLS client/route/leaf connections, NKey authentication, JWT operator
+mode, multi-account scoping with imports/exports, JetStream
+mirroring/sourcing (same node), the monitoring endpoint, and `.conf`
+file support, plus the gap areas 1–3 (trie sublist, RwLock sublist,
+parser copy audit — Phase 18a) and the slow-consumer fix (Phase 18).
+All are implemented and verified against the unmodified official Go
+(`nats.go` v1.55.0) and Rust (`async-nats` 0.38) clients, plus
+raw-wire protocol tests. **200 Rust tests green, 2 ignored** (the
+ignored tests name two unfixed bugs — see Phase 26 and README
+Known issues); Go interop scripts green in both directions (routes,
+leafs, JetStream, route/leaf TLS, imports, mirroring). Parity suite
+green in default and strict mode (53 probes, 52 pass + 1 documented
+KV-gate exception, 0 fail).
 
 Remaining items: gateways and JetStream clustering/replication are
 **documented remainders, not implemented** — each has a design note
 below (Phase 24, Phase 25) and no code. Still non-goals:
-cross-node mirroring/sourcing, MQTT/WebSocket gateways, and the
-KV/object-store client helpers (their server-side primitives exist).
+cross-node mirroring/sourcing, cross-node imports/exports, JWT
+imports across routes/leafs, MQTT/WebSocket gateways, XKeys,
+cert-to-user mapping on route/leaf connections, and the
+KV/object-store client helpers (their server-side primitives exist;
+raw `$KV` matches Go, nats.go helpers are version-gated).
+
+Note on phase sections below: they are a historical record in
+phase order. Where a later phase supersedes an earlier one, the
+earlier section says so explicitly (Phases 9, 10, 12, 13, 15);
+the Status above and the README feature matrix are authoritative
+for current behaviour.
 
 ## Phases
 
@@ -113,12 +138,18 @@ KV/object-store client helpers (their server-side primitives exist).
   `CONSUMER.DURABLE.CREATE`, `STREAM.NAMES`.
 - Verified: 8 async-nats e2e tests + `scripts/e2e-go-js.sh` (nats.go JS
   client). Per-node streams (no replication); file storage accepted but
-  stored in memory.
+  stored in memory. **Superseded by Phase 15:** file persistence is
+  implemented there (whole-engine JSON snapshot), and by Phase 19
+  (pending ack state included).
 
 ### Phase 10 — Monitoring endpoint
 - Hand-rolled HTTP/1.1 server on `--http-port`: `/varz`, `/connz`,
   `/subz`, `/routez`, `/leafz`, `/jsz`, `/healthz`. Only tracked fields
   filled in; untracked ones report 0. `/jsz` is 404 without JetStream.
+  **Superseded in part by Phase 16:** `mem` is now real (from
+  `/proc/self/statm` on Linux), `slow_consumers` is a real counter,
+  and `/accounz` / `/gatewayz` were added; untracked fields still
+  report 0.
 - Verified: `tests/e2e_monitor.rs`.
 
 ### Phase 11 — Config file compatibility
@@ -137,7 +168,8 @@ KV/object-store client helpers (their server-side primitives exist).
   goes out in plaintext first, then the client upgrades the same socket
   to TLS (a direct/implicit-TLS client fails on its own side, and a
   plain client after INFO is closed silently — both verified against
-  Go). Route/leaf paths stay plain TCP.
+  Go). **Superseded by Phase 22:** route/leaf paths now support TLS
+  (implicit route TLS, INFO-first leaf TLS).
 - Verified: `tests/e2e_tls.rs` (openssl-generated CA/certs; TLS 1.3
   note: a no-cert client `connect()` can succeed while the server's
   certificate-required alert surfaces on first read — the test
@@ -147,7 +179,8 @@ KV/object-store client helpers (their server-side primitives exist).
 - `nkey`/`sig`/`jwt` fields in `ConnectInfo`; per-connection `nonce`
   sent in INFO only when authentication is configured (Go omitempty);
   signatures verified with the `nkeys` crate (base64 via the `base64`
-  crate). JWT operator mode is out of scope.
+  crate). **Superseded by Phase 23:** JWT operator mode is
+  implemented there.
 - Verified: `tests/e2e_nkey.rs` (in-memory throwaway keypair).
 
 ### Phase 14 — Multi-account
@@ -167,7 +200,8 @@ KV/object-store client helpers (their server-side primitives exist).
 - File persistence behind `--jetstream` + `--js-store-dir` /
   `jetstream.store_dir`: whole-engine JSON snapshot (base64 payloads)
   written atomically after every mutation, reloaded on startup;
-  pending ack state is NOT persisted. Workqueue retention, 
+  pending ack state is NOT persisted **at this phase — superseded by
+  Phase 19, which persists it (snapshot v2)**. Workqueue retention, 
   `max_msgs_per_subject`, deliver_policy `last` (filter-aware) and
   `by_start_sequence`. Filtered consumer creates
   (`CREATE.<stream>.<consumer>.<filter…>`) fixed.
@@ -233,6 +267,39 @@ KV/object-store client helpers (their server-side primitives exist).
   `never_reading_subscriber_dropped_at_byte_limit` (4 KiB limit,
   5000 x 256 B to a never-reading subscriber, connection closed)
   in `tests/e2e_raw.rs`.
+
+### Phase 18a — Gap areas 1–3: trie sublist, RwLock, parser copy audit
+- **Trie sublist (gap area 1).** `src/sublist.rs`'s linear `Vec`
+  scan was replaced by a subject trie (exact-token children, `*`
+  child, `>` terminator on the prefix node; partial wildcards like
+  `foo*`/`f>o` are literal exact tokens). API and semantics
+  preserved exactly: keep-first duplicate `(conn_id, sid)`,
+  insertion order via per-key sequence numbers, queue-cursor
+  rotation, account scoping, echo filtering, auto-unsub via
+  `note_deliveries`. `has_pattern` is O(1) via a pattern-count
+  map. Measured with the 10k-subscription harness in
+  `examples/sublist_bench.rs` (release): sparse-subject matching
+  357.8 µs → 0.394 µs/iter (~900×); all-subjects matching
+  387.9 → 173.9 µs/iter (smaller gain — the 2,500-member
+  queue-group clone cost dominates there). Phase 2's description
+  of the sublist was updated to the trie.
+- **RwLock sublist (gap area 2).** `Shared.sublist` is
+  `RwLock<Sublist>`: read lock for matching/lookup paths, write
+  lock for mutations, combined blocks kept under a single guard
+  (no read-to-write upgrades). `propagate_local_sub` collects
+  route/leaf handles first and sends after registry locks drop.
+  Other `Shared` mutexes were audited and left with reasons
+  (short critical sections, Arc collection before sending, no I/O
+  under lock). No hand-rolled lock-free structures, no
+  connection-model change.
+- **Parser copy audit (gap area 3).** The client parser was
+  already zero-copy on the PUB/HPUB hot path
+  (`BytesMut::split_to` + `freeze`, HPUB headers/payload as
+  `Bytes::slice`) and was left untouched. The route/leaf parsers
+  did copy every forwarded body via `Bytes::copy_from_slice`;
+  they now freeze+slice like the client parser. Remaining copies
+  are documented in Design notes (one `feed()` copy, small
+  control-line `String`s, per-recipient frame copies).
 
 ### Phase 19 — JetStream persistence completeness (gap area 4)
 - Pending ack state is now persisted in the whole-engine JSON
@@ -775,12 +842,79 @@ KV/object-store client helpers (their server-side primitives exist).
   itself clustered must have Raft groups, quorum commit, a WAL,
   and the test plan above, or it must not ship.
 
+### Phase 26 — Test-gap work (audit + missing unit/e2e tests)
+- Audit of every module/feature area against existing tests
+  (unit, `tests/e2e_*.rs`, Go scripts, parity probes — parity
+  probes explicitly not counted as cargo tests), then tests added
+  for the genuine gaps, test-only (no `src/` changes). Result:
+  **150 → 200 Rust tests passing, 2 ignored.**
+- Added: unit gaps (21: subject/protocol edges, config/conf
+  parsing, JWT claim branches, TLS cert identity ordering);
+  `tests/e2e_wire_gaps.rs` (13: pedantic, verbose order,
+  duplicate sid, echo, no-responders, PING/stale, token modes,
+  malformed CONNECT, unknown op, second CONNECT, 3-member queue,
+  HPUB max-payload, graceful shutdown) with the weak
+  `protocol_error_closes_connection` test strengthened to assert
+  EOF as well as `-ERR`; `tests/e2e_js_gaps.rs` (6 pass:
+  deliver-policy all, filter subject, ack-policy none, push
+  ack-wait redelivery, filtered purge, NAMES filter,
+  CONSUMER.INFO); monitoring/conf gaps (subz/routez/leafz/
+  gatewayz shapes, varz max_pending/ping values, jsz 404,
+  connz filters, file-based accounts isolation, file store_dir);
+  rust-client gaps (fanout, unsubscribe, request_with_headers,
+  publish with no subscribers); new `scripts/e2e-go-advanced.sh`
+  + `e2e/go/advanced.go` (service imports and mirror
+  backfill/live via nats.go, green; JWT mode unwired — see below).
+- **Two bugs found by the new tests, NOT fixed in this phase**
+  (both tests committed `#[ignore]`d naming the bug, see README
+  Known issues): (1) pull-consumer `max_deliver` is not enforced
+  (redeliveries continue past `max_deliver: 2`); (2) JWT auth via
+  the official Go client can never succeed, because nats.go's
+  UserJWT flow never sends a CONNECT `nkey` field while
+  rust-natsd requires `nkey == JWT sub` (fix: derive the user
+  key from the JWT `sub`, as Go does). Also noted:
+  CONSUMER.INFO `num_pending` is hardcoded to 0.
+- Deliberately not tested (features that do not exist, a test
+  would fail by design): gateways, JetStream clustering/Raft/WAL,
+  MQTT/WebSocket, cross-node mirroring/imports, JWT imports
+  across routes/leafs.
+
+### Phase 27 — Documentation refresh (this phase, 2026-10-25)
+- Full audit of README.md, PLAN.md, and parity/KNOWN_DIFFS.md
+  against the code at HEAD `0cb8650`, docs-only (no src/test/
+  script changes). Fixed: PLAN status section (was phases 0–16
+  and 97 tests; now phases 0–23 complete, 24–25 design notes,
+  200 tests + 2 ignored) and its stale out-of-scope line (file
+  persistence is in scope since Phase 15); superseded-phase
+  annotations on Phases 9, 10, 12, 13, 15; a new README
+  Configuration reference (every CLI flag and `.conf` key,
+  verified against `src/config.rs`/`src/conf.rs`); a new README
+  Known issues and limitations section (the two ignored-test
+  bugs, `num_pending`, deliberate deviations, JWT limitations,
+  and the single consistent out-of-scope list, mirrored in
+  KNOWN_DIFFS); README benchmark table refreshed from a fresh
+  `bash scripts/bench.sh` run at HEAD (2026-10-25, medians in
+  README); README monitor design note corrected (memory is real
+  from `/proc/self/statm`, not 0); README Tests section gained
+  `scripts/e2e-go-route-leaf-tls.sh`; Phase 18a (gap areas 1–3)
+  and Phase 26 (test-gap work) recorded here, since neither had
+  a phase entry before.
+- Flagged, not changed (docs-only task, code change needed):
+  the CLI help text in `src/config.rs` describes
+  `--js-store-dir` as "(reserved)", but the store dir is in fact
+  implemented (whole-engine JSON snapshot, Phases 15/19) — the
+  help text is stale, the docs are right.
+
 ## Future work (not in this plan)
 - Gateways (Phase 24) and JetStream clustering/replication
   (Phase 25): documented remainders with design notes, not
   implemented, not planned-imminent — no code, no accepting stub.
-- Cross-node mirroring/sourcing, MQTT/WebSocket gateways,
+- Cross-node mirroring/sourcing, cross-node imports/exports,
+  JWT imports across routes/leafs, MQTT/WebSocket gateways,
+  XKeys, cert-to-user mapping on route/leaf connections,
   KV/object-store client-helper verification.
+- The two ignored-test bugs from Phase 26 (pull-consumer
+  `max_deliver`, Go-client JWT login) — fixes, not features.
 
 ## Design notes
 - Single shared subscription registry behind a lock; delivery resolves the

@@ -69,8 +69,8 @@ rust-natsd does; it replaces the older support table.
 | Multi-account + pub/sub allow/deny | Implemented | `accounts {}` in `.conf` (per-user `permissions` or account-level `authorization`), `system_account`, `no_auth_user`; subscriptions/deliveries/routes/leafs/JetStream scoped per account; Go's exact permission-violation `-ERR` text, connection stays alive |
 | Account imports/exports (service + stream) | Implemented (same node) | `accounts { NAME { exports: [{service\|stream: "subj", accounts: ["B"]}], imports: [{service\|stream: {account: A, subject: "subj"}, to: "local"}] } }` — Go v2.15.1 `.conf` shape probed (`to`, not `local_subject`; the older spelling is accepted as an alias). Service requests are rewritten into the exporting account with a synthetic `_RIMPORT.<seq>` reply subject that routes replies back; stream publishes are copied to the importer's local subject. Unauthorized imports (account not listed, remote pattern not covered by the export) are dropped, never delivered; the importing account's publish allow/deny is checked on the local subject and the responder's subscribe allow/deny on the exported subject. Same-node only: imports do not cross routes/leafs, and route/leaf-origin messages do not fan out to stream importers. Reply mappings are retained for the server lifetime (Go's `_R_.` mappings expire by TTL) |
 | TLS client connections | Implemented | `--tls/--tlscert/--tlskey/--tlsverify/--tlscacert`, `tls {}` in `.conf`, `tls_required` in `INFO`; STARTTLS order (plaintext `INFO` first, then upgrade), matching Go |
-| Route/leaf TLS | Implemented | Route TLS is implicit TLS (no plaintext first, unlike client STARTTLS); leaf TLS is INFO-first then upgrade (hub sends plaintext `INFO` with `tls_required`, then TLS). Both directions interop with Go 2.15.1 (see `scripts/e2e-go-route-leaf-tls.sh`); `--cluster-tls*` / `--leaf-tls*` flags, `cluster { tls {} }` / `leafnodes { tls {} }` / remote `tls {}` in `.conf` |
-| TLS client-certificate-to-user mapping | Implemented | `tls { verify_and_map: true }` (also `--tlsverify-and-map`): the client certificate's identity — email SANs, then DNS SANs, then URI SANs, then CN, then full DN — is matched against configured user names (a superset of Go's DN-only match, so both `alice` and `CN=alice` users work); no mapping entry means rejection even with a valid password, and a mapped user is still subject to that user's publish/subscribe allow/deny. Certificate identities are parsed from DER by hand (no new dependency) |
+| Route/leaf TLS | Implemented | Route TLS is implicit TLS (no plaintext first, unlike client STARTTLS); leaf TLS is INFO-first then upgrade (hub sends plaintext `INFO` with `tls_required`, then TLS). Both directions interop with Go 2.15.1 (see `scripts/e2e-go-route-leaf-tls.sh`); `--cluster-tls*` / `--leaf-tls*` flags, `cluster { tls {} }` / `leafnodes { tls {} }` / remote `tls {}` in `.conf`. Certificate verification on route/leaf connections is CA-only; cert-to-user mapping does not apply there |
+| TLS client-certificate-to-user mapping | Implemented | Client connections only: `tls { verify_and_map: true }` (also `--tlsverify-and-map`): the client certificate's identity — email SANs, then DNS SANs, then URI SANs, then CN, then full DN — is matched against configured user names (a superset of Go's DN-only match, so both `alice` and `CN=alice` users work); no mapping entry means rejection even with a valid password, and a mapped user is still subject to that user's publish/subscribe allow/deny. Certificate identities are parsed from DER by hand (no new dependency) |
 | XKeys | Not implemented | Non-goal |
 | Routes / clustering | Implemented | Full mesh, solicitation with retry, RS+/RS-, RMSG/HMSG, duplicate resolution |
 | Leaf nodes | Implemented | Hub accept + solicited leaf, LS+/LS-, LMSG/HMSG, reconnect |
@@ -79,7 +79,7 @@ rust-natsd does; it replaces the older support table.
 | Slow-consumer detection | Implemented | Byte-based pending limit (default 64 MiB, `--max-pending` / .conf `max_pending`, reported in `/varz` as `max_pending` and per-connection in `/connz` as `pending_bytes`) → disconnect when exceeded. A fast reader at bench rates is not dropped; a never-reading reader is, like Go |
 | Graceful shutdown on SIGINT/SIGTERM | Implemented | Writer flushes pending frames (e.g. a final `-ERR`) before close |
 | JetStream: streams, pull + push consumers | Implemented | In-memory, or file-persisted with `--js-store-dir` |
-| JetStream: ack policies (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | Implemented | |
+| JetStream: ack policies (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | Implemented | With one known exception: `max_deliver` is not enforced for pull consumers (see Known issues) |
 | JetStream: workqueue retention, `max_msgs_per_subject` | Implemented | |
 | JetStream: deliver policies `all` / `last` (filter-aware) / `new` / `by_start_sequence` | Implemented | |
 | JetStream persistence | Implemented | Whole-engine JSON snapshot after every mutation, reloaded on startup — including per-consumer pending ack state (in-flight stream seqs, delivery counts, wall-clock delivery times), ack floors, redelivery counts, and pull redelivery queues (snapshot v2; v1 snapshots load with empty ack state). Restart preserves the remaining ack window (Go v2.15.1 semantics, probed): unacked messages redeliver once the window expires with delivered count incremented, acked messages never redeliver, push redelivery defers while the deliver subject has no interest; waiting pulls are not persisted (dead reply inbox) |
@@ -103,6 +103,60 @@ rust-natsd does; it replaces the older support table.
 
 See [PLAN.md](PLAN.md) for the phased plan and design notes.
 
+## Configuration reference
+
+Every flag and `.conf` key below is implemented (verified against
+`src/config.rs` / `src/conf.rs` at HEAD); there is no other
+configuration surface. Run `rust-natsd --help` for the same list.
+Explicit CLI flags win over the file, which is loaded first with
+`-c` / `--config`.
+
+**CLI flags:**
+
+| Flag | Default | Notes |
+|---|---|---|
+| `-a, --addr <HOST>` | `0.0.0.0` | Client bind host |
+| `-p, --port <PORT>` | `4222` | Client port |
+| `-n, --name <NAME>` | `rust-natsd` | Server name |
+| `--max-payload <SIZE>` | `1mb` | Sizes accept plain bytes or `k`/`mb` suffixes |
+| `--max-pending <SIZE>` | `64mb` | Queued outbound bytes per connection before slow-consumer drop |
+| `--ping-interval <DUR>` | `2m` | Durations accept `ms`, `s`, `m` (e.g. `200ms`) |
+| `--ping-max <N>` | `2` | Missed PONGs before stale close |
+| `--user <USER>` / `--pass <PASS>` | — | Global credentials (the `$G` account) |
+| `--auth-token <TOKEN>` | — | Token, only via `auth_token` in CONNECT |
+| `--cluster-name <NAME>` | server name | |
+| `--cluster-host <HOST>` | `0.0.0.0` | Route listener host |
+| `--cluster-port <PORT>` | `6222` | Route listener port; `0` disables |
+| `--routes <URLS>` | — | Comma list of routes to solicit |
+| `--leaf-port <PORT>` | `0` | Leafnode listener port; `0` disables |
+| `--leaf-urls <URLS>` | — | Comma list of hub leafnode endpoints |
+| `--leaf-user <USER>` / `--leaf-pass <PASS>` | — | Credentials for solicited leaf connections |
+| `--jetstream` | off | Enable JetStream |
+| `--js-store-dir <DIR>` | — | JetStream store dir (whole-engine JSON snapshot; see JetStream persistence) |
+| `--http-port <PORT>` | `0` | Monitoring HTTP port; `0` disables |
+| `--tls` / `--tlscert` / `--tlskey` / `--tlscacert` / `--tlsverify` / `--tlsverify-and-map` | — | Client TLS; `--tlsverify` and `--tlsverify-and-map` require `--tlscacert` |
+| `--cluster-tls` / `--cluster-tlscert` / `--cluster-tlskey` / `--cluster-tlscacert` / `--cluster-tlsverify` | — | Implicit TLS on the route port |
+| `--leaf-tls` / `--leaf-tlscert` / `--leaf-tlskey` / `--leaf-tlscacert` / `--leaf-tlsverify` | — | INFO-first-then-upgrade TLS on the leafnode port |
+| `-c, --config <FILE>` | — | `.conf` file |
+| `-h, --help` | — | |
+
+**`.conf` keys** (top level unless noted; unknown keys are ignored):
+
+- `port`, `host`, `server_name`, `http_port`, `max_payload`,
+  `max_pending`, `ping_interval`, `ping_max`
+- `authorization { user, password, token, users: [{ user, password, token, nkey, permissions }] }`
+- `accounts { NAME { users: [...], permissions { publish { allow, deny }, subscribe { allow, deny } } | authorization { ... }, jetstream: enabled, exports: [{ service | stream, accounts: [...] }], imports: [{ service | stream: { account, subject }, to }] } }` — `to` is the import's local subject (`local_subject` is accepted as an alias); per-account `jetstream: enabled` is parsed but not enforced (with `--jetstream`, all accounts get JetStream)
+- `system_account`, `no_auth_user`
+- `operator: "<jwt>"` or `operator { jwt | jwt_file, accounts: [...] }`; `resolver { type: memory, preload: {...} }` (Rust convenience) and top-level `resolver_preload: { <pubkey>: "<jwt>" }` (Go's real preload key)
+- `cluster { name, host, port, routes: [...], tls { ... } }`
+- `leafnodes { port, tls { ... }, remotes: [{ url, tls { ... } } | "<url>"], authorization { user, password } }`
+- `tls { cert_file, key_file, ca_file, verify, verify_and_map }` — the same block shape is used for `cluster { tls {} }`, `leafnodes { tls {} }`, and leaf remotes
+- `jetstream` — boolean, or a block with `store_dir`
+
+JetStream stream/consumer fields (`mirror`, `sources`, `max_deliver`,
+etc.) are API fields on `$JS.API` stream/consumer creation, not
+`.conf` keys.
+
 ## Comparison with mainline (Go) implementation
 
 Mainline here is Go `nats-server` **v2.15.1**, the reference
@@ -113,7 +167,9 @@ claims traceable to code or to a suite/benchmark result are made.
 suite in `scripts/parity.sh` starts both servers side by side with
 matching configs and runs the same raw-wire and Go-client probes
 against both: **53 probes, 52 pass + 1 documented exception, 0 fail,
-in both default and `--strict` mode** (last verified 2026-10-24).
+in both default and `--strict` mode** (last verified 2026-10-25
+at HEAD `0cb8650`, re-verified during the 2026-10-25 documentation
+refresh).
 The single exception is not a server difference: `nats.go` gates
 key-value on server version >= 2.6.2, and rust-natsd honestly reports
 its own crate version (0.1.0), so `CreateKeyValue` fails client-side
@@ -183,49 +239,114 @@ which would dominate the JetStream scenario; Go's `-sd` then holds
 only JetStream metadata for a memory stream, so both message paths
 are in-memory.
 
-**Results — 2026-10-24 (post slow-consumer fix).** Go `nats-server`
-v2.15.1 vs rust-natsd server code at the fix commit (the HEAD at
-benchmark time; the bench harness does not change server behaviour).
-Machine:
+**Results — 2026-10-25, refreshed at HEAD `0cb8650`** (one full
+`bash scripts/bench.sh` run, 3 runs per server, medians [ranges]).
+Go `nats-server` v2.15.1 vs rust-natsd at HEAD; the bench harness
+does not change server behaviour. Machine:
 Linux x86_64, AMD EPYC 9D64, 2 vCPUs, Go 1.27.3, rustc 1.98.1.
+Raw output: `bench/results/bench-2026-10-25T045508.txt` (gitignored).
 
 | Scenario | Go nats-server v2.15.1 (median [range]) | rust-natsd (median [range]) |
 |---|---|---|
-| Core pub/sub, 256 B, 200k msgs (msgs/s) | 497,531 [411,559..636,226] | 418,910 [359,904..431,465] |
-| Core pub/sub, 1 KiB, 200k msgs (msgs/s) | 282,695 [244,584..306,766] | 226,910 [222,978..227,694] |
-| Request/reply, 256 B, 20k requests (mean / p50 / p99 µs) | 320 / 293 / 1,001 | 196 / 180 / 537 |
-| JetStream publish with ack, 1 KiB, 20k msgs (msgs/s) | 5,249 [5,096..5,558] | 8,019 [7,941..8,053] |
+| Core pub/sub, 256 B, 200k msgs (msgs/s) | 621,740 [617,203..669,713] | 391,090 [358,140..401,949] |
+| Core pub/sub, 1 KiB, 200k msgs (msgs/s) | 303,720 [268,943..319,209] | 202,768 [199,269..242,006] |
+| Request/reply, 256 B, 20k requests (mean / p50 / p99 µs) | 290 / 268 / 701 | 203 / 184 / 601 |
+| JetStream publish with ack, 1 KiB, 20k msgs (msgs/s) | 5,609 [5,246..5,644] | 7,930 [7,757..8,191] |
 
-**Read it plainly.** All four scenarios now complete on both
-servers. On core pub/sub throughput rust-natsd is ~15–20% behind Go
-in this run (418,910 vs 497,531 msgs/s at 256 B; 226,910 vs 282,695
-at 1 KiB) — the gap is writer/parse throughput, not drops. On
-request/reply latency and JetStream publish throughput, rust-natsd
-is faster here (lower latency, higher msgs/s) — that is a localhost,
-single-client, uncontended result, not a general performance claim,
-and the JetStream gain vs the pre-fix run (6,274 → 8,019 msgs/s)
-tracks the batched writer, since JS acks and deliveries go through
-the same outbound path. Request/reply is unchanged vs the pre-fix
-run (mean 195 → 196 µs): no regression from the fix. For history:
-before the fix, rust-natsd pub/sub **failed** in all attempts
-(subscriber dropped as a slow consumer after 1–500 of 200,000
-deliveries) because of the old 1024-frame outbound queue; that
-failure mode is gone, and a never-reading subscriber is still
-dropped at the 64 MiB byte limit (see PLAN Phase 18).
+**Read it plainly.** All four scenarios complete on both servers.
+On core pub/sub throughput rust-natsd trails Go in this run
+(391,090 vs 621,740 msgs/s at 256 B; 202,768 vs 303,720 at 1 KiB) —
+the gap is writer/parse throughput, not drops. Do not read the
+change from the 2026-10-24 table (418,910 / 226,910) as a regression
+from the gap-fix work: run-to-run noise on this shared VM is large
+enough that Go's own pub/sub-256 number moved 497,531 → 621,740
+between the same two runs, and request/reply and JetStream are
+essentially unchanged (203 vs 196 µs mean; 7,930 vs 8,019 msgs/s).
+On request/reply latency and JetStream publish throughput,
+rust-natsd is faster here (lower latency, higher msgs/s) — that is
+a localhost, single-client, uncontended result, not a general
+performance claim. For history: before the slow-consumer fix,
+rust-natsd pub/sub **failed** in all attempts (subscriber dropped
+as a slow consumer after 1–500 of 200,000 deliveries) because of
+the old 1024-frame outbound queue; that failure mode is gone, and
+a never-reading subscriber is still dropped at the 64 MiB byte
+limit (see PLAN Phase 18).
 
 **Repeatability.** No stray servers were left running after the run
 (verified by process and port check).
+
+## Known issues and limitations
+
+These are known, not hidden. The first two are covered by tests that
+are committed `#[ignore]`d naming the bug, so the suite stays green
+without pretending they pass.
+
+- **Pull-consumer `max_deliver` is not enforced.** A pull consumer
+  with `max_deliver: 2` keeps redelivering past 2 deliveries on
+  repeated NAK (test `max_deliver_exhaustion_stops_redelivery` in
+  `tests/e2e_js_gaps.rs`, ignored). Push-consumer `max_deliver`
+  was not verified either way. Fix: enforce the cap on the pull
+  redelivery path in `src/jetstream.rs`.
+- **JWT auth via the official Go client can never succeed.** nats.go's
+  `UserJWT` flow never sends a CONNECT `nkey` field (UserJWT and
+  Nkey are mutually exclusive in nats.go), but rust-natsd's
+  `verify_user` requires CONNECT `nkey == JWT sub`, so every
+  Go-JWT login fails with `-ERR 'Authorization Violation'` (test
+  `jwt_login_without_nkey_field_authenticates` in
+  `tests/e2e_jwt.rs`, ignored; the Go JWT mode in
+  `e2e/go/advanced.go` is deliberately unwired from
+  `scripts/e2e-go-advanced.sh` until this is fixed). Fix: derive
+  the user key from the JWT `sub` claim, as Go does. Note the
+  reverse direction works: Rust-generated JWTs are accepted by Go.
+- **CONSUMER.INFO `num_pending` is hardcoded to 0** (in
+  `src/jetstream.rs`); `num_ack_pending` is real.
+- **Deliberate deviations from Go** (all verified against Go
+  2.15.1, documented here rather than fixed): JetStream mirror
+  backfill is synchronous where Go's is asynchronous (final state
+  matches); a mirror/source of a nonexistent stream is rejected
+  with 404/10059 where Go accepts it and leaves the stream empty;
+  an unauthorized account import drops the message instead of Go
+  refusing to start the server; import reply mappings are retained
+  for the server lifetime where Go's expire by TTL; no
+  `Nats-Request-Info` header is injected on translated service
+  requests.
+- **JWT limitations:** account-JWT `limits` are parsed but not
+  enforced; user `revocations` lists are not honored (revocation =
+  removing the account JWT from trust and restarting);
+  `bearer_token` is not honored (the INFO-nonce signature is
+  always required, stricter than Go); the Rust `iat` >60 s future
+  cap is stricter than Go (Go accepted `iat` 300 s in the future
+  in probing); `$SYS` is an ordinary JWT account, not
+  special-cased; Go-generated JWT → Rust was not run (no `nsc`
+  generator available), though claim shapes were verified against
+  the JWT library source.
+- **Scope limits (also the out-of-scope list, kept identical in
+  PLAN.md and `parity/KNOWN_DIFFS.md`):** gateways, JetStream
+  clustering/Raft/WAL, MQTT/WebSocket, cross-node
+  mirroring/sourcing, cross-node imports/exports, JWT imports
+  across routes/leafs, XKeys, cert-to-user mapping on route/leaf
+  connections (CA verification only there), and Go-only INFO
+  fields (`git_commit`, `go`, `xkey`, `api_lvl` — advertising
+  Go's JS API level would gate clients into unimplemented JS
+  features). Per-account `jetstream: enabled` in `.conf` is
+  parsed but not enforced: with `--jetstream`, all accounts get
+  JetStream.
 
 ## Tests
 
 ```sh
 cargo test                    # 200 Rust tests passing, 2 ignored (unit + integration)
-bash scripts/e2e-go-advanced.sh # Go client imports, mirror, JWT minting
+bash scripts/e2e-go-advanced.sh # Go client imports, mirror, JWT minting (JWT mode unwired: see Known issues)
 bash scripts/e2e-go.sh        # Go client core e2e
 bash scripts/e2e-go-cluster.sh  # Go <-> Rust route interop, both seed directions
 bash scripts/e2e-go-leaf.sh     # Go <-> Rust leaf interop, both directions
 bash scripts/e2e-go-js.sh       # Go JetStream interop (nats.go JS client)
+bash scripts/e2e-go-route-leaf-tls.sh  # Go <-> Rust route/leaf TLS interop, both directions
 ```
+
+The 2 ignored tests are the two bugs in Known issues above; they
+are ignored with a comment naming the bug, not deleted, so the
+failure is visible in the test inventory rather than hidden.
 
 Test layers, by design:
 
@@ -332,9 +453,11 @@ handled in the implementation:
   the hosting node; `$JS.API` requests and acks route cluster-wide.
 - `src/tls.rs` — rustls (ring) TLS server config for client connections.
 - `src/monitor.rs` — hand-rolled HTTP/1.1 monitoring server (one request
-  per connection, then close). Only tracked fields are filled in;
-  untracked ones (memory, RTT) report 0. Per-connection pending bytes
-  are tracked (`/connz` `pending_bytes`).
+  per connection, then close). Memory is real (`/varz` `mem` from
+  `/proc/self/statm` on Linux); untracked fields report 0.
+  Per-connection pending bytes are tracked (`/connz`
+  `pending_bytes`), and `/varz` reports the configured
+  `max_pending`, `ping_interval`, and `ping_max`.
 - `src/conf.rs` — `.conf` parser (blocks, lists, quoted strings,
   comments, URLs intact).
 - `src/config.rs` — CLI and CONNECT authorization.

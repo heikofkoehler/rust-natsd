@@ -1,6 +1,7 @@
 # Parity residue: rust-natsd vs Go nats-server v2.15.1
 
-As of the parity-fix work (2026-10-24), **there are no remaining known
+As of the parity-fix work (2026-10-24), re-verified 2026-10-25 at
+HEAD `0cb8650`, **there are no remaining known
 server diffs**. Every divergence in the previous edition of this file
 is fixed and passes in both default and `--strict` mode:
 
@@ -88,17 +89,51 @@ client that does not apply nats.go's version gate, and will become
 usable through nats.go itself when rust-natsd's own version reaches
 2.6.2.
 
-## Deliberately out of scope (unchanged)
+## Known issues and deliberate deviations (not parity diffs)
+
+These are server behaviours that differ from Go or are unfinished,
+found by tests (not by parity probes) and recorded here so this file,
+README, and PLAN agree. They do not fail the parity run, because the
+parity probes do not cover them — that is a coverage statement, not
+a claim that they match Go.
+
+- **Pull-consumer `max_deliver` not enforced.** Redeliveries
+  continue past the configured cap (test
+  `max_deliver_exhaustion_stops_redelivery`, `#[ignore]`d).
+- **JWT auth via the official Go client never succeeds.** nats.go
+  UserJWT never sends a CONNECT `nkey` field, but rust-natsd
+  requires `nkey == JWT sub` (test
+  `jwt_login_without_nkey_field_authenticates`, `#[ignore]`d;
+  fix: derive the user key from the JWT `sub`, as Go does).
+- **CONSUMER.INFO `num_pending` hardcoded to 0**;
+  `num_ack_pending` is real.
+- **Deliberate deviations from Go** (verified against 2.15.1):
+  mirror backfill synchronous (Go async, final state matches);
+  mirror/source of a nonexistent stream rejected 404/10059 (Go
+  accepts and leaves empty); unauthorized import drops the message
+  (Go refuses to start); import reply mappings retained for server
+  lifetime (Go's expire by TTL); no `Nats-Request-Info` header on
+  translated service requests; JWT `limits` not enforced,
+  `revocations` not honored, `bearer_token` not honored (nonce
+  signature always required), `iat` >60 s future cap stricter
+  than Go, `$SYS` not special-cased, Go-generated JWT → Rust not
+  run (no `nsc`); cert-to-user mapping is client-connections only
+  (route/leaf use CA verification only).
+
+## Deliberately out of scope (unchanged, and identical to the
+README Known issues list and PLAN's Future work list)
 
 - Gateways (super-cluster): Rust returns an empty `/gatewayz`; no
   gateway protocol is implemented (design note: PLAN Phase 24).
 - JetStream clustering/replication: single-node only (design note:
   PLAN Phase 25). Mirroring/sourcing are implemented same-node only;
   cross-node mirroring/sourcing remain out of scope.
+- Cross-node imports/exports; JWT imports across routes/leafs.
 - MQTT/WebSocket: not implemented in rust-natsd (see README
   non-goals); not probed. JWT operator mode, route/leaf TLS, and TLS
   client-certificate-to-user mapping are now implemented (see
   README/PLAN) and are no longer in this out-of-scope list.
+- XKeys: not implemented.
 - Byte-identical monitoring JSON: compared on supported fields only.
 - Exact per-member queue distribution: compared on totals only (Go
   random-ish, Rust round-robin, both exactly once).
