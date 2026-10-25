@@ -440,6 +440,7 @@ impl Engine {
             mirror: mirror.clone(),
             sources: sources.clone(),
             source_token: make_source_token(name, created_ns),
+            wal_rewrite: false,
         };
         self.streams.insert(name.to_string(), stream);
         // Backfill (synchronous, under the engine lock, before the
@@ -629,6 +630,9 @@ impl Engine {
                 for (i, m) in stream.messages.iter_mut().enumerate() {
                     m.seq = base + i as u64;
                 }
+                // Renumbered in place: the WAL diff cannot track
+                // this append-only, so force a msgs.wal rewrite.
+                stream.wal_rewrite = true;
                 for c in stream.consumers.values_mut() {
                     c.pending.clear();
                     c.redeliver.clear();

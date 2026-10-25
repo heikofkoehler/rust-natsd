@@ -3,12 +3,15 @@
 //! `$JS.API` surface.
 //!
 //! Scope notes (also in the README):
-//! - Persistence: when a store dir is configured (`--js-store-dir` /
-//!   `jetstream.store_dir`), the whole engine is snapshotted to JSON
-//!   (payloads base64-encoded) after every mutation and reloaded on
-//!   startup. Without a store dir the engine is purely in-memory and
-//!   data is lost on restart. A stream created with file storage but
-//!   no store dir is accepted but stays in-memory.
+//! - Persistence (Phase 30 WAL): when a store dir is configured
+//!   (`--js-store-dir` / `jetstream.store_dir`), every mutation is
+//!   appended to a per-account/per-stream WAL (`meta.json` +
+//!   `msgs.wal` + `consumers/*.wal`, CRC-checked frames) and
+//!   replayed on startup; a legacy whole-engine JSON snapshot is
+//!   migrated once when no WAL layout exists yet. Without a store
+//!   dir the engine is purely in-memory and data is lost on
+//!   restart. A stream created with file storage but no store dir
+//!   is accepted but stays in-memory.
 //! - Pending ack state IS persisted (snapshot version 2): per-consumer
 //!   delivered-but-unacked entries (consumer seq, stream seq, delivery
 //!   count, wall-clock delivery time), the ack floor, the redelivery
@@ -70,9 +73,11 @@
 //! `Consumer`, …) and small helpers. The `$JS.API` request router and
 //! stream/consumer API handlers live in `api`, stream state, capture,
 //! dedup and retention in `stream`, consumer state machines in
-//! `consumer`, and the atomic JSON snapshot persistence in `storage`.
-//! The snapshot format (v2, incl. pending ack state) is unchanged; the
-//! WAL is a later phase, not this one.
+//! `consumer`, and persistence in `storage`. Phase 30 replaced the
+//! atomic JSON snapshot write path with an append-only WAL there
+//! (the snapshot-v2 format survives as the migration source and
+//! as the WAL-load assembly format, so pending ack state, ack
+//! floors, redelivery queues, and dedup ids reload identically).
 //!
 //! Actions pattern (unchanged): engine methods never deliver while
 //! holding `engine.lock()` — they return `Vec<Action>` and the caller
@@ -104,13 +109,15 @@ pub(crate) const DEFAULT_ACK_WAIT: Duration = Duration::from_secs(30);
 /// Redelivery / pull-expiry tick interval.
 pub(crate) const TICK: Duration = Duration::from_millis(100);
 
-/// JetStream engine handle. When `store_dir` is set, the whole
-/// engine is snapshotted to JSON in that directory (atomically, via
-/// temp file + rename) after every mutating operation, and reloaded
-/// on startup. Without a store dir the engine is purely in-memory.
+/// JetStream engine handle. When `store_dir` is set, mutations
+/// are appended to the WAL in that directory (see `storage.rs`)
+/// after every mutating operation, and replayed on startup.
+/// Without a store dir the engine is purely in-memory.
 pub struct JetStream {
     pub(crate) engine: Mutex<Engine>,
     pub(crate) store_dir: Option<std::path::PathBuf>,
+    pub(crate) wal: Mutex<Option<storage::FileWalStore>>,
+    pub(crate) shadow: Mutex<storage::Shadow>,
 }
 
 impl JetStream {
@@ -175,20 +182,28 @@ impl JetStream {
         Self::with_store_dir(None)
     }
 
-    /// Create an engine, restoring a snapshot from `store_dir` when
-    /// one exists there.
+    /// Create an engine, restoring from the WAL layout in
+    /// `store_dir` when one exists there (else migrating a legacy
+    /// snapshot once, else starting empty).
     pub fn with_store_dir(store_dir: Option<std::path::PathBuf>) -> Self {
-        let engine = match &store_dir {
-            Some(dir) => Self::load_snapshot(dir).unwrap_or_else(|| Engine {
-                streams: HashMap::new(),
-            }),
-            None => Engine {
-                streams: HashMap::new(),
+        match &store_dir {
+            Some(dir) => {
+                let (engine, wal, shadow) = Self::load_engine_and_store(dir);
+                JetStream {
+                    engine: Mutex::new(engine),
+                    store_dir,
+                    wal: Mutex::new(Some(wal)),
+                    shadow: Mutex::new(shadow),
+                }
+            }
+            None => JetStream {
+                engine: Mutex::new(Engine {
+                    streams: HashMap::new(),
+                }),
+                store_dir,
+                wal: Mutex::new(None),
+                shadow: Mutex::new(storage::Shadow::default()),
             },
-        };
-        JetStream {
-            engine: Mutex::new(engine),
-            store_dir,
         }
     }
 }
@@ -268,6 +283,11 @@ pub(crate) struct Stream {
     /// per-origin-stream id; this one is generated at creation and
     /// persisted).
     pub(crate) source_token: String,
+    /// Phase 30: set when messages were renumbered in place
+    /// (filtered purge), forcing the WAL writer to rewrite this
+    /// stream's `msgs.wal` instead of trusting the append-only
+    /// diff. Cleared by the sync that performs the rewrite.
+    pub(crate) wal_rewrite: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]

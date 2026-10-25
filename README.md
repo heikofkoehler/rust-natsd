@@ -82,7 +82,7 @@ rust-natsd does; it replaces the older support table.
 | JetStream: ack policies (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | Implemented | `max_deliver` enforced for pull and push consumers on both the -NAK path and the ack-wait sweep; exhaustion publishes the Go `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>` advisory (type `io.nats.jetstream.advisory.v1.max_deliver`) and, for workqueue streams, leaves the message in the stream (only a plain +ACK deletes it), as Go v2.15.1 does |
 | JetStream: workqueue retention, `max_msgs_per_subject` | Implemented | |
 | JetStream: deliver policies `all` / `last` (filter-aware) / `new` / `by_start_sequence` | Implemented | |
-| JetStream persistence | Implemented | Whole-engine JSON snapshot after every mutation, reloaded on startup — including per-consumer pending ack state (in-flight stream seqs, delivery counts, wall-clock delivery times), ack floors, redelivery counts, and pull redelivery queues (snapshot v2; v1 snapshots load with empty ack state). Restart preserves the remaining ack window (Go v2.15.1 semantics, probed): unacked messages redeliver once the window expires with delivered count incremented, acked messages never redeliver, push redelivery defers while the deliver subject has no interest; waiting pulls are not persisted (dead reply inbox) |
+| JetStream persistence | Implemented | Append-only WAL under `<store_dir>/<account>/streams/<stream>/` (Phase 30): `meta.json` (stream config, base sequence, dedup ids), `msgs.wal` (CRC32-checked framed appends + tombstones, O(1) per append), `consumers/<consumer>.wal` (consumer-state append log, checkpointed every 128 records). A legacy whole-engine JSON snapshot is migrated once when no WAL layout exists yet. Persisted state is unchanged from snapshot v2 — per-consumer pending ack state (in-flight stream seqs, delivery counts, wall-clock delivery times), ack floors, redelivery counts, and pull redelivery queues — so restart preserves the remaining ack window (Go v2.15.1 semantics, probed): unacked messages redeliver once the window expires with delivered count incremented, acked messages never redeliver, push redelivery defers while the deliver subject has no interest; waiting pulls are not persisted (dead reply inbox). A corrupt/truncated WAL tail is truncated on load (logged) and never accepted; compaction rewrites `msgs.wal` with live messages only once tombstoned/evicted bytes exceed 50% of a file larger than 1 MiB |
 | JetStream clustering / replication | Not implemented | Remainder, not implemented — design note in PLAN Phase 25 (Raft/WAL scope); single-node only, no replication, no high availability |
 | JetStream mirroring / sourcing | Implemented (same node) | `mirror` / `sources` in STREAM.CREATE (`name`, `filter_subject`, `opt_start_seq`, `opt_start_time`); backfill at creation then live copies via the capture hook (atomic under the engine lock: no loss, no duplicates); mirror copies are exact, source copies add a `Nats-Stream-Source` header; origin delete keeps copies but kills the link permanently, purge leaves the mirror untouched. Cross-node mirroring/sourcing (routes/leafs, `external`) is NOT implemented and is rejected at creation. One deliberate deviation from Go: a mirror/source of a nonexistent stream is rejected with 404/10059 instead of Go's accept-and-leave-empty |
 | JetStream `$JS.API` routing across routes/leafs (`$JS.API.>` interest) | Implemented | |
@@ -132,7 +132,7 @@ Explicit CLI flags win over the file, which is loaded first with
 | `--leaf-urls <URLS>` | — | Comma list of hub leafnode endpoints |
 | `--leaf-user <USER>` / `--leaf-pass <PASS>` | — | Credentials for solicited leaf connections |
 | `--jetstream` | off | Enable JetStream |
-| `--js-store-dir <DIR>` | — | JetStream store dir (whole-engine JSON snapshot; see JetStream persistence) |
+| `--js-store-dir <DIR>` | — | JetStream store dir (append-only WAL; see JetStream persistence) |
 | `--http-port <PORT>` | `0` | Monitoring HTTP port; `0` disables |
 | `--tls` / `--tlscert` / `--tlskey` / `--tlscacert` / `--tlsverify` / `--tlsverify-and-map` | — | Client TLS; `--tlsverify` and `--tlsverify-and-map` require `--tlscacert` |
 | `--cluster-tls` / `--cluster-tlscert` / `--cluster-tlskey` / `--cluster-tlscacert` / `--cluster-tlsverify` | — | Implicit TLS on the route port |
@@ -234,7 +234,7 @@ single best run**. This box is a shared VM (2 vCPUs), so the numbers
 are noisy; treat them as an order-of-magnitude comparison, not a
 precise ranking. One fairness note: rust-natsd runs *without*
 `--js-store-dir` in the benchmark, because with a store dir it
-snapshots the whole engine JSON after every mutating operation,
+appends every mutation to the WAL,
 which would dominate the JetStream scenario; Go's `-sd` then holds
 only JetStream metadata for a memory stream, so both message paths
 are in-memory.
@@ -439,8 +439,10 @@ handled in the implementation:
   helpers), `api.rs` (`$JS.API.>` router, stream API handlers, error
   codes), `stream.rs` (stream state, capture, dedup, retention,
   mirroring/sourcing), `consumer.rs` (push/pull state machines,
-  `MSG.NEXT`, tick, redelivery loop), `storage.rs` (atomic JSON snapshot
-  persistence). Public exports unchanged (`JetStream`, `handle_message`,
+  `MSG.NEXT`, tick, redelivery loop), `storage.rs` (Phase 30 append-only
+  WAL persistence: `JsStore` trait + `FileWalStore`, CRC-checked
+  frames, legacy-snapshot migration, compaction; the snapshot-v2
+  format survives as the migration source and WAL-load assembly). Public exports unchanged (`JetStream`, `handle_message`,
   `redelivery_loop`, `rfc3339`).
 - `src/tls.rs` — rustls (ring) TLS server config for client connections.
 - `src/monitor.rs` — hand-rolled HTTP/1.1 monitoring server (one request

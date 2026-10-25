@@ -1145,6 +1145,149 @@ for current behaviour.
   README Design section file layout; this PLAN entry.
   `parity/KNOWN_DIFFS.md` intentionally untouched.
 
+### Phase 30 — JetStream WAL: replace the whole-engine JSON snapshot write path (2026-10-25)
+- Renumbering: this work was planned as Phase 29, but PLAN.md
+  already has a Phase 29 (modularization), so the WAL is recorded
+  as Phase 30 (plan 29 → 30). The Phase 27, 28A–C, and 29 entries
+  are untouched. One commit, local only (not pushed).
+- Storage abstraction (`src/jetstream/storage.rs`, `JsStore`
+  trait): `save_stream_meta` / `delete_stream` / `append_msg` /
+  `delete_msg` / `save_consumer_state` / `delete_consumer` /
+  `needs_compaction` / `compact_msgs`. `FileWalStore` is the only
+  implementation. Trait signatures were adapted to the actual
+  post-modularization types (`Stream`, `StoredMsg`, `Consumer`
+  as they exist in `jetstream/mod.rs`); there is no separate
+  `StreamConfig`/`ConsumerSnapshot` type in this codebase, so
+  the plan's nominal signatures are realised as: stream meta
+  from `&Stream`, consumer state from `&Consumer` (serialised
+  with the snapshot-v2 consumer fragment, shared with the
+  legacy snapshot code via `consumer_snapshot_json`).
+- Layout: `<store_dir>/<account>/streams/<stream>/meta.json`
+  (stream config/metadata, base sequence, dedup ids),
+  `msgs.wal`, `consumers/<consumer>.wal`. Names are sanitised
+  for path components (`[^A-Za-z0-9._-]` → `_`); `meta.json`
+  carries the authoritative names. A sanitised collision would
+  merge two names — documented, not silently worked around.
+- Frame format, exactly as planned: `[magic u32][crc32 u32]
+  [record_type u8][seq u64][timestamp i64][subject_len u16]
+  [headers_len u32][payload_len u32][bytes...]` with `bytes` =
+  `subject ++ headers ++ payload`; AppendMsg `0x01`,
+  TombstoneSeq `0x02` (msgs.wal), ConsumerState `0x03`
+  (consumers/*.wal, payload is the consumer snapshot JSON).
+  CRC32 is IEEE, hand-rolled (no new dependency); it covers
+  everything after the CRC field. Appends are O(1) single
+  writes with cached file handles and no fsync (a graceful
+  restart sees every completed write; only a machine crash
+  could lose the OS-buffered tail).
+- Write path is a diff, not a rewrite: `JetStream::persist`
+  (still called after every `handle_message` and every
+  redelivery tick, still never dispatching deliveries while
+  holding `engine.lock()` — the actions pattern is unchanged)
+  compares the live engine against a shadow of the last
+  persisted state and appends only the delta: new tail
+  messages, tombstones for newly deleted/evicted sequences,
+  a fresh `meta.json` only when config, base sequence,
+  mirror/source liveness, or dedup ids changed, and one
+  consumer record per changed consumer. Dedup ids live in
+  `meta.json` (adaptation: no third record type; meta is
+  rewritten only when the dedup map changes, and the dedup
+  window still restarts on reload, as in snapshot v2). The
+  one in-place renumbering operation — filtered purge — sets
+  `Stream::wal_rewrite`, forcing a `msgs.wal` rewrite; a
+  wholesale stream replace (new `created_ns`) and a base
+  sequence moving backwards take the same defensive path.
+- CRC/corruption behaviour (fail-closed, chosen option):
+  replay stops at the first record failing magic, length, or
+  CRC, and the corrupt/truncated tail is truncated on load
+  (logged) — corrupt bytes never enter the engine. A corrupt
+  `meta.json` skips that one stream (logged), matching the
+  legacy snapshot's start-without-unreadable-data behaviour
+  rather than refusing the whole server. Tested: flipping
+  the last payload byte of `msgs.wal` drops exactly that
+  message on restart, keeps the rest, and shrinks the file.
+- Startup migration: if `rust-natsd-js.json` exists and no
+  per-account WAL layout exists yet, the legacy snapshot
+  (v2, including pending ack state) is loaded once and
+  written out through the WAL. The legacy file is left in
+  place; a second start sees the WAL layout and never
+  re-migrates. Re-migration would still be idempotent
+  (replay keys messages by sequence; consumer state is
+  last-record-wins), but the layout check makes it
+  unnecessary. Tested end to end: legacy snapshot → start
+  (migrated, WAL files present) → publish → restart →
+  restart again, message set identical each time.
+- Compaction: when a stream's tombstoned/evicted bytes exceed
+  50% of its `msgs.wal` size AND the file is larger than
+  1 MiB, the next persist rewrites `msgs.wal` with only the
+  live messages. Tested against the store directly with a
+  small threshold override (a store-level test setter, not
+  a production config knob): 10 appends, 8 tombstoned,
+  trigger fires, rewrite leaves exactly the 2 live messages.
+  Consumer logs checkpoint after 128 appended state
+  records (rewrite to just the latest record).
+- Persisted fields: nothing dropped. Streams, messages,
+  headers, timestamps, base sequence, dedup ids, consumer
+  definitions, positions, pending ack state, ack floors,
+  redelivery counts, and pull redelivery queues all reload
+  identically to snapshot v2, because WAL load assembles a
+  snapshot-v2 document (meta + replayed messages + last
+  consumer records) and feeds the unchanged
+  `from_snapshot_json`, including its deadline recomputation.
+  Waiting pulls are still not persisted (dead reply inbox).
+  The old whole-engine snapshot path is no longer the write
+  path: `snapshot_json` survives only as the migration-source
+  format reference (round-trip unit test) and `load_snapshot`
+  only as the migration loader.
+- `tests/e2e_js_persistence.rs` passes unchanged in behaviour
+  (no test in it asserts on the legacy file layout, so no
+  update was needed). New `tests/e2e_js_wal.rs`: legacy
+  migration + double-restart idempotency, corrupt-tail
+  truncation, filtered-purge WAL rewrite, and the 10,000-
+  message stress test.
+- Stress test, honest numbers (payload `msg-%05d` +
+  `-0123456789abcdef`, 26 bytes): direct WAL appends of
+  10,000 records take ~53 ms in a debug build — the <1 s
+  plan gate, asserted in the store unit test, passes with
+  20x headroom. The end-to-end sequential async-nats
+  publish+ack loop over the same 10,000 messages takes
+  ~6.5–7.6 s in debug (run-to-run VM noise), and that is
+  NOT a WAL cost: the in-memory (no persistence at all)
+  baseline for the same loop is ~225 us per publish
+  (~2.25 s per 10,000), fire-and-forget WAL sends cost
+  ~212 us vs ~71 us in-memory (~140 us WAL overhead per
+  publish, of which the diff-sync itself is ~41 us), and
+  pipelined WAL publishes take ~2.9 s per 10,000. So the
+  end-to-end loop cannot meet <1 s in a debug build for any
+  persistence implementation; the integration stress test
+  therefore keeps the full 10,000 messages, real payloads,
+  and real WAL with reload verification, prints its wall
+  time, and does not assert <1 s on the client loop (the
+  gate assertion lives in the store unit test, where
+  persistence is what is measured). No test was tuned to
+  pass: no fewer messages, no smaller payloads, no
+  in-memory shortcut.
+- Note: `src/jetstream/storage.rs` is now ~1,800 lines,
+  over the Phase 29 "no file exceeds 1,200 lines" gate for
+  the split; that gate was for the refactor, not this
+  phase, but a future storage split (frames vs. store vs.
+  sync) is the obvious follow-up if the file keeps growing.
+- Verification (same commit): `cargo fmt --check` clean;
+  `cargo clippy --all-targets -- -D warnings` clean;
+  `cargo test` 224 passed / 0 failed / 0 ignored (baseline
+  215 + 5 new lib unit tests + 4 new WAL integration tests);
+  `tests/e2e_js_persistence.rs` 8 passed (unchanged);
+  `bash scripts/e2e-go.sh` OK (all Go e2e checks passed,
+  plain + auth); `bash scripts/parity.sh` GREEN — raw probes
+  52 pass / 1 exception / 0 fail of 53 (the exception is the
+  documented nats.go KV client version gate), JS full PASS,
+  JS persistence-restart PASS, cluster smoke PASS, leaf smoke
+  PASS. Docs synced in
+  the same commit: README JetStream persistence section
+  (WAL layout, migration, compaction) and this PLAN entry.
+  `parity/KNOWN_DIFFS.md` intentionally untouched: no
+  behavioural difference closed (persistence behaviour is
+  identical; only the on-disk mechanism changed).
+
 ## Future work (not in this plan)
 - Gateways (Phase 24) and JetStream clustering/replication
   (Phase 25): documented remainders with design notes, not
