@@ -4,11 +4,16 @@
 //! TLS cert-identity candidate ordering. These use only public APIs
 //! (no server behaviour is exercised here).
 
-use rust_natsd::config::{parse_duration, parse_route_url, parse_size, split_list, Config, Permissions};
 use rust_natsd::conf;
+use rust_natsd::config::{
+    parse_duration, parse_route_url, parse_size, split_list, Config, Permissions,
+};
 use rust_natsd::jwt::{encode_jwt, permissions_from_nats, verify_jwt};
 use rust_natsd::protocol::{ClientOp, Parser};
-use rust_natsd::subject::{has_empty_token, is_valid_publish_subject, is_valid_subscribe_subject, pattern_covers, subject_matches, translate_subject};
+use rust_natsd::subject::{
+    has_empty_token, is_valid_publish_subject, is_valid_subscribe_subject, pattern_covers,
+    subject_matches, translate_subject,
+};
 use rust_natsd::tls::CertIdentity;
 use serde_json::json;
 
@@ -118,7 +123,9 @@ fn parser_payload_split_across_many_feeds() {
         p.feed(&[*b]);
     }
     match p.next_op().unwrap().unwrap() {
-        ClientOp::Pub { subject, payload, .. } => {
+        ClientOp::Pub {
+            subject, payload, ..
+        } => {
             assert_eq!(subject, "split.me");
             assert_eq!(payload.as_ref(), b"hello");
         }
@@ -135,7 +142,12 @@ fn parser_hpub_header_payload_split() {
     p.feed(hdrs);
     p.feed(b"abc\r\n");
     match p.next_op().unwrap().unwrap() {
-        ClientOp::HPub { subject, headers, payload, .. } => {
+        ClientOp::HPub {
+            subject,
+            headers,
+            payload,
+            ..
+        } => {
             assert_eq!(subject, "h.sub");
             assert_eq!(headers.as_ref(), hdrs);
             assert_eq!(payload.as_ref(), b"abc");
@@ -311,17 +323,29 @@ fn jwt_verify_time_branches() {
     // exp in the past rejects; exp in the future accepts.
     let tok = jwt_token(jwt_claims(&op_pub, &user_pub, json!({"exp": now - 1})), &op);
     assert!(verify_jwt(&tok, &op_pub, now).is_err());
-    let tok = jwt_token(jwt_claims(&op_pub, &user_pub, json!({"exp": now + 3600})), &op);
+    let tok = jwt_token(
+        jwt_claims(&op_pub, &user_pub, json!({"exp": now + 3600})),
+        &op,
+    );
     assert!(verify_jwt(&tok, &op_pub, now).is_ok());
 
     // nbf in the future rejects.
-    let tok = jwt_token(jwt_claims(&op_pub, &user_pub, json!({"nbf": now + 60})), &op);
+    let tok = jwt_token(
+        jwt_claims(&op_pub, &user_pub, json!({"nbf": now + 60})),
+        &op,
+    );
     assert!(verify_jwt(&tok, &op_pub, now).is_err());
 
     // iat far in the future rejects; modest skew is tolerated.
-    let tok = jwt_token(jwt_claims(&op_pub, &user_pub, json!({"iat": now + 3600})), &op);
+    let tok = jwt_token(
+        jwt_claims(&op_pub, &user_pub, json!({"iat": now + 3600})),
+        &op,
+    );
     assert!(verify_jwt(&tok, &op_pub, now).is_err());
-    let tok = jwt_token(jwt_claims(&op_pub, &user_pub, json!({"iat": now + 30})), &op);
+    let tok = jwt_token(
+        jwt_claims(&op_pub, &user_pub, json!({"iat": now + 30})),
+        &op,
+    );
     assert!(verify_jwt(&tok, &op_pub, now).is_ok());
 }
 
@@ -368,7 +392,11 @@ fn base64_url(data: &[u8]) -> String {
     const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(ALPH[(n >> 18) as usize & 63] as char);
         out.push(ALPH[(n >> 12) as usize & 63] as char);
@@ -385,7 +413,9 @@ fn base64_url(data: &[u8]) -> String {
 #[test]
 fn jwt_permissions_from_nats_shapes() {
     // Bare string counts as a one-element allow list.
-    let p = permissions_from_nats(&json!({"pub": "news.>", "sub": {"allow": ["a"], "deny": ["a.secret"]}}));
+    let p = permissions_from_nats(
+        &json!({"pub": "news.>", "sub": {"allow": ["a"], "deny": ["a.secret"]}}),
+    );
     assert!(p.can_publish("news.today"));
     assert!(!p.can_publish("other"));
     assert!(p.can_subscribe("a"));

@@ -112,13 +112,11 @@ async fn file_accounts_isolate_clients_end_to_end() {
     .connect(format!("nats://{}", srv.addr))
     .await
     .expect("alice connects");
-    let bob = async_nats::ConnectOptions::with_user_and_password(
-        "bob".to_string(),
-        "bobpw".to_string(),
-    )
-    .connect(format!("nats://{}", srv.addr))
-    .await
-    .expect("bob connects");
+    let bob =
+        async_nats::ConnectOptions::with_user_and_password("bob".to_string(), "bobpw".to_string())
+            .connect(format!("nats://{}", srv.addr))
+            .await
+            .expect("bob connects");
     let mut bob_sub = bob
         .subscribe("shared.topic".to_string())
         .await
@@ -155,7 +153,10 @@ async fn file_jetstream_store_dir_serves_jsz() {
     let cfg = Config::from_args(&["-c".to_string(), path.to_string_lossy().to_string()])
         .expect("load conf");
     assert!(cfg.jetstream);
-    assert_eq!(cfg.js_store_dir.as_deref(), Some(dir.as_path().to_str().unwrap()));
+    assert_eq!(
+        cfg.js_store_dir.as_deref(),
+        Some(dir.as_path().to_str().unwrap())
+    );
     let srv = server::start(cfg).await.expect("server starts");
     let mut stream = tokio::net::TcpStream::connect(srv.http_addr.unwrap())
         .await
@@ -169,7 +170,10 @@ async fn file_jetstream_store_dir_serves_jsz() {
     stream.read_to_end(&mut raw).await.expect("read");
     let text = String::from_utf8_lossy(&raw);
     assert!(text.starts_with("HTTP/1.1 200"), "jsz via file: {text}");
-    assert!(text.contains("\"store_dir\""), "jsz must report store_dir: {text}");
+    assert!(
+        text.contains("\"store_dir\""),
+        "jsz must report store_dir: {text}"
+    );
     srv.shutdown().await.expect("shutdown");
     std::fs::remove_file(&path).ok();
     std::fs::remove_dir_all(&dir).ok();

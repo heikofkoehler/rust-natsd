@@ -151,7 +151,10 @@ async fn verbose_ok_precedes_self_delivery() {
     let (read, mut writer) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut info = String::new();
-    timeout(T, reader.read_line(&mut info)).await.unwrap().unwrap();
+    timeout(T, reader.read_line(&mut info))
+        .await
+        .unwrap()
+        .unwrap();
     writer
         .write_all(b"CONNECT {\"verbose\":true}\r\nPING\r\n")
         .await
@@ -206,11 +209,7 @@ async fn echo_false_suppresses_only_self_delivery() {
 async fn no_responders_true_sends_503_and_false_sends_nothing() {
     let srv = start_server(test_config()).await;
     // headers:true so the 503 arrives as HMSG, not stripped to MSG.
-    let mut c = RawClient::connect(
-        srv.addr,
-        "{\"headers\":true,\"no_responders\":true}",
-    )
-    .await;
+    let mut c = RawClient::connect(srv.addr, "{\"headers\":true,\"no_responders\":true}").await;
     c.send_sync("SUB _INBOX.test 1\r\n").await;
     c.send("PUB req.nowhere _INBOX.test 4\r\nping\r\n").await;
     let headers = c.read_hmsg_headers().await;
@@ -222,7 +221,9 @@ async fn no_responders_true_sends_503_and_false_sends_nothing() {
     // Without headers, the same 503 is stripped to an empty MSG.
     let mut plain = RawClient::connect(srv.addr, "{\"no_responders\":true}").await;
     plain.send_sync("SUB _INBOX.plain 1\r\n").await;
-    plain.send("PUB req.nowhere _INBOX.plain 4\r\nping\r\n").await;
+    plain
+        .send("PUB req.nowhere _INBOX.plain 4\r\nping\r\n")
+        .await;
     let (line, payload) = plain.read_msg().await;
     assert!(line.starts_with("MSG _INBOX.plain 1 "), "{line}");
     assert_eq!(payload, b"");
@@ -245,21 +246,24 @@ async fn server_ping_stale_connection_closes() {
     let (read, mut writer) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut line = String::new();
-    timeout(T, reader.read_line(&mut line)).await.unwrap().unwrap();
-    assert!(line.starts_with("INFO "));
-    writer
-        .write_all(b"CONNECT {}\r\n")
+    timeout(T, reader.read_line(&mut line))
         .await
+        .unwrap()
         .unwrap();
+    assert!(line.starts_with("INFO "));
+    writer.write_all(b"CONNECT {}\r\n").await.unwrap();
     let mut saw_ping = false;
     let mut saw_err = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     loop {
         let mut l = String::new();
-        let n = timeout(deadline - tokio::time::Instant::now(), reader.read_line(&mut l))
-            .await
-            .expect("stale close timed out")
-            .expect("io error");
+        let n = timeout(
+            deadline - tokio::time::Instant::now(),
+            reader.read_line(&mut l),
+        )
+        .await
+        .expect("stale close timed out")
+        .expect("io error");
         if n == 0 {
             break; // EOF: connection closed.
         }
@@ -294,7 +298,10 @@ async fn token_auth_modes() {
         let (read, mut writer) = stream.into_split();
         let mut reader = BufReader::new(read);
         let mut info = String::new();
-        timeout(T, reader.read_line(&mut info)).await.unwrap().unwrap();
+        timeout(T, reader.read_line(&mut info))
+            .await
+            .unwrap()
+            .unwrap();
         writer
             .write_all(format!("CONNECT {bad}\r\n").as_bytes())
             .await
@@ -327,7 +334,10 @@ async fn malformed_connect_closes_silently() {
     let (read, mut writer) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut info = String::new();
-    timeout(T, reader.read_line(&mut info)).await.unwrap().unwrap();
+    timeout(T, reader.read_line(&mut info))
+        .await
+        .unwrap()
+        .unwrap();
     writer.write_all(b"CONNECT notjson\r\n").await.unwrap();
     // No -ERR is sent; the connection just closes.
     let mut line = String::new();
@@ -420,10 +430,7 @@ async fn hpub_over_max_payload_rejected() {
     c.writer.write_all(hdrs).await.unwrap();
     c.writer.write_all(&[b'x'; 101]).await.unwrap();
     c.writer.write_all(b"\r\n").await.unwrap();
-    assert_eq!(
-        c.read_line().await,
-        "-ERR 'Maximum Payload Violation'"
-    );
+    assert_eq!(c.read_line().await, "-ERR 'Maximum Payload Violation'");
     srv.shutdown().await.unwrap();
 }
 

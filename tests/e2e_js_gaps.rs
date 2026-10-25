@@ -233,7 +233,10 @@ async fn push_ack_policy_none_never_redelivers() {
     // means the message is never redelivered.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let next = timeout(Duration::from_secs(1), sub.next()).await;
-    assert!(next.is_err(), "ack_policy none must not redeliver: {next:?}");
+    assert!(
+        next.is_err(),
+        "ack_policy none must not redeliver: {next:?}"
+    );
 }
 
 #[tokio::test]
