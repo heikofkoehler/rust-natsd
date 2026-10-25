@@ -134,13 +134,7 @@ async fn pull_filter_subject_limits_deliveries() {
     assert_eq!(fetch_all(&consumer, 10).await, vec![b"A".to_vec()]);
 }
 
-// BUG (server, not test): max_deliver is stored in the consumer config
-// but not enforced for pull consumers. Reproduction: pull consumer with
-// max_deliver: 2, fetch + NAK repeatedly — deliveries continue past 2
-// (ack subjects show delivered counts 3, 4, ...). Until the server is
-// fixed, this test is ignored rather than committed failing.
 #[tokio::test]
-#[ignore = "max_deliver not enforced for pull consumers"]
 async fn max_deliver_exhaustion_stops_redelivery() {
     let (_srv, client) = start_js().await;
     let js = js(&client);
@@ -190,10 +184,229 @@ async fn max_deliver_exhaustion_stops_redelivery() {
         .await
         .expect("fetch after exhaustion");
     let next = timeout(Duration::from_secs(2), batch.next()).await;
+    // No redelivery: either the batch ends/times out, or it yields
+    // the server's 404 "No Messages" sentinel (empty payload), never
+    // the exhausted message again.
+    if let Ok(Some(Ok(m))) = next {
+        assert_ne!(
+            m.payload.as_ref(),
+            b"once",
+            "exhausted message must not be delivered again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn push_max_deliver_exhaustion_stops_redelivery_and_advises() {
+    let (_srv, client) = start_js().await;
+    let js = js(&client);
+    let stream = js
+        .create_stream(jetstream::stream::Config {
+            name: "MAXPUSH".into(),
+            subjects: vec!["maxpush.>".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("create stream");
+    let mut adv = client
+        .subscribe("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.MAXPUSH.>".to_string())
+        .await
+        .expect("subscribe advisory");
+    let mut sub = client
+        .subscribe("deliver.maxpush".to_string())
+        .await
+        .expect("subscribe deliver");
+    let _consumer = stream
+        .create_consumer(push::Config {
+            deliver_subject: "deliver.maxpush".into(),
+            durable_name: Some("c-maxpush".into()),
+            max_deliver: 2,
+            ack_wait: Duration::from_secs(1),
+            ..Default::default()
+        })
+        .await
+        .expect("create consumer");
+    js.publish("maxpush.1", Bytes::from("once"))
+        .await
+        .expect("publish")
+        .await
+        .expect("ack");
+    // Delivery 1, NAK -> delivery 2, NAK -> exhausted, no third delivery.
+    for _ in 0..2 {
+        let msg = timeout(T, sub.next()).await.unwrap().unwrap();
+        assert_eq!(msg.payload.as_ref(), b"once");
+        let reply = msg.reply.expect("ack reply subject");
+        client
+            .publish(reply, Bytes::from("-NAK"))
+            .await
+            .expect("nak");
+    }
+    let next = timeout(Duration::from_secs(2), sub.next()).await;
     assert!(
-        matches!(next, Ok(None) | Err(_)),
-        "exhausted message must not be delivered again, got: {next:?}"
+        next.is_err(),
+        "exhausted push message must not be delivered again: {next:?}"
     );
+    let advisory = timeout(T, adv.next()).await.unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&advisory.payload).expect("advisory json");
+    assert_eq!(body["type"], "io.nats.jetstream.advisory.v1.max_deliver");
+    assert_eq!(body["stream"], "MAXPUSH");
+    assert_eq!(body["consumer"], "c-maxpush");
+    assert_eq!(body["stream_seq"], 1);
+    assert_eq!(body["deliveries"], 2);
+}
+
+#[tokio::test]
+async fn workqueue_max_deliver_exhaustion_keeps_message_and_advises() {
+    // Go v2.15.1 behaviour, probed: on workqueue exhaustion the
+    // message stays in the stream (only a plain +ACK deletes it);
+    // the consumer simply stops redelivering and publishes the
+    // MAX_DELIVERIES advisory.
+    let (_srv, client) = start_js().await;
+    let js = js(&client);
+    let stream = js
+        .create_stream(jetstream::stream::Config {
+            name: "MAXWQ".into(),
+            subjects: vec!["maxwq.>".into()],
+            retention: jetstream::stream::RetentionPolicy::WorkQueue,
+            ..Default::default()
+        })
+        .await
+        .expect("create stream");
+    let mut adv = client
+        .subscribe("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.MAXWQ.>".to_string())
+        .await
+        .expect("subscribe advisory");
+    js.publish("maxwq.1", Bytes::from("once"))
+        .await
+        .expect("publish")
+        .await
+        .expect("ack");
+    let consumer = stream
+        .create_consumer(pull::Config {
+            durable_name: Some("c-maxwq".into()),
+            max_deliver: 2,
+            ..Default::default()
+        })
+        .await
+        .expect("create consumer");
+    for _ in 0..2 {
+        let mut batch = consumer
+            .fetch()
+            .max_messages(1)
+            .messages()
+            .await
+            .expect("fetch");
+        let msg = timeout(T, batch.next())
+            .await
+            .expect("fetch yields")
+            .expect("some")
+            .expect("message");
+        msg.ack_with(jetstream::message::AckKind::Nak(None))
+            .await
+            .expect("nak");
+    }
+    let mut batch = consumer
+        .fetch()
+        .max_messages(1)
+        .messages()
+        .await
+        .expect("fetch after exhaustion");
+    let next = timeout(Duration::from_secs(2), batch.next()).await;
+    if let Ok(Some(Ok(m))) = next {
+        assert_ne!(
+            m.payload.as_ref(),
+            b"once",
+            "exhausted workqueue message must not be delivered again"
+        );
+    }
+    let advisory = timeout(T, adv.next()).await.unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&advisory.payload).expect("advisory json");
+    assert_eq!(body["deliveries"], 2);
+    // Message still in the stream.
+    let got = api(
+        &client,
+        "$JS.API.STREAM.MSG.GET.MAXWQ",
+        serde_json::json!({"seq": 1}),
+    )
+    .await;
+    assert_eq!(
+        got["message"]["data"], "b25jZQ==",
+        "workqueue message retained: {got}"
+    );
+}
+
+#[tokio::test]
+async fn pull_max_deliver_exhaustion_via_ack_wait_timeout() {
+    // Same cap, ack-wait path (tick sweep) instead of NAK: delivery
+    // 1 times out -> delivery 2 times out -> exhausted, no third.
+    let (_srv, client) = start_js().await;
+    let js = js(&client);
+    let stream = js
+        .create_stream(jetstream::stream::Config {
+            name: "MAXAW".into(),
+            subjects: vec!["maxaw.>".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("create stream");
+    let mut adv = client
+        .subscribe("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.MAXAW.>".to_string())
+        .await
+        .expect("subscribe advisory");
+    js.publish("maxaw.1", Bytes::from("once"))
+        .await
+        .expect("publish")
+        .await
+        .expect("ack");
+    let consumer = stream
+        .create_consumer(pull::Config {
+            durable_name: Some("c-maxaw".into()),
+            max_deliver: 2,
+            ack_wait: Duration::from_millis(500),
+            ..Default::default()
+        })
+        .await
+        .expect("create consumer");
+    // Fetch is no-wait in async-nats: a poll before the ack-wait
+    // window expires yields the server's 404 sentinel (empty payload)
+    // instead of blocking, so poll until the redelivery arrives.
+    for _ in 0..2 {
+        let mut got_once = false;
+        for _attempt in 0..20 {
+            let mut batch = consumer
+                .fetch()
+                .max_messages(1)
+                .messages()
+                .await
+                .expect("fetch");
+            match timeout(T, batch.next()).await {
+                Ok(Some(Ok(m))) if m.payload.as_ref() == b"once" => {
+                    got_once = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        assert!(got_once, "ack-wait redelivery must arrive");
+        // Deliberately not acked: ack_wait redelivers, then exhausts.
+    }
+    let mut batch = consumer
+        .fetch()
+        .max_messages(1)
+        .messages()
+        .await
+        .expect("fetch after exhaustion");
+    let next = timeout(Duration::from_secs(2), batch.next()).await;
+    if let Ok(Some(Ok(m))) = next {
+        assert_ne!(
+            m.payload.as_ref(),
+            b"once",
+            "ack-wait-exhausted message must not be delivered again"
+        );
+    }
+    let advisory = timeout(T, adv.next()).await.unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&advisory.payload).expect("advisory json");
+    assert_eq!(body["deliveries"], 2);
 }
 
 #[tokio::test]

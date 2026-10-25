@@ -905,6 +905,47 @@ for current behaviour.
   implemented (whole-engine JSON snapshot, Phases 15/19) — the
   help text is stale, the docs are right.
 
+### Phase 28A — Enforce max_deliver on pull AND push consumers (2026-10-25)
+- Renumbering: this work was planned as Phase 27A, but PLAN.md
+  already has a Phase 27 (docs refresh), so the bug-fix series is
+  recorded as 28A–28C (plan 27A→28A, 27B→28B, 27C→28C). Phase 27
+  itself is untouched.
+- `src/jetstream.rs`: -NAK handler now enforces the cap for both
+  kinds (pull: drop + no re-queue; push: drop + no delivery, where
+  the old code already dropped but silently); the ack-wait tick
+  sweep already dropped but now also advises and advances the ack
+  floor; a defensive guard in `fulfill_pulls` drops redelivery
+  queue entries whose queued count is past the cap (e.g. restored
+  from an old snapshot), and snapshot restore drops such entries.
+  Exhaustion never deletes the message (workqueue included) and
+  never increments `num_redelivered` for the terminal attempt.
+- Go v2.15.1 probed first: exhaustion publishes
+  `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>`
+  with `{"type":"io.nats.jetstream.advisory.v1.max_deliver",
+  "stream", "consumer", "stream_seq", "deliveries"}` (deliveries =
+  the cap, e.g. 2); rust-natsd now publishes that advisory on
+  every exhaustion path, exactly once (pending + queue removed at
+  the same site). Workqueue probed separately: on both NAK and
+  ack-wait exhaustion the message stays in the stream
+  (`STREAM.MSG.GET` still succeeds, stream msgs unchanged); only a
+  plain +ACK deletes it. One Go timing nuance not replicated:
+  Go's NAK path queues the redelivery and only checks the cap on
+  the next delivery attempt, so `num_ack_pending` stays 1 between
+  the terminal NAK and the next Fetch; rust-natsd drops at the NAK
+  (the task's specified behaviour), which is observably stricter
+  in that window but identical in deliveries, advisory, and final
+  consumer state.
+- Tests: `#[ignore]` removed from
+  `max_deliver_exhaustion_stops_redelivery`; new
+  `push_max_deliver_exhaustion_stops_redelivery_and_advises`,
+  `workqueue_max_deliver_exhaustion_keeps_message_and_advises`,
+  and `pull_max_deliver_exhaustion_via_ack_wait_timeout` in
+  `tests/e2e_js_gaps.rs`. The exhausted pull Fetch yields Go's
+  404 "No Messages" sentinel rather than None; the tests accept
+  that sentinel and assert the exhausted payload never reappears.
+- Docs synced in the same commit: README feature matrix and Known
+  issues (max_deliver bullet removed), `parity/KNOWN_DIFFS.md`.
+
 ## Future work (not in this plan)
 - Gateways (Phase 24) and JetStream clustering/replication
   (Phase 25): documented remainders with design notes, not
@@ -913,8 +954,8 @@ for current behaviour.
   JWT imports across routes/leafs, MQTT/WebSocket gateways,
   XKeys, cert-to-user mapping on route/leaf connections,
   KV/object-store client-helper verification.
-- The two ignored-test bugs from Phase 26 (pull-consumer
-  `max_deliver`, Go-client JWT login) — fixes, not features.
+- The remaining ignored-test bug from Phase 26 (Go-client JWT
+  login) — Phase 28B, not a feature.
 
 ## Design notes
 - Single shared subscription registry behind a lock; delivery resolves the

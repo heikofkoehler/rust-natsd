@@ -836,6 +836,47 @@ fn deliver_to_consumer(
     );
 }
 
+/// Publish a max-deliveries advisory when a consumer exhausts its
+/// `max_deliver` cap for one message. Go v2.15.1 shape, probed:
+/// subject `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>`,
+/// body `{"type":"io.nats.jetstream.advisory.v1.max_deliver",
+/// "stream":..., "consumer":..., "stream_seq":..., "deliveries":...}`.
+/// Go also carries an `id` (nuid) and a `timestamp`; rust-natsd emits
+/// a timestamp and a deterministic id derived from stream/consumer/
+/// sequence/time (no nuid dependency). The advisory is emitted exactly
+/// once per exhaustion: the pending entry and any redelivery queue
+/// entry are removed at the same site, so no later path re-emits it.
+/// Workqueue retention does NOT delete the message on exhaustion
+/// (probed: Go leaves the message in the stream, `num_pending` 0,
+/// `num_ack_pending` 0, advisory published); only plain +ACK deletes
+/// a workqueue message, as before.
+fn max_deliver_advisory_action(
+    stream_name: &str,
+    account: &str,
+    consumer_name: &str,
+    stream_seq: u64,
+    deliveries: u64,
+) -> Action {
+    let body = json!({
+        "type": "io.nats.jetstream.advisory.v1.max_deliver",
+        "id": format!("{stream_name}-{consumer_name}-{stream_seq}-{}", now_ns()),
+        "timestamp": rfc3339(now_ns()),
+        "stream": stream_name,
+        "consumer": consumer_name,
+        "stream_seq": stream_seq,
+        "deliveries": deliveries,
+    });
+    Action::Deliver(
+        Message::new(
+            &format!("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.{stream_name}.{consumer_name}"),
+            None,
+            None,
+            Bytes::from(body.to_string()),
+        )
+        .with_account(account),
+    )
+}
+
 /// Deliver the next available messages to a push consumer, honouring
 /// max_ack_pending and the filter. Advances next_stream_seq past every
 /// sequence considered (matching or not).
@@ -978,6 +1019,27 @@ fn fulfill_pulls(
         let Some(seq) = seq else {
             return;
         };
+        // Defensive exhaustion guard for redelivery queue entries
+        // that predate the NAK/tick enforcement (e.g. restored from
+        // an old snapshot): a queued delivery count past the cap is
+        // dropped with an advisory, never delivered. Fresh deliveries
+        // carry delivered=1, so this only fires on redeliveries.
+        {
+            let (max_deliver, account) = {
+                let c = stream.consumers.get(consumer_name).unwrap();
+                (c.max_deliver, stream.account.clone())
+            };
+            if max_deliver > 0 && delivered > max_deliver as u64 {
+                actions.push(max_deliver_advisory_action(
+                    stream_name,
+                    &account,
+                    consumer_name,
+                    seq,
+                    delivered - 1,
+                ));
+                continue;
+            }
+        }
         let Some(msg) = stream.get(seq).map(|m| StoredMsg {
             seq: m.seq,
             subject: m.subject.clone(),
@@ -1411,6 +1473,13 @@ impl Engine {
                                 rv.get("stream_seq").and_then(|v| v.as_u64()),
                                 rv.get("delivered").and_then(|v| v.as_u64()),
                             ) {
+                                // A queued count past the cap is
+                                // already exhausted (see
+                                // fulfill_pulls guard); drop it
+                                // rather than resurrecting it.
+                                if max_deliver > 0 && delivered > max_deliver as u64 {
+                                    continue;
+                                }
                                 redeliver.push_back(Redeliver {
                                     stream_seq: sseq,
                                     delivered,
@@ -1946,9 +2015,25 @@ impl Engine {
             // The wire format for negative ack is `-NAK` (async-nats
             // and nats.go both send that); `+NAK` is accepted too.
             "-NAK" | "+NAK" => {
-                // Immediate redelivery.
+                // Immediate redelivery, subject to max_deliver.
+                // Exhaustion (deliveries already made >= cap) drops
+                // the message from ack_pending with no re-queue and
+                // publishes the MAX_DELIVERIES advisory; the ack
+                // floor was already advanced above. The message
+                // itself is NOT deleted, whatever the retention
+                // (Go workqueue behaviour, probed): only a plain
+                // +ACK deletes a workqueue message.
                 if consumer.deliver_subject.is_some() {
-                    if let Some(m) = staged {
+                    if consumer.max_deliver > 0 && pending.delivered >= consumer.max_deliver as u64
+                    {
+                        actions.push(max_deliver_advisory_action(
+                            stream_name,
+                            &msg.account,
+                            consumer_name,
+                            sseq,
+                            pending.delivered,
+                        ));
+                    } else if let Some(m) = staged {
                         let to = consumer.deliver_subject.clone().unwrap();
                         let delivered = pending.delivered + 1;
                         if consumer.max_deliver <= 0 || delivered <= consumer.max_deliver as u64 {
@@ -1982,6 +2067,19 @@ impl Engine {
                             consumer.num_redelivered += 1;
                         }
                     }
+                } else if consumer.max_deliver > 0
+                    && pending.delivered >= consumer.max_deliver as u64
+                {
+                    // Exhausted: drop, do not re-queue, advise.
+                    // num_redelivered is not incremented (Go reports
+                    // only actual redeliveries, probed).
+                    actions.push(max_deliver_advisory_action(
+                        stream_name,
+                        &msg.account,
+                        consumer_name,
+                        sseq,
+                        pending.delivered,
+                    ));
                 } else {
                     consumer.redeliver.push_back(Redeliver {
                         stream_seq: sseq,
@@ -3073,6 +3171,17 @@ impl Engine {
                         continue;
                     };
                     if c.max_deliver > 0 && delivered >= c.max_deliver as u64 {
+                        // Ack-wait exhaustion: drop with advisory
+                        // and advance the ack floor (Go's
+                        // hasMaxDeliveries), no redelivery, no
+                        // deletion (workqueue messages stay).
+                        if cseq > c.ack_floor_consumer_seq {
+                            c.ack_floor_consumer_seq = cseq;
+                            c.ack_floor_stream_seq = sseq;
+                        }
+                        actions.push(max_deliver_advisory_action(
+                            &name, &account, &cname, sseq, delivered,
+                        ));
                         continue;
                     }
                     if c.deliver_subject.is_some() {

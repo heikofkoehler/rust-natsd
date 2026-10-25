@@ -79,7 +79,7 @@ rust-natsd does; it replaces the older support table.
 | Slow-consumer detection | Implemented | Byte-based pending limit (default 64 MiB, `--max-pending` / .conf `max_pending`, reported in `/varz` as `max_pending` and per-connection in `/connz` as `pending_bytes`) → disconnect when exceeded. A fast reader at bench rates is not dropped; a never-reading reader is, like Go |
 | Graceful shutdown on SIGINT/SIGTERM | Implemented | Writer flushes pending frames (e.g. a final `-ERR`) before close |
 | JetStream: streams, pull + push consumers | Implemented | In-memory, or file-persisted with `--js-store-dir` |
-| JetStream: ack policies (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | Implemented | With one known exception: `max_deliver` is not enforced for pull consumers (see Known issues) |
+| JetStream: ack policies (+ACK/-NAK/+TERM/+WPI), redelivery, dedup, expected sequences, MSG.GET, purge/delete | Implemented | `max_deliver` enforced for pull and push consumers on both the -NAK path and the ack-wait sweep; exhaustion publishes the Go `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>` advisory (type `io.nats.jetstream.advisory.v1.max_deliver`) and, for workqueue streams, leaves the message in the stream (only a plain +ACK deletes it), as Go v2.15.1 does |
 | JetStream: workqueue retention, `max_msgs_per_subject` | Implemented | |
 | JetStream: deliver policies `all` / `last` (filter-aware) / `new` / `by_start_sequence` | Implemented | |
 | JetStream persistence | Implemented | Whole-engine JSON snapshot after every mutation, reloaded on startup — including per-consumer pending ack state (in-flight stream seqs, delivery counts, wall-clock delivery times), ack floors, redelivery counts, and pull redelivery queues (snapshot v2; v1 snapshots load with empty ack state). Restart preserves the remaining ack window (Go v2.15.1 semantics, probed): unacked messages redeliver once the window expires with delivered count incremented, acked messages never redeliver, push redelivery defers while the deliver subject has no interest; waiting pulls are not persisted (dead reply inbox) |
@@ -277,16 +277,10 @@ limit (see PLAN Phase 18).
 
 ## Known issues and limitations
 
-These are known, not hidden. The first two are covered by tests that
-are committed `#[ignore]`d naming the bug, so the suite stays green
-without pretending they pass.
+These are known, not hidden. The remaining one is covered by a test
+that is committed `#[ignore]`d naming the bug, so the suite stays
+green without pretending it passes.
 
-- **Pull-consumer `max_deliver` is not enforced.** A pull consumer
-  with `max_deliver: 2` keeps redelivering past 2 deliveries on
-  repeated NAK (test `max_deliver_exhaustion_stops_redelivery` in
-  `tests/e2e_js_gaps.rs`, ignored). Push-consumer `max_deliver`
-  was not verified either way. Fix: enforce the cap on the pull
-  redelivery path in `src/jetstream.rs`.
 - **JWT auth via the official Go client can never succeed.** nats.go's
   `UserJWT` flow never sends a CONNECT `nkey` field (UserJWT and
   Nkey are mutually exclusive in nats.go), but rust-natsd's

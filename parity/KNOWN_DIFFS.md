@@ -97,9 +97,6 @@ README, and PLAN agree. They do not fail the parity run, because the
 parity probes do not cover them — that is a coverage statement, not
 a claim that they match Go.
 
-- **Pull-consumer `max_deliver` not enforced.** Redeliveries
-  continue past the configured cap (test
-  `max_deliver_exhaustion_stops_redelivery`, `#[ignore]`d).
 - **JWT auth via the official Go client never succeeds.** nats.go
   UserJWT never sends a CONNECT `nkey` field, but rust-natsd
   requires `nkey == JWT sub` (test
