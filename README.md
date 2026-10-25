@@ -83,7 +83,7 @@ rust-natsd does; it replaces the older support table.
 | JetStream: workqueue retention, `max_msgs_per_subject` | Implemented | |
 | JetStream: deliver policies `all` / `last` (filter-aware) / `new` / `by_start_sequence` | Implemented | |
 | JetStream persistence | Implemented | Whole-engine JSON snapshot after every mutation, reloaded on startup — including per-consumer pending ack state (in-flight stream seqs, delivery counts, wall-clock delivery times), ack floors, redelivery counts, and pull redelivery queues (snapshot v2; v1 snapshots load with empty ack state). Restart preserves the remaining ack window (Go v2.15.1 semantics, probed): unacked messages redeliver once the window expires with delivered count incremented, acked messages never redeliver, push redelivery defers while the deliver subject has no interest; waiting pulls are not persisted (dead reply inbox) |
-| JetStream clustering / replication | Not implemented | Single-node only; non-goal |
+| JetStream clustering / replication | Not implemented | Remainder, not implemented — design note in PLAN Phase 25 (Raft/WAL scope); single-node only, no replication, no high availability |
 | JetStream mirroring / sourcing | Implemented (same node) | `mirror` / `sources` in STREAM.CREATE (`name`, `filter_subject`, `opt_start_seq`, `opt_start_time`); backfill at creation then live copies via the capture hook (atomic under the engine lock: no loss, no duplicates); mirror copies are exact, source copies add a `Nats-Stream-Source` header; origin delete keeps copies but kills the link permanently, purge leaves the mirror untouched. Cross-node mirroring/sourcing (routes/leafs, `external`) is NOT implemented and is rejected at creation. One deliberate deviation from Go: a mirror/source of a nonexistent stream is rejected with 404/10059 instead of Go's accept-and-leave-empty |
 | JetStream `$JS.API` routing across routes/leafs (`$JS.API.>` interest) | Implemented | |
 | KV / object store as client helpers | Partial | Stream primitives exist (`KV_<bucket>` streams, `last_by_subj`); raw `$KV` traffic matches Go (parity probe `kv_raw`), but the nats.go/async-nats KV helpers apply a version gate (see below) and are not verified end-to-end |
@@ -94,11 +94,11 @@ rust-natsd does; it replaces the older support table.
 | Monitoring `/leafz` | Implemented | Field naming differs from Go (count vs list shape); counts compared in the parity suite |
 | Monitoring `/jsz` | Implemented | |
 | Monitoring `/accounz` | Implemented | Rust superset: Go 2.15.1 answers 404 here |
-| Monitoring `/gatewayz` | Partial | Empty response only; no gateway protocol is implemented |
+| Monitoring `/gatewayz` | Partial | Empty response only; no gateway protocol is implemented (see Phase 24 remainder note) |
 | Monitoring `/healthz` | Implemented | |
 | Config files (`.conf`) | Partial | nats-server `.conf` subset via `-c` (CLI wins over file); unknown keys ignored |
 | `INFO` completeness | Partial | Omits Go-only fields by design: `git_commit`, `go`, `xkey`, and `api_lvl` (Go's JetStream API level — advertising 5 would gate clients into JS features Rust does not implement). All other fields match Go, including omitempty semantics |
-| Gateways (super-cluster) | Not implemented | Non-goal |
+| Gateways (super-cluster) | Not implemented | Remainder, not implemented — design note in PLAN Phase 24, with the Go 2.15.1 gateway handshake, RS+/RMSG framing, and account scoping probed on the wire; no gateway protocol code, no accepting stub |
 | MQTT / WebSocket gateways | Not implemented | Non-goal |
 
 See [PLAN.md](PLAN.md) for the phased plan and design notes.
@@ -126,9 +126,11 @@ identical per-member queue distribution: both are compared on
 supported fields / totals only, by design.
 
 **Scope — what mainline does that rust-natsd deliberately does not.**
-Gateways (super-cluster), JetStream clustering/replication,
-cross-node mirroring/sourcing, MQTT/WebSocket gateways,
-and XKeys. JetStream
+Gateways (super-cluster) and JetStream clustering/replication are
+documented remainders (design notes in PLAN Phases 24–25, not
+implemented, not planned-imminent); cross-node mirroring/sourcing,
+MQTT/WebSocket gateways,
+and XKeys are non-goals. JetStream
 here is single-node only (mirroring/sourcing and account imports work
 on the same node).
 Conversely, rust-natsd is a superset in

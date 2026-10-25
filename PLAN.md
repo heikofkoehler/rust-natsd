@@ -21,7 +21,9 @@ unmodified official Go (`nats.go` v1.55.0) and Rust (`async-nats` 0.38)
 clients, plus raw-wire protocol tests. 97 Rust tests green; Go interop
 scripts green in both directions (routes, leafs, JetStream).
 
-Remaining non-goals: gateways, JetStream clustering/replication,
+Remaining items: gateways and JetStream clustering/replication are
+**documented remainders, not implemented** — each has a design note
+below (Phase 24, Phase 25) and no code. Still non-goals:
 cross-node mirroring/sourcing, MQTT/WebSocket gateways, and the
 KV/object-store client helpers (their server-side primitives exist).
 
@@ -513,9 +515,271 @@ KV/object-store client helpers (their server-side primitives exist).
   their connections (imports do not cross routes/leafs, Phase 21
   remainder).
 
+### Phase 24 — Gateways (super-cluster): probe + design note ONLY (gap area 9)
+- **Status: REMAINDER, NOT IMPLEMENTED. No gateway server code was
+  written in this phase, and no stub gateway endpoint was added.**
+  The existing empty `/gatewayz` response stays exactly what it is
+  (an empty list, honestly labelled in the README), and `gateway {}`
+  sections in `.conf` are still ignored (see `src/conf.rs`). A
+  gateway that accepts connections but cannot interop with Go is
+  worse than none (see "why a partial gateway is worse" below),
+  so this phase deliberately ships notes, not code.
+- **Probe method (empirical, Go nats-server v2.15.1, 2026-10-24/25).**
+  Two Go servers, A (client 4222, gateway 7222) and B (client 4223,
+  gateway 7223, soliciting A). A raw-TCP intercept proxy sat between
+  B's gateway solicitation and A's gateway port and logged every
+  byte in both directions; plain raw clients then subscribed on one
+  side and published on the other. Config note found the hard way:
+  the solicitation key is `gateways: [{ name, urls }]`, not
+  `remotes` — Go rejects `remotes` as an unknown field.
+- **Handshake, exact order as probed (gateway port, INFO-first —
+  unlike routes, where the dialer sends CONNECT first):**
+  1. Accepter → dialer: `INFO` (proto 3) with `server_id`,
+     `server_name`, `version` "2.15.1", `host`, `port` (the gateway
+     port), `headers: true`, `max_payload`, plus gateway-only
+     fields `gateway: "<name>"`, `gateway_urls: ["<host>:<port>"]`,
+     `gateway_url`, `gateway_nrp: true`, `gateway_iom: true`.
+     (`gateway_nrp`/`gateway_iom` are advertised, not behaviourally
+     probed here — see below.)
+  2. Dialer → accepter: `CONNECT {"echo": false, "verbose": false,
+     "pedantic": false, "tls_required": false, "headers": false,
+     "name": "<dialer server_id>", "cluster": "", "gateway": "<dialer
+     gateway name>"}` followed immediately by the dialer's own
+     `INFO` in the same shape as step 1 (its own gateway name and
+     `gateway_urls`).
+  3. Accepter → dialer: `INFO` frames whose only meaningful fields
+     are `gateway`, `gateway_cmd`, and `gateway_cmd_payload` (all
+     other fields empty/zero). `gateway_cmd: 2` arrives once per
+     account, payload = base64(account name) — observed order
+     `$SYS`, `APP`, `$G`, `OTHER` on a server with two named
+     accounts, `$SYS`, `$G` on a default-only server. Then
+     `gateway_cmd: 3` per account, payload = base64(account name).
+     Interpretation (inference, not source-verified): cmd 2
+     announces an account to the peer; cmd 3 marks it switched to
+     interest-only mode — B's `-DV` log at the same moment says
+     `switching account "$SYS" to Interest-Only mode` (and `$G`).
+     The cmd numbers and payloads are probed fact; the cmd
+     semantics are the plausible reading of the ordering plus that
+     log line, and an implementation must confirm them against
+     Go's gateway source before relying on them.
+  4. Interest, then messages, then `PING`/`PONG` in both directions
+     on the same connection. A naive fake peer (INFO first, then a
+     CONNECT naming an unconfigured gateway) was answered with
+     `-ERR 'Authorization Violation'` and a reset — evidence that
+     handshake order and gateway-name recognition are enforced,
+     and that the proxy intercept, not the fake, is the
+     authoritative record.
+- **Interest propagation (probed): gateway interest IS route
+  framing.** Accepter → dialer after the handshake, and on every
+  later local subscribe/unsubscribe: `RS+ <account> <subject>
+  [queue weight]` / `RS- <account> <subject> [queue]` — literally
+  the route verbs, account token first. Observed: `RS+ $G
+  events.>`, `RS+ $G jobs workers 1` (queue weight 1, as on
+  routes), `RS+ APP orders.>`, `RS+ OTHER orders.>`, and on
+  disconnect `RS- APP orders.>`, `RS- OTHER orders.>`.
+- **Message framing (probed): gateway messages ARE route framing.**
+  `RMSG <account> <subject> [reply] [| queues] <size>` (HMSG form
+  for headers, by analogy with routes — not separately probed
+  here). Observed: `RMSG $G events.click 5`, `RMSG $G jobs |
+  workers 3`, `RMSG APP orders.new 4`. The client-facing delivery
+  on the far side is an ordinary `MSG` to the subscriber.
+- **Account scoping (probed, not assumed).** With accounts `APP`
+  and `OTHER` on both servers: an `APP` publish on B was delivered
+  only to the `APP` subscriber on A (`RMSG APP orders.new` on the
+  wire); the `OTHER` subscriber on A received nothing. Accounts
+  are matched by name across gateways, and the account token on
+  every RS+/RMSG frame is what enforces the boundary. `$SYS`
+  traffic also crosses: an `RMSG $SYS
+  $SYS.SERVER.ACCOUNT.APP.CONNS` advisory was observed on the
+  gateway connection, so the system account is not filtered out.
+  Queue subscriptions cross with their weight (`jobs workers 1`).
+- **Implicit gateways (probed, partially).** On learning B from
+  B's INFO `gateway_urls`, A solicits back: A's log shows
+  `Connecting to implicit gateway "B"`. A supercluster therefore
+  forms one connection per direction, not one shared socket. The
+  reverse direction (A publish → B subscribe) was NOT verified in
+  this probe: in this sandbox A's back-connect went to the
+  advertised non-local address (198.19.0.2:7223), which hit a
+  middlebox (198.19.0.1:3128) and died with a gateway parser
+  error, while the 127.0.0.1 B→A direction carried all verified
+  traffic. That is a sandbox networking artifact, not a Go
+  behaviour claim, and the reverse-direction test is on the
+  interop plan below.
+- **What would be reused vs what is genuinely new.** Reuse:
+  `src/route.rs` parser/encoder framing (RS+/RS-/RMSG/HMSG are
+  shared verbs — a gateway parser is a route parser plus INFO
+  `gateway_cmd` handling, not a new wire language); the trie
+  sublist and `deliver()`'s global queue selection; the account
+  model and per-account interest maps; route solicitation
+  retry/backoff; the TLS machinery's patterns (gateway TLS mode
+  was NOT probed — implicit vs STARTTLS on the gateway port is an
+  open question for implementation, not something to guess).
+  Genuinely new: a gateway listener + accept path (there is none:
+  no gateway port, no gateway config fields, `gateway {}` in
+  `.conf` is ignored); gateway INFO handling (gateway name,
+  `gateway_urls` advertisement, `gateway_nrp`/`gateway_iom`
+  negotiation, `gateway_cmd` 2/3 state machine per account);
+  explicit-vs-implicit solicitation state (configured gateways
+  persist; implicit ones are discovered from peer INFO and must
+  be deduped against explicit ones); supercluster account mapping
+  (same-name matching, what happens to interest for an account
+  the peer does not have, interest-only-mode semantics — what
+  exactly changes when an account switches to it, beyond the log
+  line, is unprobed); loop safety across a supercluster (a message
+  must not bounce between gateways — routes in a full mesh do not
+  have this problem); real `/gatewayz` (inbound vs outbound,
+  configured flag — Go reports the solicitor's side
+  `configured: true`, the accepter's `configured: false`).
+- **Go-interop test plan (the 4-direction matrix used for
+  route/leaf TLS, extended).** Seed direction × traffic direction:
+  (1) Go seed + Rust solicits, traffic Go→Rust; (2) Go seed + Rust
+  solicits, traffic Rust→Go; (3) Rust seed + Go solicits, traffic
+  Go→Rust; (4) Rust seed + Go solicits, traffic Rust→Go — plus an
+  implicit-back-connect case (Rust learns Go from INFO and
+  solicits back, and vice versa), an account-scoped case (APP
+  delivers, OTHER does not, as probed), and a queue-group case
+  (one delivery across the gateway). All against Go 2.15.1, raw
+  wire first, then nats.go clients. `gateway_nrp` behaviour
+  (no-responders across gateways) needs its own probe before it is
+  implemented, not after.
+- **Scope estimate.** At least a full phase on the scale of Phase 7
+  + Phase 8 combined: a new `src/gateway.rs` (parser/encoder/state
+  machine, comparable to `route.rs` + `leaf.rs`), gateway
+  connection handlers and interest hooks in `src/server.rs`,
+  gateway config in `src/config.rs`/`src/conf.rs`, real
+  `/gatewayz` in `src/monitor.rs`, `tests/e2e_gateway.rs`,
+  `scripts/e2e-go-gateway.sh`, and parity probes. The wire framing
+  is the easy part (it is route framing); the state machine
+  (implicit discovery, per-account interest-only mode, supercluster
+  account mapping, loop safety) is the work.
+- **Why a partial gateway is worse than none.** A gateway listener
+  that accepts a connection but gets the handshake wrong is not a
+  stepping stone: Go answers it with `Authorization Violation` and
+  the supercluster silently never forms, while `/gatewayz` would
+  claim a gateway exists. Worse, a gateway that forwards without
+  the account-token boundary or interest-only semantics leaks
+  traffic across accounts — a correctness and isolation
+  regression versus advertising no gateway at all. Until all four
+  interop directions plus account scoping pass against Go, the
+  honest state is: not implemented, design note only.
+- **Conclusion: remainder, not implemented.** Probe evidence above
+  is evidence about Go's wire behaviour; this note is a plan.
+  Neither is an implementation.
+
+### Phase 25 — JetStream clustering / Raft / WAL: design note ONLY (gap area 10)
+- **Status: REMAINDER, NOT IMPLEMENTED. No Raft code, no WAL code,
+  no multi-node JetStream code was written in this phase.**
+  JetStream remains single-node (whole-engine JSON snapshot,
+  Phase 19/20). This note scopes the work; it does not start it.
+- **Sourcing honesty.** The Go model below is from Go documentation
+  (docs.nats.io JetStream clustering deep-dive: Raft groups, meta
+  leader and stream leaders, quorum commits, placement, peer
+  catch-up/scaling) and secondary descriptions of nats-server's
+  `jetstream_cluster.go`/`raft.go`. It was NOT wire-probed in this
+  task: no multi-node Go JetStream cluster was stood up, no Raft
+  traffic was captured, and no Go Raft wire format is claimed here.
+  What IS verified in this repo, and is the contrast point, is the
+  single-node snapshot: whole-engine JSON rewritten after every
+  mutation and reloaded on startup, including pending ack state
+  (snapshot v2, Phase 19).
+- **What Go JetStream clustering actually consists of (per the
+  documentation above).** A meta group — a Raft group over every
+  JetStream server in the cluster — whose leader assigns streams
+  and consumers to peers (placement honours cluster/tags when
+  configured). Each stream gets its own Raft group over its
+  replicas (`num_replicas`, R1/R3/...); each consumer gets its own
+  Raft group for its delivery/ack state. Every group elects a
+  leader; writes are proposed to the leader, replicated through
+  the Raft log, and committed only on a quorum (majority) before
+  followers apply them. The Raft log is persisted to a WAL on disk
+  (file storage), with snapshots and log compaction bounding log
+  growth, and a peer that restarts or falls behind catches up from
+  a snapshot plus log replay. Three servers is the recommended
+  minimum: a 3-node group survives one loss; a 2-node group has a
+  quorum of 2, so losing either node halts it — strictly worse
+  than a single node. A single server's R1 streams are standalone
+  by definition, not a degraded cluster.
+- **Why the single-node JSON snapshot differs fundamentally.** One
+  writer, no election, no quorum, no log: the snapshot is a
+  last-write-wins whole-state rewrite, and restart reloads exactly
+  that state. There is no ordering of concurrent writes from two
+  nodes, no commit point a client ack can be tied to, no replay
+  for a peer that missed writes, and no protection against two
+  nodes both believing they own a stream. Copying a snapshot file
+  to a second node does not create a replica — it creates a fork:
+  the first publish on either side (new sequence, dedup window,
+  consumer ack floor, redelivery count) diverges state that
+  nothing will ever reconcile.
+- **Tempting shortcuts that must NOT be shipped.** (1) Shared
+  snapshot files (NFS/shared disk, or copying snapshots between
+  nodes): two writers, stale reads, no write ordering — a fork
+  with extra steps. (2) Leader election without log replication
+  (a "primary" that others merely follow by polling state): two
+  primaries after a partition both accept publishes; the loser
+  silently discards acknowledged data on rejoin. (3)
+  Primary-backup copying without quorum (async copy, ack on the
+  primary before the backup confirms): an acked publish is lost
+  when the primary dies before the copy lands — the exact loss
+  clustering exists to prevent. (4) Advertising `num_replicas > 1`
+  or cluster/leader fields in STREAM.INFO/`$JS.API` responses while
+  storing R1: clients and operators would believe data is
+  replicated when it is not. Any of these would be worse than the
+  current honest single-node state.
+- **Component list a correct implementation would need in this
+  codebase.** (a) `src/raft.rs`: a Raft state machine — persistent
+  term/vote/log, election timers, RequestVote/AppendEntries,
+  snapshot install + log compaction, membership changes — with its
+  own unit tests (election, log matching, commit advancement,
+  snapshot restore) before any JetStream integration. (b) A WAL
+  store per Raft group on disk under `--js-store-dir`, replacing
+  the whole-engine snapshot as the durability mechanism for
+  clustered streams (the snapshot format can survive as the
+  snapshot half of Raft, not as the log). (c) `src/js_cluster.rs`:
+  the meta group (assignments, placement, peer set management)
+  plus per-stream and per-consumer group lifecycle (create on
+  assignment, tear down on delete, reassign on replica loss).
+  (d) Peer RPC transport: the design must choose and document it
+  (over the existing route connections or dedicated peer
+  connections). Go-interop for clustered JetStream would additionally
+  require matching Go's Raft RPC, which is not a documented wire
+  protocol and was not probed — a Rust-only cluster (own Raft
+  transport, own wire framing) is the honest first scope, and Go
+  interop for clustered JS is a separate reverse-engineering
+  effort, not a free consequence of this note. (e) Integration
+  with the existing JetStream engine's apply path in
+  `src/jetstream.rs`: every mutation (publish, ack, consumer
+  create/delete, purge, delete) becomes a Raft proposal applied
+  only on commit; reads are served by the group leader (or
+  explicitly stale-tolerant followers — that choice must be
+  documented, not accidental); the snapshot-v2 pending ack state
+  becomes consumer-group replicated state, not a local file. (f)
+  Config (`num_replicas`, placement cluster/tags, store dir per
+  group) and monitoring (cluster/leader fields in STREAM.INFO and
+  `/jsz`, honestly absent until groups exist).
+- **Test plan.** 3-node Rust cluster, R3 stream created through
+  the meta leader, publish + pull/push consume end to end; kill
+  the stream leader (SIGKILL, not graceful stop) and verify
+  election, continued service, and no lost or duplicated messages;
+  network partition (sever route links between one node and the
+  other two) and verify the minority side refuses writes rather
+  than forking, and rejoins cleanly; restart catch-up (a node down
+  through N publishes rejoins and serves current state, verified
+  by MSG.GET across the full sequence range); replica loss +
+  reassignment by the meta leader; quorum loss (2 of 3 down)
+  verified to refuse writes, not silently serve R1. API behaviour
+  compared against a 3-node Go 2.15.1 cluster for leader/error
+  reporting, once — and only once — the Rust cluster passes its
+  own tests.
+- **Conclusion: remainder, not implemented.** The single-node
+  snapshot is the shipped durability story; anything calling
+  itself clustered must have Raft groups, quorum commit, a WAL,
+  and the test plan above, or it must not ship.
+
 ## Future work (not in this plan)
-- Gateways, JetStream clustering/replication, cross-node
-  mirroring/sourcing, MQTT/WebSocket gateways,
+- Gateways (Phase 24) and JetStream clustering/replication
+  (Phase 25): documented remainders with design notes, not
+  implemented, not planned-imminent — no code, no accepting stub.
+- Cross-node mirroring/sourcing, MQTT/WebSocket gateways,
   KV/object-store client-helper verification.
 
 ## Design notes
