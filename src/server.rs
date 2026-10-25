@@ -368,7 +368,7 @@ pub async fn start(config: Config) -> io::Result<RunningServer> {
     };
     // Unauthorized imports are warned about at startup (Go refuses to
     // start instead); at delivery time they are dropped, never leaked.
-    for account in &config.accounts {
+    for account in config.all_accounts() {
         for import in &account.imports {
             if !config.import_authorized(&account.name, import) {
                 eprintln!(
@@ -1210,8 +1210,7 @@ pub fn deliver(
     if !msg.import_copy {
         let importers: Vec<(String, String)> = shared
             .config
-            .accounts
-            .iter()
+            .all_accounts()
             .filter(|a| a.name != msg.account)
             .filter_map(|a| {
                 a.stream_import_for(&msg.account, &msg.subject)

@@ -6,6 +6,7 @@
 pub mod conf;
 pub mod config;
 pub mod jetstream;
+pub mod jwt;
 pub mod leaf;
 pub mod monitor;
 pub mod protocol;

@@ -22,8 +22,7 @@ clients, plus raw-wire protocol tests. 97 Rust tests green; Go interop
 scripts green in both directions (routes, leafs, JetStream).
 
 Remaining non-goals: gateways, JetStream clustering/replication,
-cross-node mirroring/sourcing, MQTT/WebSocket gateways, JWT operator
-mode, and the
+cross-node mirroring/sourcing, MQTT/WebSocket gateways, and the
 KV/object-store client helpers (their server-side primitives exist).
 
 ## Phases
@@ -422,9 +421,101 @@ KV/object-store client helpers (their server-side primitives exist).
   connections — mapping applies to client connections); imports
   still do not cross routes/leafs (Phase 21 remainder).
 
+### Phase 23 — JWT operator mode (gap area 8)
+- Feasibility first: no new dependency was needed. `nkeys` 0.4.5
+  (already depended on) verifies Ed25519 against a public-only
+  keypair built from an NKey string, and `base64` + `serde_json`
+  cover the rest; a scratch crate also confirmed cargo can fetch
+  new crates in this environment, but `jsonwebtoken` does not speak
+  `ed25519-nkey` and was not added.
+- Implementation: `src/jwt.rs` — `encode_jwt` (tests/tooling) and
+  `verify_jwt` (header `typ: JWT` / `alg: ed25519-nkey`, Ed25519
+  over `header.payload` against the issuer's NKey, `iss` match,
+  `exp` past / `nbf` future / `iat` >60 s future all reject),
+  `OperatorTrust::from_jwts` (operator self-signed `O…` key,
+  account `iss` must be the operator key or an operator signing
+  key, account `sub` an `A…` key, duplicate pubkey/name rejected,
+  everything verified at trust-establishment time so a server
+  never starts half-trusting), and `verify_user` (user `iss` must
+  be a trusted account key or account signing key, CONNECT `nkey`
+  must equal the JWT `sub`, and the INFO-nonce signature must
+  verify — a `jwt` alone, or with a missing/wrong nonce signature,
+  never authenticates). `Config.operator` holds the trust;
+  `authenticate` routes a CONNECT carrying `jwt` exclusively
+  through the trust (failure rejects outright, never falls through
+  to static credentials), while CONNECTs without `jwt` use the
+  static accounts unchanged, so standalone nkey auth keeps
+  working. `auth_required` includes operator trust, so INFO
+  carries a nonce in operator mode with no static users.
+- Account JWTs convert into the existing `Account` machinery at
+  trust time: `default_permissions` become the account fallback,
+  imports/exports become `Import`/`Export` with pubkey references
+  translated to account names where trusted (imports from, and
+  exports to, untrusted accounts dropped, fail-closed). This
+  required `Config::all_accounts` (static + JWT accounts):
+  service-import delivery and stream-import fan-out resolve
+  accounts through it — without that, JWT accounts' imports were
+  invisible to area-6 routing and a service-import test hung.
+  A Go-shaped export with no `accounts` field maps to `*`
+  (authorizes any importer, matching Go's subject-match-only
+  check); a present list restricts to it.
+- `.conf`: `operator: "<jwt>"`, `operator { jwt | jwt_file,
+  accounts: [...] }`, `resolver { type: memory }` +
+  `resolver_preload: { <pubkey>: "<jwt>" }`, and a `preload` map
+  inside `resolver` as a Rust convenience. Bad operator/account
+  JWTs, preload keys matching no account JWT, and JWT account
+  names colliding with static accounts are config errors.
+- Go probing (nats-server v2.15.1 + its jwt v2.8.2 source, fetched
+  for this phase) settled four details: (1) Go's real preload key
+  is top-level `resolver_preload` — a `preload` map inside
+  `resolver` is ignored and the server then dies with "error
+  resolving system account: account missing"; (2) Go account
+  limits keys are `conn`/`subs`/`payload`/`data`/`leaf`/
+  `imports`/`exports`, and an absent numeric decodes to 0, which
+  Go enforces as a real limit (only -1 is unlimited) — a
+  limits-less account JWT fails Go on the first connection with
+  "maximum account active connections exceeded" and the first
+  subscription with "maximum subscriptions exceeded", and the
+  same applies to user-claim limits (`payload`/`subs`/`data`
+  under `nats`); (3) claim `name` is top-level in Go (also
+  accepted inside `nats` by rust-natsd, which now prefers
+  top-level to match); (4) Go rejects `exp` 2 s in the past (no
+  expiry leeway) but accepts `iat` 300 s in the future — the
+  Rust 60 s `iat` cap is therefore stricter than Go, fail-closed.
+- Verified: 3 unit tests in `src/jwt.rs` + 14 tests in
+  `tests/e2e_jwt.rs` (valid chain + claims enforcement, account
+  default-permission fallback, expired, tampered payload, wrong
+  issuer, untrusted account, revoked account (empty trust),
+  missing/bad nonce signature, nkey/sub mismatch, account
+  signing-key issuance, JWT service import through area-6
+  machinery, standalone nkey alongside operator mode, `.conf`
+  operator + resolver_preload + jwt_file shapes, bad-JWT config
+  error) and 2 Go interop tests (Go 2.15.1 accepts a
+  Rust-generated chain and delivers pub/sub; Go rejects an
+  expired Rust-generated user JWT). Go tests serialize on a
+  tokio mutex because parallel tests re-picked the same freed
+  port and cross-connected to the wrong fixture's server.
+  cargo test 150 green; parity GREEN (52 pass + 1 exception,
+  unchanged, nkey probes still pass); bench no regression vs
+  86edbe8 (pub/sub median 398,243/265,119 vs 418,910/226,910 —
+  256 B inside this run's own 283k–415k range; req/reply mean
+  89 µs vs 196 µs; JS 17,558 vs 8,019).
+- Remainder of this area: none for the required scope. Known
+  limitations carried forward: account-JWT `limits` are parsed
+  by neither enforcement path in rust-natsd (ignored; Go
+  enforces them, see above); account-JWT user `revocations`
+  lists are not honored (revocation = removing the account JWT
+  from trust and restarting); user `bearer_token` is not honored
+  (the nonce signature is always required, stricter than Go);
+  the system account is an ordinary JWT account (`$SYS`
+  subjects are not special-cased, as elsewhere); JWT accounts
+  do not appear in route/leaf account advertisement beyond
+  their connections (imports do not cross routes/leafs, Phase 21
+  remainder).
+
 ## Future work (not in this plan)
 - Gateways, JetStream clustering/replication, cross-node
-  mirroring/sourcing, MQTT/WebSocket gateways, JWT operator mode,
+  mirroring/sourcing, MQTT/WebSocket gateways,
   KV/object-store client-helper verification.
 
 ## Design notes

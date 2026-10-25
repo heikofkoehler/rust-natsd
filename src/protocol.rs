@@ -43,8 +43,9 @@ pub struct ConnectInfo {
     pub headers: bool,
     #[serde(default)]
     pub no_responders: bool,
-    /// NKey public key (standalone nkey auth; JWT operator mode is out of
-    /// scope — a `jwt` field alone does not authenticate).
+    /// NKey public key (standalone nkey auth, and the user key a JWT
+    /// CONNECT must match — a `jwt` field alone never authenticates:
+    /// it needs a valid nonce signature, see `crate::jwt`).
     #[serde(default, deserialize_with = "de_opt_string_null_as_none")]
     pub nkey: Option<String>,
     /// Base64-encoded Ed25519 signature of the INFO nonce bytes.

@@ -18,6 +18,18 @@
 //! - `accounts { NAME { users [...], permissions/authorization {...},
 //!   jetstream: enabled, exports [...], imports [...] } }`,
 //!   `system_account`, `no_auth_user`
+//! - JWT operator mode (see `crate::jwt`): `operator: "<jwt>"` (the
+//!   Go inline shape) or `operator { jwt: "<jwt>" | jwt_file: <path>,
+//!   accounts: ["<account jwt>", ...] }`, plus Go's resolver shape
+//!   `resolver { type: memory }` with top-level `resolver_preload: {
+//!   <account pubkey>: "<account jwt>" }` (Go v2.15.1's actual
+//!   preload key, verified by probing the Go binary; a `preload`
+//!   map inside the `resolver` block is also accepted as a Rust
+//!   convenience). Operator/account JWTs are fully verified
+//!   at load; a bad JWT, a preload key that matches no account JWT,
+//!   or a JWT account name colliding with a static account is a
+//!   config error. `jwt_file` paths are read relative to the current
+//!   working directory.
 //!
 //! Not supported (ignored or, for `include`, rejected): `include`,
 //! logging, limits, websocket/mqtt/gateway sections. A config using
@@ -525,6 +537,28 @@ fn parse_tls_block(v: &Value, mut tls: TlsSettings) -> TlsSettings {
     tls
 }
 
+/// Resolve a JWT value: an inline JWT string, or a `{ jwt: ... }` /
+/// `{ jwt_file: ... }` map. File contents are trimmed (JWT files
+/// commonly end with a newline).
+fn jwt_from_value(v: &Value) -> Result<String, String> {
+    match v {
+        Value::Str(s) => Ok(s.clone()),
+        Value::Map(_) => {
+            let map = map_of(v).unwrap_or_default();
+            if let Some(j) = map.get("jwt").and_then(|v| v.as_str()) {
+                return Ok(j.to_string());
+            }
+            if let Some(f) = map.get("jwt_file").and_then(|v| v.as_str()) {
+                let text = std::fs::read_to_string(f)
+                    .map_err(|e| format!("cannot read JWT file {f}: {e}"))?;
+                return Ok(text.trim().to_string());
+            }
+            Err("JWT value must be a string or { jwt | jwt_file }".to_string())
+        }
+        _ => Err("JWT value must be a string or { jwt | jwt_file }".to_string()),
+    }
+}
+
 fn as_string_list(v: &Value) -> Result<Vec<String>, String> {
     match v {
         Value::List(items) => {
@@ -639,6 +673,92 @@ pub fn apply_to(base: &Config, text: &str) -> Result<Config, String> {
                 cfg.accounts.push(account);
             }
         }
+    }
+    // JWT operator mode: `operator` (inline JWT string, or a block
+    // with jwt/jwt_file + accounts) and Go's resolver-preload shape.
+    // Verified at load via OperatorTrust::from_jwts; any failure is a
+    // config error, so a server never starts half-trusting.
+    let mut operator_jwt: Option<String> = None;
+    let mut operator_accounts: Vec<String> = Vec::new();
+    let mut preload_keys: Vec<String> = Vec::new();
+    if let Some(v) = lookup(&top, "operator") {
+        match &v {
+            Value::Str(s) => operator_jwt = Some(s.clone()),
+            Value::Map(_) => {
+                let map = map_of(&v).unwrap_or_default();
+                if let Some(j) = map.get("jwt") {
+                    operator_jwt = Some(jwt_from_value(j)?);
+                } else if let Some(f) = map.get("jwt_file").and_then(|v| v.as_str()) {
+                    let text = std::fs::read_to_string(f)
+                        .map_err(|e| format!("cannot read JWT file {f}: {e}"))?;
+                    operator_jwt = Some(text.trim().to_string());
+                } else {
+                    return Err("operator block requires jwt or jwt_file".to_string());
+                }
+                if let Some(Value::List(items)) = map.get("accounts") {
+                    for item in items {
+                        operator_accounts.push(jwt_from_value(item)?);
+                    }
+                } else if map.contains_key("accounts") {
+                    return Err("operator accounts must be a list".to_string());
+                }
+            }
+            _ => return Err("operator must be a JWT string or a block".to_string()),
+        }
+    }
+    if let Some(v) = lookup(&top, "resolver") {
+        let map = map_of(&v).ok_or("resolver must be a block")?;
+        if let Some(t) = map.get("type").and_then(|v| v.as_str()) {
+            if t != "memory" {
+                return Err("only resolver type memory is supported".to_string());
+            }
+        }
+        // A preload map here is the Rust convenience shape; Go's
+        // shape puts the preload in top-level `resolver_preload`
+        // (handled below), so a bare `resolver { type: memory }`
+        // block without preload is fine.
+        if let Some(pre) = map.get("preload") {
+            let pmap = map_of(pre).ok_or("resolver preload must be a map")?;
+            for (k, val) in pmap {
+                preload_keys.push(k.clone());
+                operator_accounts.push(jwt_from_value(val)?);
+            }
+        }
+        if operator_jwt.is_none() {
+            return Err("resolver without an operator is not supported".to_string());
+        }
+    }
+    // Go's actual preload key: top-level `resolver_preload` (the
+    // resolver block's own `preload` map, handled above, is a Rust
+    // convenience — Go v2.15.1 ignores it).
+    if let Some(v) = lookup(&top, "resolver_preload") {
+        let pmap = map_of(&v).ok_or("resolver_preload must be a map")?;
+        for (k, val) in pmap {
+            preload_keys.push(k.clone());
+            operator_accounts.push(jwt_from_value(val)?);
+        }
+        if operator_jwt.is_none() {
+            return Err("resolver_preload without an operator is not supported".to_string());
+        }
+    }
+    if let Some(oj) = operator_jwt {
+        let trust = crate::jwt::OperatorTrust::from_jwts(&oj, &operator_accounts)?;
+        for key in &preload_keys {
+            if !trust.accounts.iter().any(|a| &a.pubkey == key) {
+                return Err(format!(
+                    "resolver preload key {key} does not match any trusted account JWT"
+                ));
+            }
+        }
+        for jwt_account in &trust.accounts {
+            if cfg.accounts.iter().any(|a| a.name == jwt_account.name) {
+                return Err(format!(
+                    "JWT account name {} collides with a configured account",
+                    jwt_account.name
+                ));
+            }
+        }
+        cfg.operator = Some(trust);
     }
     if let Some(v) = lookup(&top, "system_account") {
         cfg.system_account = v.as_str().map(|s| s.to_string());

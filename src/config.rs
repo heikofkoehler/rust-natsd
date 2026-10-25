@@ -282,6 +282,11 @@ pub struct Config {
     /// Multi-account model; empty means the legacy single-account mode
     /// (global --user/--pass/--auth-token as account `$G`).
     pub accounts: Vec<Account>,
+    /// JWT operator trust, if configured (see `crate::jwt`). When set,
+    /// CONNECTs carrying a `jwt` field are authenticated against this
+    /// trust; CONNECTs without one still use the static accounts above
+    /// (mixed mode), so standalone nkey auth keeps working.
+    pub operator: Option<crate::jwt::OperatorTrust>,
     /// Name of the system account, if configured (parsed and exposed
     /// via monitoring; `$SYS` subjects are not special-cased).
     pub system_account: Option<String>,
@@ -322,6 +327,7 @@ impl Default for Config {
             leaf_tls: None,
             leaf_remote_tls: std::collections::HashMap::new(),
             accounts: Vec::new(),
+            operator: None,
             system_account: None,
             no_auth_user: None,
             ping_interval: std::time::Duration::from_secs(120),
@@ -681,9 +687,21 @@ impl Config {
             .unwrap_or_else(|| self.name.clone())
     }
 
-    /// Look up a configured account by name.
+    /// All accounts visible to routing: static accounts plus JWT
+    /// accounts from operator trust. JWT accounts participate in the
+    /// area-6 import/export machinery exactly like static accounts
+    /// (their `users` are empty — users arrive via user JWTs).
+    pub fn all_accounts(&self) -> impl Iterator<Item = &Account> {
+        self.accounts.iter().chain(
+            self.operator
+                .iter()
+                .flat_map(|op| op.accounts.iter().map(|a| &a.account)),
+        )
+    }
+
+    /// Look up a configured account by name (static or JWT).
     pub fn account(&self, name: &str) -> Option<&Account> {
-        self.accounts.iter().find(|a| a.name == name)
+        self.all_accounts().find(|a| a.name == name)
     }
 
     /// True when an import is authorized by the source account's
@@ -727,11 +745,13 @@ impl Config {
         })
     }
 
-    /// True when any authentication is configured (legacy user/token
-    /// or any account with users).
+    /// True when any authentication is configured (legacy user/token,
+    /// any account with users, or JWT operator trust — operator mode
+    /// requires a nonce in INFO even with no static users).
     pub fn auth_required(&self) -> bool {
         self.user.is_some()
             || self.auth_token.is_some()
+            || self.operator.is_some()
             || self.accounts.iter().any(|a| !a.users.is_empty())
     }
 
@@ -744,6 +764,29 @@ impl Config {
         info: &crate::protocol::ConnectInfo,
         nonce: Option<&[u8]>,
     ) -> Option<AuthOutcome> {
+        // JWT operator mode: a CONNECT carrying a jwt field is
+        // authenticated ONLY against the operator trust, and any
+        // failure rejects outright — it must never fall through to
+        // static credentials. Without operator trust, a jwt field is
+        // ignored and the standalone paths below apply unchanged.
+        if let Some(operator) = &self.operator {
+            if let Some(jwt) = info.jwt.as_deref().filter(|s| !s.is_empty()) {
+                return match operator.verify_user(
+                    jwt,
+                    info.nkey.as_deref(),
+                    nonce,
+                    info.sig.as_deref(),
+                    crate::jwt::now_unix(),
+                ) {
+                    Ok(u) => Some(AuthOutcome {
+                        account: u.account,
+                        user: u.user,
+                        permissions: u.permissions,
+                    }),
+                    Err(_) => None,
+                };
+            }
+        }
         if !self.accounts.is_empty() {
             for account in &self.accounts {
                 for user in &account.users {
