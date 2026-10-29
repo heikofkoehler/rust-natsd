@@ -221,3 +221,115 @@ async fn conf_accounts_shape_parses() {
     assert_eq!(cfg.system_account.as_deref(), Some("B"));
     assert_eq!(cfg.no_auth_user.as_deref(), Some("alice"));
 }
+
+#[tokio::test]
+async fn jetstream_streams_and_consumers_isolated_across_accounts() {
+    let cfg = Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        cluster_port: 0,
+        jetstream: true,
+        accounts: vec![
+            Account {
+                name: "A".into(),
+                users: vec![AccountUser {
+                    name: "alice".into(),
+                    pass: Some("alicepw".into()),
+                    ..Default::default()
+                }],
+                jetstream_enabled: true,
+                ..Default::default()
+            },
+            Account {
+                name: "B".into(),
+                users: vec![AccountUser {
+                    name: "bob".into(),
+                    pass: Some("bobpw".into()),
+                    ..Default::default()
+                }],
+                jetstream_enabled: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let srv = server::start(cfg).await.expect("server starts");
+
+    let ca = async_nats::ConnectOptions::with_user_and_password(
+        "alice".to_string(),
+        "alicepw".to_string(),
+    )
+    .connect(format!("nats://{}", srv.addr))
+    .await
+    .unwrap();
+    let cb =
+        async_nats::ConnectOptions::with_user_and_password("bob".to_string(), "bobpw".to_string())
+            .connect(format!("nats://{}", srv.addr))
+            .await
+            .unwrap();
+
+    let jsa = async_nats::jetstream::new(ca.clone());
+    let jsb = async_nats::jetstream::new(cb.clone());
+
+    // Account A creates stream "SHARED" and durable consumer "c1".
+    let sa = jsa
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: "SHARED".into(),
+            subjects: vec!["orders.>".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("account A creates SHARED");
+    sa.create_consumer(async_nats::jetstream::consumer::pull::Config {
+        durable_name: Some("c1".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("account A creates consumer c1");
+
+    // Account B cannot read or delete Account A's consumer "c1" before B
+    // even has a stream named "SHARED".
+    let info_resp: serde_json::Value = serde_json::from_slice(
+        &cb.request("$JS.API.CONSUMER.INFO.SHARED.c1", "".into())
+            .await
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert!(
+        info_resp.get("error").is_some(),
+        "Account B must not read Account A's consumer info: {info_resp}"
+    );
+    let del_resp: serde_json::Value = serde_json::from_slice(
+        &cb.request("$JS.API.CONSUMER.DELETE.SHARED.c1", "".into())
+            .await
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert!(
+        del_resp.get("error").is_some(),
+        "Account B must not delete Account A's consumer: {del_resp}"
+    );
+
+    // Account A's consumer "c1" is still intact.
+    let info_a: serde_json::Value = serde_json::from_slice(
+        &ca.request("$JS.API.CONSUMER.INFO.SHARED.c1", "".into())
+            .await
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert_eq!(info_a["name"], "c1");
+
+    // Account B can also create a stream with the same name "SHARED".
+    jsb.create_stream(async_nats::jetstream::stream::Config {
+        name: "SHARED".into(),
+        subjects: vec!["orders.>".into()],
+        ..Default::default()
+    })
+    .await
+    .expect("account B creates its own SHARED stream");
+
+    srv.shutdown().await.expect("shutdown");
+}

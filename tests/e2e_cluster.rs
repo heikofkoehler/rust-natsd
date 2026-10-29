@@ -291,3 +291,66 @@ async fn cluster_three_nodes_full_mesh() {
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn cluster_queue_group_with_headers_exactly_once() {
+    let b = start(node_config(free_port(), vec![])).await;
+    let b_cluster = b.cluster_addr.unwrap();
+    let a = start(node_config(
+        free_port(),
+        vec![format!("nats://{b_cluster}")],
+    ))
+    .await;
+
+    let ca = connect(&a).await;
+    let cb = connect(&b).await;
+    // Plain subscriber on B ensures every HMSG is routed to B even when
+    // A's queue worker wins selection.
+    let mut plain_b = cb.subscribe("hjobs").await.unwrap();
+    let mut qa = ca
+        .queue_subscribe("hjobs", "workers".to_string())
+        .await
+        .unwrap();
+    let mut qb = cb
+        .queue_subscribe("hjobs", "workers".to_string())
+        .await
+        .unwrap();
+    ca.flush().await.unwrap();
+    cb.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let pub_client = connect(&a).await;
+    let mut hdrs = async_nats::header::HeaderMap::new();
+    hdrs.insert("X-Route", "hdr");
+    for _ in 0..20 {
+        pub_client
+            .publish_with_headers("hjobs", hdrs.clone(), "x".into())
+            .await
+            .unwrap();
+    }
+    pub_client.flush().await.unwrap();
+
+    let mut total = 0;
+    let deadline = tokio::time::Instant::now() + T;
+    while total < 20 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only got {total}/20"
+        );
+        tokio::select! {
+            m = qa.next() => { assert!(m.is_some()); total += 1; }
+            m = qb.next() => { assert!(m.is_some()); total += 1; }
+        }
+    }
+    for _ in 0..20 {
+        assert!(timeout(T, plain_b.next()).await.unwrap().is_some());
+    }
+    tokio::select! {
+        m = qa.next() => panic!("extra delivery on A: {:?}", m.map(|m| m.payload)),
+        m = qb.next() => panic!("extra delivery on B: {:?}", m.map(|m| m.payload)),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}

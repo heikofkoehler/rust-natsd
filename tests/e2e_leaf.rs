@@ -255,3 +255,140 @@ async fn leaf_reconnects_after_restart() {
     leaf2.shutdown().await.unwrap();
     hub.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn leaf_to_leaf_via_hub() {
+    let hub = start(Config {
+        leaf_port: free_port(),
+        ..base_config()
+    })
+    .await;
+    let hub_leaf = hub.leaf_addr.unwrap();
+    let leaf1 = start(Config {
+        leaf_urls: vec![format!("nats://{hub_leaf}")],
+        ..base_config()
+    })
+    .await;
+    let leaf2 = start(Config {
+        leaf_urls: vec![format!("nats://{hub_leaf}")],
+        ..base_config()
+    })
+    .await;
+
+    let c1 = connect(&leaf1).await;
+    let c2 = connect(&leaf2).await;
+    let mut sub2 = c2.subscribe("spoke.to.spoke").await.unwrap();
+    c2.flush().await.unwrap();
+    publish_until_received(&c1, &mut sub2, "spoke.to.spoke", b"l1-to-l2").await;
+
+    let mut sub1 = c1.subscribe("spoke.back").await.unwrap();
+    c1.flush().await.unwrap();
+    publish_until_received(&c2, &mut sub1, "spoke.back", b"l2-to-l1").await;
+
+    leaf1.shutdown().await.unwrap();
+    leaf2.shutdown().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn leaf_to_route_and_route_to_leaf() {
+    let node_b_cluster_port = free_port();
+    let node_b = start(Config {
+        cluster_host: "127.0.0.1".into(),
+        cluster_port: node_b_cluster_port,
+        cluster_name: Some("c1".into()),
+        ..base_config()
+    })
+    .await;
+    let hub_a = start(Config {
+        cluster_host: "127.0.0.1".into(),
+        cluster_port: free_port(),
+        cluster_name: Some("c1".into()),
+        routes: vec![format!("nats://127.0.0.1:{node_b_cluster_port}")],
+        leaf_port: free_port(),
+        ..base_config()
+    })
+    .await;
+    let hub_a_leaf = hub_a.leaf_addr.unwrap();
+    let leaf = start(Config {
+        leaf_urls: vec![format!("nats://{hub_a_leaf}")],
+        ..base_config()
+    })
+    .await;
+
+    let c_leaf = connect(&leaf).await;
+    let c_b = connect(&node_b).await;
+
+    // Subscriber on cluster node B, publisher on leaf (via hub A).
+    let mut sub_b = c_b.subscribe("from.leaf").await.unwrap();
+    c_b.flush().await.unwrap();
+    publish_until_received(&c_leaf, &mut sub_b, "from.leaf", b"leaf-to-route").await;
+
+    // Subscriber on leaf, publisher on cluster node B (via hub A).
+    let mut sub_leaf = c_leaf.subscribe("from.route").await.unwrap();
+    c_leaf.flush().await.unwrap();
+    publish_until_received(&c_b, &mut sub_leaf, "from.route", b"route-to-leaf").await;
+
+    leaf.shutdown().await.unwrap();
+    hub_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn leaf_queue_group_with_headers_exactly_once() {
+    let (hub, leaf) = hub_and_leaf().await;
+
+    let ch = connect(&hub).await;
+    let cl = connect(&leaf).await;
+    // Also add a plain subscriber on the leaf so HMSG frames go over the
+    // leaf connection even when the hub's queue worker wins selection.
+    let mut plain_leaf = cl.subscribe("hjobs").await.unwrap();
+    let mut qh = ch
+        .queue_subscribe("hjobs", "workers".to_string())
+        .await
+        .unwrap();
+    let mut ql = cl
+        .queue_subscribe("hjobs", "workers".to_string())
+        .await
+        .unwrap();
+    ch.flush().await.unwrap();
+    cl.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let pub_client = connect(&hub).await;
+    let mut hdrs = async_nats::header::HeaderMap::new();
+    hdrs.insert("X-Test", "1");
+    for _ in 0..20 {
+        pub_client
+            .publish_with_headers("hjobs", hdrs.clone(), "x".into())
+            .await
+            .unwrap();
+    }
+    pub_client.flush().await.unwrap();
+
+    let mut total = 0;
+    let deadline = tokio::time::Instant::now() + T;
+    while total < 20 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only got {total}/20"
+        );
+        tokio::select! {
+            m = qh.next() => { assert!(m.is_some()); total += 1; }
+            m = ql.next() => { assert!(m.is_some()); total += 1; }
+        }
+    }
+    // Plain subscriber receives all 20, while the queue group receives
+    // each message once globally (never duplicated across hub + leaf).
+    for _ in 0..20 {
+        assert!(timeout(T, plain_leaf.next()).await.unwrap().is_some());
+    }
+    tokio::select! {
+        m = qh.next() => panic!("extra queue delivery on hub: {:?}", m.map(|m| m.payload)),
+        m = ql.next() => panic!("extra queue delivery on leaf: {:?}", m.map(|m| m.payload)),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+
+    leaf.shutdown().await.unwrap();
+    hub.shutdown().await.unwrap();
+}

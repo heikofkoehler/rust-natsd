@@ -541,7 +541,7 @@ impl Engine {
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        match self.streams.get(stream_name) {
+        match self.stream_for(stream_name, account) {
             Some(stream) => match stream.consumers.get(consumer_name) {
                 Some(consumer) => {
                     let info = consumer.info_json(stream_name, stream);
@@ -606,8 +606,7 @@ impl Engine {
         actions: &mut Vec<Action>,
     ) {
         let removed = self
-            .streams
-            .get_mut(stream_name)
+            .stream_for_mut(stream_name, account)
             .map(|s| s.consumers.remove(consumer_name).is_some())
             .unwrap_or(false);
         if removed {
@@ -801,13 +800,8 @@ impl Engine {
         let mut actions = Vec::new();
         let now = Instant::now();
         let now_ns = now_ns();
-        let stream_names: Vec<String> = self.streams.keys().cloned().collect();
-        for name in stream_names {
-            let account = self
-                .streams
-                .get(&name)
-                .map(|s| s.account.clone())
-                .unwrap_or_default();
+        let stream_keys: Vec<(String, String)> = self.streams.keys().cloned().collect();
+        for (account, name) in stream_keys {
             let stream = self.stream_for_mut(&name, &account).unwrap();
             // Max-age eviction.
             if stream.max_age_ns > 0 {

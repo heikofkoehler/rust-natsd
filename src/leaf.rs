@@ -255,44 +255,63 @@ fn parse_leaf_line(
         }
         // Go sends header messages to leafs as HMSG (client-style, but
         // with no subscription id and no account): HMSG subject [reply]
-        // hdr_len total_len. Plain MSG (subject sid [reply] size) is
-        // accepted the same way for robustness.
+        // [| queue...] hdr_len total_len. Plain MSG (subject sid [reply]
+        // size) is accepted the same way for robustness.
         "HMSG" | "MSG" => {
             let args: Vec<&str> = rest.split_whitespace().collect();
             if verb_up == "HMSG" {
-                if args.len() < 3 || args.len() > 4 {
+                if args.len() < 3 {
                     return Err(LeafParseError::InvalidArgs(format!("HMSG {rest}")));
                 }
                 // Leaf publish subjects are literal; never reject them here.
                 let subject = args[0].to_string();
-                let (reply_to, hdr_len, total) = if args.len() == 3 {
-                    (
-                        None,
-                        args[1]
-                            .parse::<usize>()
-                            .map_err(|_| LeafParseError::InvalidSize(args[1].to_string()))?,
-                        args[2]
-                            .parse::<usize>()
-                            .map_err(|_| LeafParseError::InvalidSize(args[2].to_string()))?,
-                    )
-                } else {
-                    (
-                        Some(args[1].to_string()),
-                        args[2]
-                            .parse::<usize>()
-                            .map_err(|_| LeafParseError::InvalidSize(args[2].to_string()))?,
-                        args[3]
-                            .parse::<usize>()
-                            .map_err(|_| LeafParseError::InvalidSize(args[3].to_string()))?,
-                    )
-                };
+                let mut mid = args[1..].to_vec();
+                let mut sizes: Vec<usize> = Vec::new();
+                while let Some(last) = mid.last() {
+                    if let Ok(n) = last.parse::<usize>() {
+                        sizes.push(n);
+                        mid.pop();
+                    } else {
+                        break;
+                    }
+                }
+                sizes.reverse();
+                if sizes.len() != 2 {
+                    return Err(LeafParseError::InvalidArgs(format!("HMSG {rest}")));
+                }
+                let (hdr_len, total) = (sizes[0], sizes[1]);
                 if total > max_payload {
                     return Err(LeafParseError::PayloadTooLarge(total));
+                }
+                let mut reply_to = None;
+                let mut queues = Vec::new();
+                let mut i = 0;
+                while i < mid.len() {
+                    match mid[i] {
+                        "+" => {
+                            if i + 1 < mid.len() {
+                                reply_to = Some(mid[i + 1].to_string());
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        "|" => {
+                            queues = mid[i + 1..].iter().map(|s| s.to_string()).collect();
+                            break;
+                        }
+                        other => {
+                            if reply_to.is_none() {
+                                reply_to = Some(other.to_string());
+                            }
+                            i += 1;
+                        }
+                    }
                 }
                 let op = LeafOp::LMsg {
                     subject,
                     reply_to,
-                    queues: None,
+                    queues: Some(queues),
                     headers: None,
                     payload: Bytes::new(),
                 };
@@ -453,6 +472,7 @@ pub fn encode_ls_minus(subject: &str, queue: Option<&str>) -> Bytes {
 pub fn encode_leaf_hmsg(
     subject: &str,
     reply_to: Option<&str>,
+    queues: &[String],
     headers: &[u8],
     payload: &[u8],
 ) -> Bytes {
@@ -461,6 +481,13 @@ pub fn encode_leaf_hmsg(
     if let Some(r) = reply_to {
         line.push(' ');
         line.push_str(r);
+    }
+    if !queues.is_empty() {
+        line.push_str(" |");
+        for q in queues {
+            line.push(' ');
+            line.push_str(q);
+        }
     }
     line.push_str(&format!(" {} {total}\r\n", headers.len()));
     let mut out = BytesMut::from(line.as_str());
@@ -570,6 +597,26 @@ mod tests {
             LeafOp::LMsg {
                 headers, payload, ..
             } => {
+                assert_eq!(headers.as_ref().unwrap().as_ref(), hdrs);
+                assert_eq!(payload.as_ref(), b"hi");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let queues = vec!["workers".to_string()];
+        let encoded = encode_leaf_hmsg("jobs", Some("_INBOX.9"), &queues, hdrs, b"hi");
+        let got2 = ops(&encoded);
+        match &got2[0] {
+            LeafOp::LMsg {
+                subject,
+                reply_to,
+                queues: parsed_q,
+                headers,
+                payload,
+            } => {
+                assert_eq!(subject, "jobs");
+                assert_eq!(reply_to.as_deref(), Some("_INBOX.9"));
+                assert_eq!(parsed_q, &Some(queues));
                 assert_eq!(headers.as_ref().unwrap().as_ref(), hdrs);
                 assert_eq!(payload.as_ref(), b"hi");
             }

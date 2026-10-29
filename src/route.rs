@@ -242,35 +242,43 @@ fn parse_route_line(
                 }
             }
             sizes.reverse();
-            let (reply_to, queues, hdr_len, total) = if verb_up == "HMSG" {
-                if sizes.len() != 2 {
-                    return Err(RouteParseError::InvalidArgs(format!("{verb} {rest}")));
-                }
-                let reply_to = if !mid.is_empty() {
-                    Some(mid[0].to_string())
-                } else {
-                    None
-                };
-                (reply_to, Vec::new(), sizes[0], sizes[1])
-            } else {
-                // RMSG: middle tokens may hold a reply and/or `|` queues.
-                let mut reply_to = None;
-                let mut queues = Vec::new();
-                let mut i = 0;
-                while i < mid.len() {
-                    if mid[i] == "|" {
+            // Middle tokens (both RMSG and HMSG) may hold a reply
+            // (optionally prefixed with `+`) and/or `|` queues.
+            let mut reply_to = None;
+            let mut queues = Vec::new();
+            let mut i = 0;
+            while i < mid.len() {
+                match mid[i] {
+                    "+" => {
+                        if i + 1 < mid.len() {
+                            reply_to = Some(mid[i + 1].to_string());
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "|" => {
                         queues = mid[i + 1..].iter().map(|s| s.to_string()).collect();
                         break;
                     }
-                    if reply_to.is_none() {
-                        reply_to = Some(mid[i].to_string());
+                    other => {
+                        if reply_to.is_none() {
+                            reply_to = Some(other.to_string());
+                        }
+                        i += 1;
                     }
-                    i += 1;
                 }
+            }
+            let (hdr_len, total) = if verb_up == "HMSG" {
+                if sizes.len() != 2 {
+                    return Err(RouteParseError::InvalidArgs(format!("{verb} {rest}")));
+                }
+                (sizes[0], sizes[1])
+            } else {
                 if sizes.len() != 1 {
                     return Err(RouteParseError::InvalidArgs(format!("{verb} {rest}")));
                 }
-                (reply_to, queues, 0, sizes[0])
+                (0, sizes[0])
             };
             if total > max_payload {
                 return Err(RouteParseError::PayloadTooLarge(total));
@@ -385,11 +393,12 @@ pub fn encode_rmsg(
 }
 
 /// Encode a routed header message (Go's route form: HMSG with account and
-/// no subscription id).
+/// no subscription id; queue groups, when present, are listed after `|`).
 pub fn encode_route_hmsg(
     account: &str,
     subject: &str,
     reply_to: Option<&str>,
+    queues: &[String],
     headers: &[u8],
     payload: &[u8],
 ) -> Bytes {
@@ -398,6 +407,13 @@ pub fn encode_route_hmsg(
     if let Some(r) = reply_to {
         line.push(' ');
         line.push_str(r);
+    }
+    if !queues.is_empty() {
+        line.push_str(" |");
+        for q in queues {
+            line.push(' ');
+            line.push_str(q);
+        }
     }
     line.push_str(&format!(" {} {total}\r\n", headers.len()));
     let mut out = BytesMut::from(line.as_str());
@@ -491,8 +507,34 @@ mod tests {
         let got = ops(&wire);
         match &got[0] {
             RouteOp::RMsg {
-                headers, payload, ..
+                queues,
+                headers,
+                payload,
+                ..
             } => {
+                assert!(queues.is_empty());
+                assert_eq!(headers.as_ref().unwrap().as_ref(), hdrs);
+                assert_eq!(payload.as_ref(), b"hello");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let queues = vec!["workers".to_string(), "q2".to_string()];
+        let encoded = encode_route_hmsg("$G", "jobs", Some("_INBOX.1"), &queues, hdrs, b"hello");
+        let got2 = ops(&encoded);
+        match &got2[0] {
+            RouteOp::RMsg {
+                account,
+                subject,
+                reply_to,
+                queues: parsed_q,
+                headers,
+                payload,
+            } => {
+                assert_eq!(account, "$G");
+                assert_eq!(subject, "jobs");
+                assert_eq!(reply_to.as_deref(), Some("_INBOX.1"));
+                assert_eq!(parsed_q, &queues);
                 assert_eq!(headers.as_ref().unwrap().as_ref(), hdrs);
                 assert_eq!(payload.as_ref(), b"hello");
             }

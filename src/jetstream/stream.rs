@@ -22,11 +22,12 @@ use crate::subject::subject_matches;
 impl Engine {
     /// Stream by name, only when it belongs to `account`.
     pub(crate) fn stream_for(&self, name: &str, account: &str) -> Option<&Stream> {
-        self.streams.get(name).filter(|s| s.account == account)
+        self.streams.get(&(account.to_string(), name.to_string()))
     }
 
     pub(crate) fn stream_for_mut(&mut self, name: &str, account: &str) -> Option<&mut Stream> {
-        self.streams.get_mut(name).filter(|s| s.account == account)
+        self.streams
+            .get_mut(&(account.to_string(), name.to_string()))
     }
 
     /// Append one message to a stream, enforcing its limits
@@ -107,8 +108,7 @@ impl Engine {
     /// waiting pulls.
     pub(crate) fn fan_out(&mut self, stream_name: &str, account: &str, actions: &mut Vec<Action>) {
         let push_names: Vec<String> = self
-            .streams
-            .get(stream_name)
+            .stream_for(stream_name, account)
             .map(|s| {
                 s.consumers
                     .values()
@@ -122,8 +122,7 @@ impl Engine {
             drain_push(stream_name, stream, &cname, actions);
         }
         let pull_names: Vec<String> = self
-            .streams
-            .get(stream_name)
+            .stream_for(stream_name, account)
             .map(|s| {
                 s.consumers
                     .values()
@@ -163,8 +162,7 @@ impl Engine {
             return;
         }
         let origin_token = self
-            .streams
-            .get(origin_name)
+            .stream_for(origin_name, account)
             .map(|s| s.source_token.clone())
             .unwrap_or_default();
         // Plan first (immutable scan), then mutate: dependents in
@@ -178,7 +176,7 @@ impl Engine {
             .collect();
         dep_names.sort();
         for dep in dep_names {
-            let Some(s) = self.streams.get(&dep) else {
+            let Some(s) = self.stream_for(&dep, account) else {
                 continue;
             };
             // Phase 32: remote links are served by the mirror loop,
@@ -361,7 +359,7 @@ impl Engine {
     /// configs transitively by name (Go rejects the cycle even when
     /// the intermediate stream was deleted, because its config still
     /// names the stream — so dead links count here).
-    pub(crate) fn would_cycle(&self, new_name: &str, origins: &[String]) -> bool {
+    pub(crate) fn would_cycle(&self, account: &str, new_name: &str, origins: &[String]) -> bool {
         let mut stack: Vec<String> = origins.to_vec();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(name) = stack.pop() {
@@ -371,7 +369,7 @@ impl Engine {
             if !seen.insert(name.clone()) {
                 continue;
             }
-            if let Some(s) = self.streams.get(&name) {
+            if let Some(s) = self.stream_for(&name, account) {
                 if let Some(cfg) = &s.mirror {
                     stack.push(cfg.name.clone());
                 }
@@ -599,6 +597,22 @@ impl Engine {
             consumer.ack_floor_stream_seq = sseq;
         }
         let payload = String::from_utf8_lossy(&msg.payload);
+        let plain_ack = !matches!(payload.as_ref(), "-NAK" | "+NAK" | "+TERM" | "+WPI");
+        let mut acked_stream_seqs = vec![sseq];
+        if plain_ack && consumer.ack_policy == super::AckPolicy::All {
+            let prior_cseqs: Vec<u64> = consumer
+                .pending
+                .keys()
+                .copied()
+                .filter(|k| *k < cseq)
+                .collect();
+            for k in prior_cseqs {
+                if let Some(p) = consumer.pending.remove(&k) {
+                    acked_stream_seqs.push(p.stream_seq);
+                }
+            }
+            consumer.redeliver.retain(|r| r.stream_seq > sseq);
+        }
         match payload.as_ref() {
             // The wire format for negative ack is `-NAK` (async-nats
             // and nats.go both send that); `+NAK` is accepted too.
@@ -700,14 +714,13 @@ impl Engine {
             let cname = consumer.name.clone();
             drain_push(stream_name, stream, &cname, actions);
         }
-        // Workqueue retention: a plain ack deletes the message (after
-        // its first ack). NAK/TERM/WPI do not delete. Note: ack policy
-        // All is not bulk-aware here — only the acked message itself
-        // is deleted; other messages covered by an All ack are deleted
-        // when they are individually acked.
-        let plain_ack = !matches!(payload.as_ref(), "-NAK" | "+NAK" | "+TERM" | "+WPI");
+        // Workqueue retention: a plain ack deletes the message (and any
+        // prior pending messages covered by an AckPolicy::All ack).
+        // NAK/TERM/WPI do not delete.
         if plain_ack && stream.retention == "workqueue" {
-            stream.deleted.insert(sseq);
+            for seq in acked_stream_seqs {
+                stream.deleted.insert(seq);
+            }
         }
     }
 }

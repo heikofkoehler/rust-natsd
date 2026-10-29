@@ -572,3 +572,146 @@ async fn per_account_jetstream_gate_blocks_disabled_account() {
     );
     srv.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn ack_policy_all_acknowledges_and_deletes_prior_messages() {
+    let (_srv, client) = start_js().await;
+    let js = js(&client);
+    api(
+        &client,
+        "$JS.API.STREAM.CREATE.WQALL",
+        serde_json::json!({
+            "name": "WQALL",
+            "subjects": ["wqall.>"],
+            "retention": "workqueue",
+        }),
+    )
+    .await;
+    for i in 1..=3 {
+        js.publish(format!("wqall.{i}"), Bytes::from(format!("m{i}")))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    api(
+        &client,
+        "$JS.API.CONSUMER.CREATE.WQALL.c_all",
+        serde_json::json!({
+            "stream_name": "WQALL",
+            "config": {
+                "name": "c_all",
+                "durable_name": "c_all",
+                "ack_policy": "all",
+                "ack_wait": 500_000_000u64, // 500ms
+            }
+        }),
+    )
+    .await;
+
+    let mut sub = client.subscribe("pull.wqall").await.unwrap();
+    client
+        .publish_with_reply(
+            "$JS.API.CONSUMER.MSG.NEXT.WQALL.c_all",
+            "pull.wqall",
+            Bytes::from(serde_json::json!({ "batch": 3 }).to_string()),
+        )
+        .await
+        .unwrap();
+
+    let _m1 = timeout(T, sub.next()).await.unwrap().unwrap();
+    let _m2 = timeout(T, sub.next()).await.unwrap().unwrap();
+    let m3 = timeout(T, sub.next()).await.unwrap().unwrap();
+
+    // Ack ONLY the 3rd message; with AckPolicy::All, messages 1 and 2
+    // must also be acknowledged and removed from the workqueue stream.
+    client
+        .publish(m3.reply.unwrap(), Bytes::new())
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let cinfo = api(
+        &client,
+        "$JS.API.CONSUMER.INFO.WQALL.c_all",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(cinfo["num_ack_pending"], 0);
+    assert_eq!(cinfo["ack_floor"]["consumer_seq"], 3);
+    assert_eq!(cinfo["ack_floor"]["stream_seq"], 3);
+
+    let sinfo = api(&client, "$JS.API.STREAM.INFO.WQALL", serde_json::json!({})).await;
+    assert_eq!(
+        sinfo["state"]["messages"], 0,
+        "workqueue stream must delete all 3 messages when the 3rd is acked under AckPolicy::All"
+    );
+}
+
+#[tokio::test]
+async fn nats_rollup_sub_and_all_purge_prior_messages() {
+    let (_srv, client) = start_js().await;
+    let js = js(&client);
+    js.create_stream(jetstream::stream::Config {
+        name: "KV_TEST".into(),
+        subjects: vec!["$KV.TEST.>".into()],
+        allow_rollup: true,
+        ..Default::default()
+    })
+    .await
+    .expect("create stream");
+
+    js.publish("$KV.TEST.a", Bytes::from("a1"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    js.publish("$KV.TEST.b", Bytes::from("b1"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    js.publish("$KV.TEST.a", Bytes::from("a2"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    // Rollup "sub" on $KV.TEST.a purges a1 and a2 while keeping b1.
+    let mut hdrs_sub = async_nats::HeaderMap::new();
+    hdrs_sub.insert("Nats-Rollup", "sub");
+    js.publish_with_headers("$KV.TEST.a", hdrs_sub, Bytes::from("a3"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let sinfo = api(
+        &client,
+        "$JS.API.STREAM.INFO.KV_TEST",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(sinfo["state"]["messages"], 2);
+    assert_eq!(sinfo["state"]["first_seq"], 2);
+    assert_eq!(sinfo["state"]["last_seq"], 4);
+
+    // Rollup "all" purges every prior message across the stream.
+    let mut hdrs_all = async_nats::HeaderMap::new();
+    hdrs_all.insert("Nats-Rollup", "all");
+    js.publish_with_headers("$KV.TEST.snap", hdrs_all, Bytes::from("snap"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let sinfo2 = api(
+        &client,
+        "$JS.API.STREAM.INFO.KV_TEST",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(sinfo2["state"]["messages"], 1);
+    assert_eq!(sinfo2["state"]["first_seq"], 5);
+    assert_eq!(sinfo2["state"]["last_seq"], 5);
+}

@@ -751,7 +751,7 @@ where
             tls,
         },
     );
-    send_local_interest(&shared, &handle, true, None);
+    send_local_interest(&shared, &handle, id, true, None);
     route_read_loop(&mut reader, &shared, id, &handle, &tx).await;
     close_route(&shared, id);
 }
@@ -954,7 +954,7 @@ async fn handle_route_solicited<R, W>(
             tls,
         },
     );
-    send_local_interest(&shared, &handle, true, None);
+    send_local_interest(&shared, &handle, id, true, None);
     route_read_loop(&mut reader, &shared, id, &handle, &tx).await;
     close_route(&shared, id);
 }
@@ -1080,7 +1080,7 @@ async fn handle_leaf_accepted<R, W>(
             tls,
         },
     );
-    send_local_interest(&shared, &handle, false, Some(&leaf_account));
+    send_local_interest(&shared, &handle, id, false, Some(&leaf_account));
     leaf_read_loop(&mut reader, &shared, id, &handle, &tx).await;
     close_leaf(&shared, id);
 }
@@ -1236,7 +1236,7 @@ async fn handle_leaf_solicited_after_info<R, W>(
             tls,
         },
     );
-    send_local_interest(&shared, &handle, false, Some(&leaf_account));
+    send_local_interest(&shared, &handle, id, false, Some(&leaf_account));
     leaf_read_loop(&mut reader, &shared, id, &handle, &tx).await;
     close_leaf(&shared, id);
 }

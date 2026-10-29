@@ -135,7 +135,18 @@ fn resident_memory_bytes() -> u64 {
 
 #[cfg(not(target_os = "linux"))]
 fn resident_memory_bytes() -> u64 {
-    0
+    let pid = std::process::id().to_string();
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+    else {
+        return 0;
+    };
+    std::str::from_utf8(&out.stdout)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
 }
 
 /// Parse a `k=v&k=v` query string into a lookup (no URL-decoding:

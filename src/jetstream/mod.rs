@@ -232,7 +232,7 @@ pub(crate) enum Action {
 }
 
 pub(crate) struct Engine {
-    pub(crate) streams: HashMap<String, Stream>,
+    pub(crate) streams: HashMap<(String, String), Stream>,
 }
 
 pub(crate) struct StoredMsg {

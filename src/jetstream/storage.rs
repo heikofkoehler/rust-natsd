@@ -1623,7 +1623,9 @@ impl Engine {
                     );
                 }
             }
-            engine.streams.insert(stream.name.clone(), stream);
+            engine
+                .streams
+                .insert((stream.account.clone(), stream.name.clone()), stream);
         }
         Ok(engine)
     }
@@ -1734,10 +1736,12 @@ mod tests {
                 num_redelivered: 0,
             },
         );
-        engine.streams.insert("S".to_string(), stream);
+        engine
+            .streams
+            .insert(("$G".to_string(), "S".to_string()), stream);
         let text = serde_json::to_string(&engine.snapshot_json()).unwrap();
         let restored = Engine::from_snapshot_json(&text).unwrap();
-        let s = &restored.streams["S"];
+        let s = &restored.streams[&("$G".to_string(), "S".to_string())];
         assert_eq!(s.messages.len(), 1);
         assert_eq!(s.messages[0].payload.as_ref(), b"hello");
         assert!(s.consumers.contains_key("c"));

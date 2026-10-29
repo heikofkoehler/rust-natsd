@@ -210,6 +210,7 @@ pub fn deliver(
                     &msg.account,
                     &msg.subject,
                     msg.reply_to.as_deref(),
+                    &[],
                     h,
                     &msg.payload,
                 ),
@@ -233,7 +234,9 @@ pub fn deliver(
                 continue;
             }
             let frame = match &msg.headers {
-                Some(h) => encode_leaf_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+                Some(h) => {
+                    encode_leaf_hmsg(&msg.subject, msg.reply_to.as_deref(), &[], h, &msg.payload)
+                }
                 None => encode_lmsg(
                     &msg.subject,
                     msg.reply_to.as_deref(),
@@ -258,6 +261,7 @@ pub fn deliver(
                     &msg.account,
                     &msg.subject,
                     msg.reply_to.as_deref(),
+                    &[],
                     h,
                     &msg.payload,
                 ),
@@ -284,20 +288,9 @@ pub fn deliver(
         _ => (u64::MAX, true),
     };
 
-    // Messages arriving on a route/leaf/gateway are delivered locally
-    // only (full mesh / hub-and-spoke / supercluster loop prevention).
-    if matches!(
-        origin,
-        Origin::Route(_) | Origin::Leaf(_) | Origin::Gateway(_)
-    ) {
-        // Phase 32: a service-import reply arriving over a route/leaf
-        // is claimed by the node that minted its mapping, if any, and
-        // delivered to the importer's original reply subject; a reply
-        // no node on this path minted is dropped, never delivered to
-        // subscribers of the synthetic subject in the responder's
-        // account. The lookup is account-agnostic (the mapping itself
-        // names the importing account), so a leaf frame — which
-        // carries no account token — is claimed correctly too.
+    // Messages arriving on a gateway are delivered locally only
+    // (supercluster loop prevention).
+    if let Origin::Gateway(gid) = origin {
         if msg.subject.starts_with("_RIMPORT.") {
             if let Some((account, orig_reply)) =
                 super::imports::lookup_import_reply(shared, &msg.subject)
@@ -313,44 +306,32 @@ pub fn deliver(
             }
             return false;
         }
-        // Phase 32: a message arriving in the importing account is
-        // service-translated on arrival exactly as a local publish
-        // is (same function, same authorization checks). The
-        // translated message is delivered locally only by the
-        // Route/Leaf branch below (via the recursive `deliver`
-        // call inside `try_service_import`), so it cannot loop.
         if let Some(delivered) = super::imports::try_service_import(shared, msg, origin) {
             return delivered;
         }
         let result = {
             let mut sl = shared.sublist.write().unwrap();
-            match origin {
-                Origin::Route(_) | Origin::Leaf(_) | Origin::Gateway(_) => {
-                    // Filtered queue selection for remote-origin messages.
-                    let gm = sl.match_groups(
-                        &msg.subject,
-                        publisher_conn,
-                        publisher_echo,
-                        Some(&msg.account),
-                    );
-                    let mut deliveries = gm.plain;
-                    for (q, members) in &gm.groups {
-                        let wanted = match queue_filter {
-                            Some(list) => list.iter().any(|g| g == q),
-                            None => true,
-                        };
-                        if wanted && !members.is_empty() {
-                            let cursor = shared.queue_cursor.fetch_add(1, Ordering::SeqCst);
-                            deliveries.push(members[(cursor as usize) % members.len()].clone());
-                        }
-                    }
-                    let expired = sl.note_deliveries(&deliveries);
-                    crate::sublist::MatchResult {
-                        deliveries,
-                        expired,
-                    }
+            let gm = sl.match_groups(
+                &msg.subject,
+                publisher_conn,
+                publisher_echo,
+                Some(&msg.account),
+            );
+            let mut deliveries = gm.plain;
+            for (q, members) in &gm.groups {
+                let wanted = match queue_filter {
+                    Some(list) => list.iter().any(|g| g == q),
+                    None => true,
+                };
+                if wanted && !members.is_empty() {
+                    let cursor = shared.queue_cursor.fetch_add(1, Ordering::SeqCst);
+                    deliveries.push(members[(cursor as usize) % members.len()].clone());
                 }
-                _ => unreachable!(),
+            }
+            let expired = sl.note_deliveries(&deliveries);
+            crate::sublist::MatchResult {
+                deliveries,
+                expired,
             }
         };
         send_local_frames(shared, msg, &result.deliveries);
@@ -359,28 +340,33 @@ pub fn deliver(
             .stats
             .out_msgs
             .fetch_add(result.deliveries.len() as u64, Ordering::Relaxed);
-        // Phase 32: stream-import copies on arrival, same table and
-        // same authorization checks as the local path — except a
-        // service-translated message never also gets stream-copied,
-        // matching the local path (which returns before the copy
-        // step). Copies are local-only (`deliver_stream_copy`).
         let mut delivered = !result.deliveries.is_empty();
         if !msg.service_translated && super::imports::deliver_stream_imports(shared, msg) {
             delivered = true;
         }
-        // Phase 33: a reply arriving on a gateway whose subject is
-        // itself a recorded reply subject (a request that passed
-        // through this node earlier) is forwarded onward over the
-        // recorded connection — the multi-hop return path. The
-        // connection it arrived on is excluded (it already got it).
-        if let Origin::Gateway(gid) = origin {
-            let mut sent = std::collections::HashSet::new();
-            sent.insert(gid);
-            if forward_gateway_reply(shared, msg, &sent) {
-                delivered = true;
-            }
+        let mut sent = std::collections::HashSet::new();
+        sent.insert(gid);
+        if forward_gateway_reply(shared, msg, &sent) {
+            delivered = true;
         }
         return delivered;
+    }
+
+    if matches!(origin, Origin::Route(_) | Origin::Leaf(_)) && msg.subject.starts_with("_RIMPORT.")
+    {
+        if let Some((account, orig_reply)) =
+            super::imports::lookup_import_reply(shared, &msg.subject)
+        {
+            deliver(
+                shared,
+                &Message::new(&orig_reply, None, msg.headers.clone(), msg.payload.clone())
+                    .with_account(&account),
+                Origin::Internal,
+                None,
+            );
+            return true;
+        }
+        return false;
     }
 
     // Phase 32: a reply to a synthetic subject minted by another node
@@ -400,17 +386,21 @@ pub fn deliver(
         }
     }
 
-    // Service import (local publishes only, same node): translation,
-    // synthetic `_RIMPORT.<seq>` reply mapping, and no-responders 503
-    // live in `imports::try_service_import` (moved verbatim here in Phase 29).
+    // Service import: translation, synthetic `_RIMPORT.<seq>` reply
+    // mapping, and no-responders 503 live in `imports::try_service_import`.
     if let Some(delivered) = super::imports::try_service_import(shared, msg, origin) {
         return delivered;
     }
 
-    // Local / internal origin: global queue selection across local
-    // members, routes, leafs, and gateways (weighted by member
-    // count), so a queue group spanning nodes still delivers exactly
-    // once per message.
+    // Global queue selection across local members, routes, leafs, and
+    // gateways (weighted by member count), so a queue group spanning
+    // nodes still delivers exactly once per message.
+    // Topology rules:
+    // - Local / Internal origin: forwards to all routes, all leafs, and all gateways.
+    // - Route(src_rid) origin: routes form a full mesh (1-hop), so never
+    //   forward to other routes, but DO forward to leafs with interest.
+    // - Leaf(src_lid) origin: hub-and-spoke, so forward to all routes and
+    //   to all OTHER leafs (`lid != src_lid`), never back to `src_lid`.
     let gm = {
         let sl = shared.sublist.read().unwrap();
         sl.match_groups(
@@ -420,9 +410,28 @@ pub fn deliver(
             Some(&msg.account),
         )
     };
-    let route_full = route_interest_full(shared, &msg.subject, &msg.account);
-    let leaf_full = leaf_interest_full(shared, &msg.subject, &msg.account);
-    let gateway_full = gateway_interest_full(shared, &msg.subject, &msg.account);
+    let route_full = match origin {
+        Origin::Local(_, _) | Origin::Internal | Origin::Leaf(_) => {
+            route_interest_full(shared, &msg.subject, &msg.account)
+        }
+        Origin::Route(_) | Origin::Gateway(_) => Vec::new(),
+    };
+    let leaf_full: InterestTargets = match origin {
+        Origin::Local(_, _) | Origin::Internal | Origin::Route(_) => {
+            leaf_interest_full(shared, &msg.subject, &msg.account)
+        }
+        Origin::Leaf(src_lid) => leaf_interest_full(shared, &msg.subject, &msg.account)
+            .into_iter()
+            .filter(|(lid, _, _, _)| *lid != src_lid)
+            .collect(),
+        Origin::Gateway(_) => Vec::new(),
+    };
+    let gateway_full = match origin {
+        Origin::Local(_, _) | Origin::Internal => {
+            gateway_interest_full(shared, &msg.subject, &msg.account)
+        }
+        Origin::Route(_) | Origin::Leaf(_) | Origin::Gateway(_) => Vec::new(),
+    };
 
     enum Dest {
         Local(crate::sublist::Delivery),
@@ -434,8 +443,28 @@ pub fn deliver(
     let mut route_selected: HashMap<u64, Vec<String>> = HashMap::new();
     let mut leaf_selected: HashMap<u64, Vec<String>> = HashMap::new();
     let mut gateway_selected: HashMap<u64, Vec<String>> = HashMap::new();
-    for (group, members) in &gm.groups {
-        let mut dests: Vec<Dest> = members.iter().map(|m| Dest::Local(m.clone())).collect();
+
+    let mut all_groups: std::collections::BTreeSet<String> = gm.groups.keys().cloned().collect();
+    for (_, _, _, counts) in &route_full {
+        all_groups.extend(counts.keys().cloned());
+    }
+    for (_, _, _, counts) in &leaf_full {
+        all_groups.extend(counts.keys().cloned());
+    }
+    for (_, _, _, counts) in &gateway_full {
+        all_groups.extend(counts.keys().cloned());
+    }
+    for group in &all_groups {
+        if let Some(list) = queue_filter {
+            if !list.iter().any(|g| g == group) {
+                continue;
+            }
+        }
+        let mut dests: Vec<Dest> = gm
+            .groups
+            .get(group)
+            .map(|members| members.iter().map(|m| Dest::Local(m.clone())).collect())
+            .unwrap_or_default();
         for (rid, _, _, counts) in &route_full {
             for _ in 0..counts.get(group).copied().unwrap_or(0) {
                 dests.push(Dest::Route(*rid));
@@ -501,6 +530,7 @@ pub fn deliver(
                 &msg.account,
                 &msg.subject,
                 msg.reply_to.as_deref(),
+                &selected,
                 h,
                 &msg.payload,
             ),
@@ -517,7 +547,7 @@ pub fn deliver(
             close_route(shared, rid);
         }
     }
-    // Leafs: same shape, via LMSG (which carries queues in both the
+    // Leafs: same shape, via LMSG/HMSG (which carries queues in both the
     // plain and header forms).
     for (lid, handle, plain, _counts) in leaf_full {
         let selected = leaf_selected.get(&lid).cloned().unwrap_or_default();
@@ -525,7 +555,13 @@ pub fn deliver(
             continue;
         }
         let frame = match &msg.headers {
-            Some(h) => encode_leaf_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+            Some(h) => encode_leaf_hmsg(
+                &msg.subject,
+                msg.reply_to.as_deref(),
+                &selected,
+                h,
+                &msg.payload,
+            ),
             None => encode_lmsg(
                 &msg.subject,
                 msg.reply_to.as_deref(),
@@ -552,6 +588,7 @@ pub fn deliver(
                 &msg.account,
                 &msg.subject,
                 msg.reply_to.as_deref(),
+                &selected,
                 h,
                 &msg.payload,
             ),
@@ -574,14 +611,15 @@ pub fn deliver(
     // reply to a request that arrived over a gateway) flows back
     // over that connection even without RS+ interest — Go's shadow
     // mechanism, since gateways do not propagate `_INBOX` subs.
-    if forward_gateway_reply(shared, msg, &gateway_sent) {
+    if matches!(origin, Origin::Local(_, _) | Origin::Internal)
+        && forward_gateway_reply(shared, msg, &gateway_sent)
+    {
         has_delivery = true;
     }
 
-    // Stream imports (local/internal publishes only, same node):
-    // copies to authorized stream importers; see
-    // `imports::deliver_stream_imports` (moved verbatim here in Phase 29).
-    if super::imports::deliver_stream_imports(shared, msg) {
+    // Stream imports: copies to authorized stream importers; see
+    // `imports::deliver_stream_imports`.
+    if !msg.service_translated && super::imports::deliver_stream_imports(shared, msg) {
         has_delivery = true;
     }
 
@@ -590,7 +628,7 @@ pub fn deliver(
     // that set no_responders:true, generates an HMSG to the reply subject
     // with a 503 header block and an empty payload. JetStream-consumed
     // messages return early above, so they never generate one.
-    if msg.no_responders && !has_delivery {
+    if matches!(origin, Origin::Local(_, _)) && msg.no_responders && !has_delivery {
         if let Some(reply_to) = &msg.reply_to {
             let headers = Bytes::from(format!(
                 "NATS/1.0 503\r\nNats-Subject: {}\r\n\r\n",
@@ -660,6 +698,7 @@ pub(crate) fn forward_remote_import_reply(shared: &Arc<Shared>, msg: &Message) {
                 &msg.account,
                 &msg.subject,
                 msg.reply_to.as_deref(),
+                &[],
                 h,
                 &msg.payload,
             ),
@@ -686,7 +725,9 @@ pub(crate) fn forward_remote_import_reply(shared: &Arc<Shared>, msg: &Message) {
         .collect();
     for handle in leaf_handles {
         let frame = match &msg.headers {
-            Some(h) => encode_leaf_hmsg(&msg.subject, msg.reply_to.as_deref(), h, &msg.payload),
+            Some(h) => {
+                encode_leaf_hmsg(&msg.subject, msg.reply_to.as_deref(), &[], h, &msg.payload)
+            }
             None => encode_lmsg(
                 &msg.subject,
                 msg.reply_to.as_deref(),
@@ -714,6 +755,7 @@ pub(crate) fn forward_remote_import_reply(shared: &Arc<Shared>, msg: &Message) {
                 &msg.account,
                 &msg.subject,
                 msg.reply_to.as_deref(),
+                &[],
                 h,
                 &msg.payload,
             ),
@@ -794,9 +836,7 @@ pub(crate) fn cleanup_expired(shared: &Arc<Shared>, expired: &[(u64, String)]) {
         }
     }
     for (account, subject, queue) in patterns {
-        if !local_pattern_in_use(shared, &account, &subject, queue.as_deref()) {
-            propagate_local_sub(shared, &account, &subject, queue.as_deref(), false);
-        }
+        notify_interest_removed(shared, &account, &subject, queue.as_deref());
     }
 }
 
@@ -928,69 +968,136 @@ pub(crate) fn gateway_interest_full(
         .collect()
 }
 
-/// Broadcast a local subscription change to all routes, leafs, and gateways.
-pub(crate) fn propagate_local_sub(
+/// Snapshot of which peer classes already saw interest for `(account, subject, queue)`
+/// before a new subscription/interest was recorded: `(routes_had, leafs_that_had, gateways_had)`.
+pub(crate) fn interest_targets_before_add(
     shared: &Arc<Shared>,
     account: &str,
     subject: &str,
     queue: Option<&str>,
-    added: bool,
-) {
-    let rframe = if added {
-        encode_rs_plus(account, subject, queue)
-    } else {
-        encode_rs_minus(account, subject, queue)
-    };
-    // Collect handles first and send after the locks drop, mirroring
-    // send_local_frames: the registry locks are never held across the
-    // (non-blocking channel) sends.
-    let route_handles: Vec<Arc<ConnHandle>> = shared
-        .routes
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|r| !r.handle.is_closed())
-        .map(|r| r.handle.clone())
-        .collect();
-    for handle in route_handles {
-        let _ = try_send(&handle, rframe.clone());
-    }
-    // Leaf frames carry no account token: a leaf connection only ever
-    // carries its own account, so propagate only to matching leafs.
-    let lframe = if added {
-        encode_ls_plus(subject, queue)
-    } else {
-        encode_ls_minus(subject, queue)
-    };
-    let leaf_handles: Vec<Arc<ConnHandle>> = shared
+) -> (bool, std::collections::HashSet<u64>, bool) {
+    let routes_had = pattern_in_use_for_routes(shared, account, subject, queue);
+    let gateways_had = routes_had;
+    let leaf_ids: Vec<(u64, String)> = shared
         .leafs
         .lock()
         .unwrap()
-        .values()
-        .filter(|l| !l.handle.is_closed() && l.account == account)
-        .map(|l| l.handle.clone())
+        .iter()
+        .filter(|(_, l)| !l.handle.is_closed())
+        .map(|(id, l)| (*id, l.account.clone()))
         .collect();
-    for handle in leaf_handles {
-        let _ = try_send(&handle, lframe.clone());
+    let mut leafs_had = std::collections::HashSet::new();
+    for (lid, l_acc) in leaf_ids {
+        if l_acc == account && pattern_in_use_for_leaf(shared, lid, &l_acc, subject, queue) {
+            leafs_had.insert(lid);
+        }
     }
-    // Gateway frames are route frames with the account token, and
-    // they go ONLY to gateway connections this server accepted
-    // (inbound): Go's directional rule (see gateway.rs) is that the
-    // accepter sends RS+ and the dialer never does — a dialer that
-    // sends RS+ gets its connection closed with a protocol
-    // violation. Solicited (outbound) connections therefore never
-    // carry RS+ from this side; the peer's interest on those
-    // connections arrives as the accepter's RS+ instead.
-    let gateway_handles: Vec<Arc<ConnHandle>> = shared
-        .gateways
+    (routes_had, leafs_had, gateways_had)
+}
+
+/// After adding interest for `(account, subject, queue)`, send `RS+`/`LS+`
+/// to any route, leaf, or inbound gateway for which interest transitioned from false -> true.
+pub(crate) fn notify_interest_added(
+    shared: &Arc<Shared>,
+    account: &str,
+    subject: &str,
+    queue: Option<&str>,
+    before: (bool, std::collections::HashSet<u64>, bool),
+) {
+    let (routes_had, leafs_had, gateways_had) = before;
+    if !routes_had && pattern_in_use_for_routes(shared, account, subject, queue) {
+        let rframe = encode_rs_plus(account, subject, queue);
+        let route_handles: Vec<Arc<ConnHandle>> = shared
+            .routes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| !r.handle.is_closed())
+            .map(|r| r.handle.clone())
+            .collect();
+        for handle in route_handles {
+            let _ = try_send(&handle, rframe.clone());
+        }
+    }
+    if !gateways_had && pattern_in_use_for_routes(shared, account, subject, queue) {
+        let rframe = encode_rs_plus(account, subject, queue);
+        let gateway_handles: Vec<Arc<ConnHandle>> = shared
+            .gateways
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|g| !g.outbound && !g.handle.is_closed())
+            .map(|g| g.handle.clone())
+            .collect();
+        for handle in gateway_handles {
+            let _ = try_send(&handle, rframe.clone());
+        }
+    }
+    let leafs: Vec<(u64, String, Arc<ConnHandle>)> = shared
+        .leafs
         .lock()
         .unwrap()
-        .values()
-        .filter(|g| !g.outbound && !g.handle.is_closed())
-        .map(|g| g.handle.clone())
+        .iter()
+        .filter(|(_, l)| !l.handle.is_closed())
+        .map(|(id, l)| (*id, l.account.clone(), l.handle.clone()))
         .collect();
-    for handle in gateway_handles {
-        let _ = try_send(&handle, rframe.clone());
+    let lframe = encode_ls_plus(subject, queue);
+    for (lid, l_acc, handle) in leafs {
+        if l_acc == account
+            && !leafs_had.contains(&lid)
+            && pattern_in_use_for_leaf(shared, lid, &l_acc, subject, queue)
+        {
+            let _ = try_send(&handle, lframe.clone());
+        }
+    }
+}
+
+/// After removing interest for `(account, subject, queue)`, send `RS-`/`LS-`
+/// to any route, leaf, or inbound gateway that no longer has any remaining source of interest.
+pub(crate) fn notify_interest_removed(
+    shared: &Arc<Shared>,
+    account: &str,
+    subject: &str,
+    queue: Option<&str>,
+) {
+    if !pattern_in_use_for_routes(shared, account, subject, queue) {
+        let rframe = encode_rs_minus(account, subject, queue);
+        let route_handles: Vec<Arc<ConnHandle>> = shared
+            .routes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| !r.handle.is_closed())
+            .map(|r| r.handle.clone())
+            .collect();
+        for handle in route_handles {
+            let _ = try_send(&handle, rframe.clone());
+        }
+        let gateway_handles: Vec<Arc<ConnHandle>> = shared
+            .gateways
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|g| !g.outbound && !g.handle.is_closed())
+            .map(|g| g.handle.clone())
+            .collect();
+        for handle in gateway_handles {
+            let _ = try_send(&handle, rframe.clone());
+        }
+    }
+    let leafs: Vec<(u64, String, Arc<ConnHandle>)> = shared
+        .leafs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, l)| !l.handle.is_closed())
+        .map(|(id, l)| (*id, l.account.clone(), l.handle.clone()))
+        .collect();
+    let lframe = encode_ls_minus(subject, queue);
+    for (lid, l_acc, handle) in leafs {
+        if l_acc == account && !pattern_in_use_for_leaf(shared, lid, &l_acc, subject, queue) {
+            let _ = try_send(&handle, lframe.clone());
+        }
     }
 }
 
@@ -1002,7 +1109,10 @@ pub(crate) fn local_pattern_in_use(
     subject: &str,
     queue: Option<&str>,
 ) -> bool {
-    if shared.jetstream.is_some() && subject == "$JS.API.>" && queue.is_none() {
+    if shared.jetstream.is_some()
+        && (subject == "$JS.API.>" || subject == "$JS.ACK.>")
+        && queue.is_none()
+    {
         return true;
     }
     shared
@@ -1012,19 +1122,125 @@ pub(crate) fn local_pattern_in_use(
         .has_pattern(subject, queue, account)
 }
 
-/// Send every local subscription (plus JetStream internal patterns) to one
-/// route or leaf connection as RS+/LS+ frames.
+/// Does any route have interest in `(account, subject, queue)`?
+fn route_pattern_in_use(
+    shared: &Arc<Shared>,
+    account: &str,
+    subject: &str,
+    queue: Option<&str>,
+) -> bool {
+    let key = (
+        account.to_string(),
+        subject.to_string(),
+        queue.map(|q| q.to_string()),
+    );
+    shared
+        .route_subs
+        .lock()
+        .unwrap()
+        .values()
+        .any(|m| m.get(&key).copied().unwrap_or(0) > 0)
+}
+
+/// Does any leaf (other than `exclude_leaf`) have interest in `(account, subject, queue)`?
+fn leaf_pattern_in_use(
+    shared: &Arc<Shared>,
+    account: &str,
+    subject: &str,
+    queue: Option<&str>,
+    exclude_leaf: Option<u64>,
+) -> bool {
+    let key = (
+        account.to_string(),
+        subject.to_string(),
+        queue.map(|q| q.to_string()),
+    );
+    shared
+        .leaf_subs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(lid, _)| Some(**lid) != exclude_leaf)
+        .any(|(_, m)| m.get(&key).copied().unwrap_or(0) > 0)
+}
+
+/// Should routes (and inbound gateways) be told this node has interest in `(account, subject, queue)`?
+/// Routes form a full mesh (1-hop), so route interest is never re-advertised to
+/// other routes; routes learn about local subscriptions AND leaf subscriptions.
+fn pattern_in_use_for_routes(
+    shared: &Arc<Shared>,
+    account: &str,
+    subject: &str,
+    queue: Option<&str>,
+) -> bool {
+    local_pattern_in_use(shared, account, subject, queue)
+        || leaf_pattern_in_use(shared, account, subject, queue, None)
+}
+
+/// Should leaf `lid` (in `leaf_account`) be told this node has interest in `(subject, queue)`?
+/// A leaf learns about local subscriptions, route subscriptions, and OTHER leafs' subscriptions.
+fn pattern_in_use_for_leaf(
+    shared: &Arc<Shared>,
+    lid: u64,
+    leaf_account: &str,
+    subject: &str,
+    queue: Option<&str>,
+) -> bool {
+    local_pattern_in_use(shared, leaf_account, subject, queue)
+        || route_pattern_in_use(shared, leaf_account, subject, queue)
+        || leaf_pattern_in_use(shared, leaf_account, subject, queue, Some(lid))
+}
+
+/// Send every active subscription (local + transitive leaf/route interest + JetStream internal patterns)
+/// to one newly connected route or leaf connection as RS+/LS+ frames.
 pub(crate) fn send_local_interest(
     shared: &Arc<Shared>,
     handle: &ConnHandle,
+    peer_id: u64,
     is_route: bool,
     leaf_account: Option<&str>,
 ) {
-    let subs: Vec<(String, String, Option<String>)> = {
+    let mut patterns: std::collections::BTreeSet<(String, String, Option<String>)> = {
         let sl = shared.sublist.read().unwrap();
-        sl.patterns()
+        sl.patterns().into_iter().collect()
     };
-    for (account, subject, queue) in subs {
+    if is_route {
+        // Routes also learn about all leaf subscriptions.
+        let leaf_subs = shared.leaf_subs.lock().unwrap();
+        for m in leaf_subs.values() {
+            for (k, count) in m {
+                if *count > 0 {
+                    patterns.insert(k.clone());
+                }
+            }
+        }
+    } else if let Some(l_acc) = leaf_account {
+        // A leaf also learns about route subscriptions and other leafs' subscriptions.
+        {
+            let route_subs = shared.route_subs.lock().unwrap();
+            for m in route_subs.values() {
+                for (k, count) in m {
+                    if *count > 0 && k.0 == l_acc {
+                        patterns.insert(k.clone());
+                    }
+                }
+            }
+        }
+        {
+            let leaf_subs = shared.leaf_subs.lock().unwrap();
+            for (lid, m) in leaf_subs.iter() {
+                if *lid == peer_id {
+                    continue;
+                }
+                for (k, count) in m {
+                    if *count > 0 && k.0 == l_acc {
+                        patterns.insert(k.clone());
+                    }
+                }
+            }
+        }
+    }
+    for (account, subject, queue) in patterns {
         if is_route {
             let _ = try_send(handle, encode_rs_plus(&account, &subject, queue.as_deref()));
         } else if leaf_account == Some(account.as_str()) {
@@ -1058,21 +1274,6 @@ pub(crate) fn send_local_interest(
             let _ = account;
         }
     }
-    // Phase 32: stream-import interest. A node hosting an importer
-    // advertises the exported subject in the exporting account, so
-    // the node hosting the exporter forwards those publishes here
-    // and this node copies them to the importer's local subject on
-    // arrival (route/leaf-origin branch of `deliver`). Service
-    // imports need no interest: the importing node translates
-    // locally and forwards the rewritten request via the responder's
-    // own advertised interest. Imports are config-static, so
-    // advertising them at connection establishment is sufficient —
-    // there is no runtime import-subscription to propagate.
-    // Leaf frames carry no account token, so a leaf only advertises
-    // imports whose source account is the leaf connection's account
-    // (the account the leaf user belongs to on the hub); a leaf
-    // import from any other account cannot be carried on that
-    // connection and is documented as a remainder.
     if is_route {
         for account in shared.config.all_accounts() {
             for import in &account.imports {
@@ -1099,10 +1300,17 @@ pub(crate) fn send_local_interest(
 
 pub(crate) fn close_route(shared: &Arc<Shared>, id: u64) {
     let removed = shared.routes.lock().unwrap().remove(&id);
-    shared.route_subs.lock().unwrap().remove(&id);
+    let subs = shared.route_subs.lock().unwrap().remove(&id);
     shared.conn_info.lock().unwrap().remove(&id);
     if let Some(r) = removed {
         r.handle.mark_closed();
+    }
+    if let Some(map) = subs {
+        for ((account, subject, queue), count) in map {
+            if count > 0 {
+                notify_interest_removed(shared, &account, &subject, queue.as_deref());
+            }
+        }
     }
 }
 
@@ -1151,6 +1359,7 @@ pub(crate) fn forward_gateway_reply(
             &msg.account,
             &msg.subject,
             msg.reply_to.as_deref(),
+            &[],
             h,
             &msg.payload,
         ),
@@ -1351,16 +1560,9 @@ pub(crate) async fn process_gateway_op(
                 (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
                 Ordering::Relaxed,
             );
-            // HMSG frames carry no queue list: deliver to all matching
-            // groups. RMSG frames restrict to the listed groups.
-            // NOTE: the account token is the whole boundary here —
-            // no subject filtering, so `$SYS` traffic crosses exactly
-            // like any other account's (Phase 24 probe).
-            let filter = if headers.is_some() {
-                None
-            } else {
-                Some(queues.as_slice())
-            };
+            // Both RMSG and HMSG frames carry the selected queue group list
+            // (`| <queues>`), restricting delivery to the listed groups.
+            let filter = Some(queues.as_slice());
             // Phase 33: remember the reply subject's return path
             // (see forward_gateway_reply) before delivering.
             if let Some(reply) = &reply_to {
@@ -1383,10 +1585,17 @@ pub(crate) async fn process_gateway_op(
 
 pub(crate) fn close_leaf(shared: &Arc<Shared>, id: u64) {
     let removed = shared.leafs.lock().unwrap().remove(&id);
-    shared.leaf_subs.lock().unwrap().remove(&id);
+    let subs = shared.leaf_subs.lock().unwrap().remove(&id);
     shared.conn_info.lock().unwrap().remove(&id);
     if let Some(l) = removed {
         l.handle.mark_closed();
+    }
+    if let Some(map) = subs {
+        for ((account, subject, queue), count) in map {
+            if count > 0 {
+                notify_interest_removed(shared, &account, &subject, queue.as_deref());
+            }
+        }
     }
 }
 
@@ -1523,10 +1732,14 @@ pub(crate) async fn process_route_op(
             queue,
             ..
         } => {
-            let mut subs = shared.route_subs.lock().unwrap();
-            if let Some(m) = subs.get_mut(&id) {
-                bump_interest(m, &account, &subject, queue.as_deref(), 1);
+            let before = interest_targets_before_add(shared, &account, &subject, queue.as_deref());
+            {
+                let mut subs = shared.route_subs.lock().unwrap();
+                if let Some(m) = subs.get_mut(&id) {
+                    bump_interest(m, &account, &subject, queue.as_deref(), 1);
+                }
             }
+            notify_interest_added(shared, &account, &subject, queue.as_deref(), before);
             true
         }
         RouteOp::RsMinus {
@@ -1535,10 +1748,13 @@ pub(crate) async fn process_route_op(
             queue,
             ..
         } => {
-            let mut subs = shared.route_subs.lock().unwrap();
-            if let Some(m) = subs.get_mut(&id) {
-                bump_interest(m, &account, &subject, queue.as_deref(), -1);
+            {
+                let mut subs = shared.route_subs.lock().unwrap();
+                if let Some(m) = subs.get_mut(&id) {
+                    bump_interest(m, &account, &subject, queue.as_deref(), -1);
+                }
             }
+            notify_interest_removed(shared, &account, &subject, queue.as_deref());
             true
         }
         RouteOp::RMsg {
@@ -1560,13 +1776,9 @@ pub(crate) async fn process_route_op(
                 (headers.as_ref().map(|h| h.len()).unwrap_or(0) + payload.len()) as u64,
                 Ordering::Relaxed,
             );
-            // HMSG frames carry no queue list: deliver to all matching
-            // groups. RMSG frames restrict to the listed groups.
-            let filter = if headers.is_some() {
-                None
-            } else {
-                Some(queues.as_slice())
-            };
+            // Both RMSG and HMSG frames carry the selected queue group list
+            // (`| <queues>`), restricting delivery to the listed groups.
+            let filter = Some(queues.as_slice());
             deliver(
                 shared,
                 &Message::new(&subject, reply_to, headers, payload).with_account(&account),
@@ -1652,10 +1864,15 @@ pub(crate) async fn process_leaf_op(
                 .get(&id)
                 .map(|l| l.account.clone())
                 .unwrap_or_else(|| "$G".to_string());
-            let mut subs = shared.leaf_subs.lock().unwrap();
-            if let Some(m) = subs.get_mut(&id) {
-                bump_interest(m, &leaf_account, &subject, queue.as_deref(), 1);
+            let before =
+                interest_targets_before_add(shared, &leaf_account, &subject, queue.as_deref());
+            {
+                let mut subs = shared.leaf_subs.lock().unwrap();
+                if let Some(m) = subs.get_mut(&id) {
+                    bump_interest(m, &leaf_account, &subject, queue.as_deref(), 1);
+                }
             }
+            notify_interest_added(shared, &leaf_account, &subject, queue.as_deref(), before);
             true
         }
         LeafOp::LsMinus { subject, queue } => {
@@ -1666,10 +1883,13 @@ pub(crate) async fn process_leaf_op(
                 .get(&id)
                 .map(|l| l.account.clone())
                 .unwrap_or_else(|| "$G".to_string());
-            let mut subs = shared.leaf_subs.lock().unwrap();
-            if let Some(m) = subs.get_mut(&id) {
-                bump_interest(m, &leaf_account, &subject, queue.as_deref(), -1);
+            {
+                let mut subs = shared.leaf_subs.lock().unwrap();
+                if let Some(m) = subs.get_mut(&id) {
+                    bump_interest(m, &leaf_account, &subject, queue.as_deref(), -1);
+                }
             }
+            notify_interest_removed(shared, &leaf_account, &subject, queue.as_deref());
             true
         }
         LeafOp::LMsg {

@@ -304,6 +304,35 @@ async fn auth_user_pass_enforced() {
 }
 
 #[tokio::test]
+async fn auth_rejects_pre_connect_ops() {
+    let mut cfg = test_config();
+    cfg.user = Some("derek".into());
+    cfg.pass = Some("s3cret".into());
+    let srv = start_server(cfg).await;
+
+    let mut sub = RawClient::connect(srv.addr, "{\"user\":\"derek\",\"pass\":\"s3cret\"}").await;
+    sub.send_sync("SUB secret 1\r\n").await;
+
+    // A raw TCP client that skips CONNECT and immediately sends PUB
+    // must be rejected with Authorization Violation and not deliver.
+    let stream = TcpStream::connect(srv.addr).await.unwrap();
+    let (read, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // INFO
+    writer.write_all(b"PUB secret 4\r\npwnd\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        line.contains("Authorization Violation"),
+        "expected auth error on pre-CONNECT PUB, got: {line}"
+    );
+    sub.expect_silence().await;
+
+    srv.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn max_payload_violation_errors() {
     let mut cfg = test_config();
     cfg.max_payload = 8;

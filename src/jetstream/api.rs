@@ -463,7 +463,7 @@ impl Engine {
                 }
             }
         }
-        if self.would_cycle(name, &origins) {
+        if self.would_cycle(account, name, &origins) {
             reject("detected cycle");
             return;
         }
@@ -479,7 +479,10 @@ impl Engine {
             );
             return;
         }
-        if self.streams.contains_key(name) {
+        if self
+            .streams
+            .contains_key(&(account.to_string(), name.to_string()))
+        {
             api_error_action(
                 account,
                 reply,
@@ -544,7 +547,8 @@ impl Engine {
             remote_progress: HashMap::new(),
             wal_rewrite: false,
         };
-        self.streams.insert(name.to_string(), stream);
+        self.streams
+            .insert((account.to_string(), name.to_string()), stream);
         // Backfill (synchronous, under the engine lock, before the
         // create response: backfill + link registration are atomic
         // with respect to publishes, so nothing is lost or doubled.
@@ -562,7 +566,7 @@ impl Engine {
                 self.backfill(name, account, cfg, false);
             }
         }
-        let info = self.streams.get(name).unwrap().info_json();
+        let info = self.stream_for(name, account).unwrap().info_json();
         api_response(account, reply, type_name, info, actions);
     }
 
@@ -1006,7 +1010,7 @@ impl Engine {
         let streams: Vec<Value> = names
             .iter()
             .skip(offset)
-            .filter_map(|n| self.streams.get(n).map(|s| s.info_json()))
+            .filter_map(|n| self.stream_for(n, account).map(|s| s.info_json()))
             .collect();
         api_response(
             account,
@@ -1061,12 +1065,16 @@ impl Engine {
         type_name: &str,
         actions: &mut Vec<Action>,
     ) {
-        if self.stream_for(name, account).is_some() && self.streams.remove(name).is_some() {
+        if self
+            .streams
+            .remove(&(account.to_string(), name.to_string()))
+            .is_some()
+        {
             // Deleting an origin kills live links to it permanently:
             // dependents keep their config and their copies, but the
             // link never revives, even if a same-named origin is
             // created later (Go behaviour, probed against v2.15.1).
-            for s in self.streams.values_mut() {
+            for s in self.streams.values_mut().filter(|s| s.account == account) {
                 if let Some(cfg) = &mut s.mirror {
                     if cfg.name == name {
                         cfg.live = false;

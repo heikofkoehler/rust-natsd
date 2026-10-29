@@ -19,7 +19,9 @@ use crate::protocol::{
 use crate::route::route_info_json;
 use crate::sublist::Subscription;
 
-use super::delivery::{deliver, json_str, local_pattern_in_use, propagate_local_sub};
+use super::delivery::{
+    deliver, interest_targets_before_add, json_str, notify_interest_added, notify_interest_removed,
+};
 use super::imports::lookup_import_reply;
 use super::{Message, Origin, Shared};
 
@@ -489,6 +491,9 @@ pub(crate) struct ConnState {
     pedantic: bool,
     /// No-responders flag from CONNECT (see deliver()).
     no_responders: bool,
+    /// True once the connection has satisfied server authentication
+    /// (immediately true when no auth is configured, or after a valid CONNECT).
+    authenticated: bool,
     /// Account this connection authenticated as ($G by default).
     account: String,
     /// JWT account limits for this connection's account, if it is a
@@ -610,15 +615,24 @@ pub(crate) async fn handle_conn<R, W>(
         });
     }
 
+    let initial_auth = shared.config.authenticate_with_cert(
+        &crate::protocol::ConnectInfo::default(),
+        None,
+        &cert_candidates,
+    );
     let mut state = ConnState {
         verbose: false,
         echo: true,
         pedantic: false,
         no_responders: false,
-        account: "$G".to_string(),
+        authenticated: initial_auth.is_some(),
+        account: initial_auth
+            .as_ref()
+            .map(|o| o.account.clone())
+            .unwrap_or_else(|| "$G".to_string()),
         jwt_limits: None,
         effective_max_payload: shared.config.max_payload,
-        permissions: crate::config::Permissions::default(),
+        permissions: initial_auth.map(|o| o.permissions).unwrap_or_default(),
         nonce: nonce.clone(),
         cert_candidates,
     };
@@ -675,9 +689,7 @@ pub(crate) async fn handle_conn<R, W>(
         patterns
     };
     for (account, subject, queue) in removed {
-        if !local_pattern_in_use(&shared, &account, &subject, queue.as_deref()) {
-            propagate_local_sub(&shared, &account, &subject, queue.as_deref(), false);
-        }
+        notify_interest_removed(&shared, &account, &subject, queue.as_deref());
     }
     shared.conns.lock().unwrap().remove(&client_id);
     shared.conn_info.lock().unwrap().remove(&client_id);
@@ -727,6 +739,10 @@ pub(crate) async fn process_op(
     tx: &mpsc::Sender<Bytes>,
     state: &mut ConnState,
 ) -> bool {
+    if !matches!(op, ClientOp::Connect(_)) && !state.authenticated {
+        let _ = tx.send(encode_err("Authorization Violation")).await;
+        return false;
+    }
     match op {
         ClientOp::Connect(info) => {
             let nonce = state.nonce.as_bytes();
@@ -738,6 +754,7 @@ pub(crate) async fn process_op(
                 let _ = tx.send(encode_err("Authorization Violation")).await;
                 return false;
             };
+            state.authenticated = true;
             state.verbose = info.verbose;
             state.echo = info.echo;
             state.pedantic = info.pedantic;
@@ -1028,9 +1045,10 @@ pub(crate) async fn process_op(
                 }
             }
             if !already {
-                let is_new = {
+                let before =
+                    interest_targets_before_add(shared, &state.account, &subject, queue.as_deref());
+                {
                     let mut sl = shared.sublist.write().unwrap();
-                    let is_new = !sl.has_pattern(&subject, queue.as_deref(), &state.account);
                     sl.add(Subscription::new(
                         client_id,
                         sid,
@@ -1038,11 +1056,8 @@ pub(crate) async fn process_op(
                         queue.clone(),
                         state.account.clone(),
                     ));
-                    is_new
-                };
-                if is_new {
-                    propagate_local_sub(shared, &state.account, &subject, queue.as_deref(), true);
                 }
+                notify_interest_added(shared, &state.account, &subject, queue.as_deref(), before);
             }
             if state.verbose {
                 let _ = tx.send(encode_ok()).await;
@@ -1059,15 +1074,7 @@ pub(crate) async fn process_op(
                         p
                     };
                     if let Some((account, subject, queue)) = pattern {
-                        if !local_pattern_in_use(shared, &account, &subject, queue.as_deref()) {
-                            propagate_local_sub(
-                                shared,
-                                &account,
-                                &subject,
-                                queue.as_deref(),
-                                false,
-                            );
-                        }
+                        notify_interest_removed(shared, &account, &subject, queue.as_deref());
                     }
                 }
                 Some(max) => {
